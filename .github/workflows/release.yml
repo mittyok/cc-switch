@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
   contents: write
@@ -14,9 +14,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: windows-latest
-          - os: ubuntu-latest
-          - os: macos-latest
+          # 固定 runner 版本，避免 latest 漂移导致 ABI 升级
+          - os: windows-2022
+          - os: ubuntu-20.04
+          - os: macos-14
 
     steps:
       - name: Checkout
@@ -25,13 +26,13 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Add macOS targets
-        if: runner.os == 'macOS'
+      - name: Add macOS targets (ARM64 only for universal)
+        if: runner.os == 'macOS' && runner.arch == 'ARM64'
         run: |
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
@@ -74,7 +75,7 @@ jobs:
         run: echo "path=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
 
       - name: Setup pnpm cache
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: ${{ steps.pnpm-store.outputs.path }}
           key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
@@ -83,9 +84,11 @@ jobs:
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
 
-      - name: Build Tauri App (macOS)
-        if: runner.os == 'macOS'
+      - name: Build Tauri App (macOS, universal on ARM64)
+        if: runner.os == 'macOS' && runner.arch == 'ARM64'
         run: pnpm tauri build --target universal-apple-darwin
+
+      # macOS 仅保留通用包（在 macOS-14 / ARM64 运行器上构建）
 
       - name: Build Tauri App (Windows)
         if: runner.os == 'Windows'
@@ -165,7 +168,7 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p release-assets
-          # 仅上传安装包（deb）
+          # 优先 DEB，同时若存在 AppImage 一并上传
           DEB=$(find src-tauri/target/release/bundle -name "*.deb" | head -1 || true)
           if [ -n "$DEB" ]; then
             cp "$DEB" release-assets/
@@ -174,6 +177,13 @@ jobs:
             echo "No .deb found" >&2
             exit 1
           fi
+          APPIMAGE=$(find src-tauri/target/release/bundle -name "*.AppImage" | head -1 || true)
+          if [ -n "$APPIMAGE" ]; then
+            cp "$APPIMAGE" release-assets/
+            echo "AppImage copied"
+          else
+            echo "No AppImage found (optional)"
+          fi
 
       - name: List prepared assets
         shell: bash
@@ -181,7 +191,7 @@ jobs:
           ls -la release-assets || true
 
       - name: Upload Release Assets
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: CC Switch ${{ github.ref_name }}
