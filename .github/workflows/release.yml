@@ -16,7 +16,7 @@ jobs:
         include:
           # 固定 runner 版本，避免 latest 漂移导致 ABI 升级
           - os: windows-2022
-          - os: ubuntu-20.04
+          - os: ubuntu-22.04
           - os: macos-14
 
     steps:
