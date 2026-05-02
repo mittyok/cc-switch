@@ -214,6 +214,10 @@ export function ProviderForm({
     ),
   }));
 
+  const [modelMapping, setModelMapping] = useState<Record<string, string>>(
+    () => initialData?.meta?.modelMapping ?? {},
+  );
+
   const { category } = useProviderCategory({
     appId,
     selectedPresetId,
@@ -245,6 +249,7 @@ export function ProviderForm({
         initialData?.meta?.pricingModelSource,
       ),
     });
+    setModelMapping(initialData?.meta?.modelMapping ?? {});
   }, [appId, initialData, supportsFullUrl]);
 
   const defaultValues: ProviderFormData = useMemo(
@@ -407,6 +412,15 @@ export function ProviderForm({
     handleCodexConfigChange: originalHandleCodexConfigChange,
     resetCodexConfig,
   } = useCodexConfigState({ initialData });
+
+  // codexWireApi is stored in ProviderMeta (not in TOML config)
+  const [codexWireApi, setCodexWireApi] = useState<string>(
+    initialData?.meta?.codexWireApi ?? "responses",
+  );
+
+  const handleCodexWireApiChange = useCallback((wireApi: string) => {
+    setCodexWireApi(wireApi);
+  }, []);
 
   const { configError: codexConfigError, debouncedValidate } =
     useCodexTomlValidation();
@@ -1208,6 +1222,14 @@ export function ProviderForm({
         supportsFullUrl && category !== "official" && localIsFullUrl
           ? true
           : undefined,
+      // Store codexWireApi in meta (not in TOML) — only when non-default
+      codexWireApi:
+        appId === "codex" && codexWireApi !== "responses"
+          ? (codexWireApi as "responses" | "chat_completions")
+          : undefined,
+      // 模型名称映射（仅在有映射时保存）
+      modelMapping:
+        Object.keys(modelMapping).length > 0 ? modelMapping : undefined,
     };
 
     if (!isCodexOauthProvider && "codexFastMode" in nextMeta) {
@@ -1338,6 +1360,7 @@ export function ProviderForm({
       if (appId === "codex") {
         const template = getCodexCustomTemplate();
         resetCodexConfig(template.auth, template.config);
+        setCodexWireApi("responses");
       }
       if (appId === "gemini") {
         resetGeminiConfig({}, {});
@@ -1838,6 +1861,8 @@ export function ProviderForm({
               shouldShowModelField={category !== "official"}
               modelName={codexModelName}
               onModelNameChange={handleCodexModelNameChange}
+              wireApi={codexWireApi}
+              onWireApiChange={handleCodexWireApiChange}
               speedTestEndpoints={speedTestEndpoints}
             />
           )}
@@ -2105,8 +2130,10 @@ export function ProviderForm({
               <ProviderAdvancedConfig
                 testConfig={testConfig}
                 pricingConfig={pricingConfig}
+                modelMapping={modelMapping}
                 onTestConfigChange={setTestConfig}
                 onPricingConfigChange={setPricingConfig}
+                onModelMappingChange={setModelMapping}
               />
             )}
 

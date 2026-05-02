@@ -1,6 +1,12 @@
 import { useTranslation } from "react-i18next";
 import { useState, useEffect } from "react";
-import { ChevronDown, ChevronRight, FlaskConical, Coins } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronRight,
+  FlaskConical,
+  Coins,
+  Repeat,
+} from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
@@ -13,6 +19,7 @@ import {
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import type { ProviderTestConfig } from "@/types";
+import { ModelMappingEditor } from "./ModelMappingEditor";
 
 export type PricingModelSourceOption = "inherit" | "request" | "response";
 
@@ -25,20 +32,27 @@ interface ProviderPricingConfig {
 interface ProviderAdvancedConfigProps {
   testConfig: ProviderTestConfig;
   pricingConfig: ProviderPricingConfig;
+  modelMapping: Record<string, string>;
   onTestConfigChange: (config: ProviderTestConfig) => void;
   onPricingConfigChange: (config: ProviderPricingConfig) => void;
+  onModelMappingChange: (mapping: Record<string, string>) => void;
 }
 
 export function ProviderAdvancedConfig({
   testConfig,
   pricingConfig,
+  modelMapping,
   onTestConfigChange,
   onPricingConfigChange,
+  onModelMappingChange,
 }: ProviderAdvancedConfigProps) {
   const { t } = useTranslation();
   const [isTestConfigOpen, setIsTestConfigOpen] = useState(testConfig.enabled);
   const [isPricingConfigOpen, setIsPricingConfigOpen] = useState(
     pricingConfig.enabled,
+  );
+  const [isModelMappingOpen, setIsModelMappingOpen] = useState(
+    Object.keys(modelMapping).length > 0,
   );
 
   useEffect(() => {
@@ -48,6 +62,12 @@ export function ProviderAdvancedConfig({
   useEffect(() => {
     setIsPricingConfigOpen(pricingConfig.enabled);
   }, [pricingConfig.enabled]);
+
+  useEffect(() => {
+    if (Object.keys(modelMapping).length > 0) {
+      setIsModelMappingOpen(true);
+    }
+  }, [modelMapping]);
 
   return (
     <div className="space-y-4">
@@ -360,6 +380,50 @@ export function ProviderAdvancedConfig({
                 </p>
               </div>
             </div>
+          </div>
+        </div>
+      </div>
+      {/* 模型名称映射 */}
+      <div className="rounded-lg border border-border/50 bg-muted/20">
+        <button
+          type="button"
+          className="flex w-full items-center justify-between p-4 hover:bg-muted/30 transition-colors"
+          onClick={() => setIsModelMappingOpen(!isModelMappingOpen)}
+        >
+          <div className="flex items-center gap-3">
+            <Repeat className="h-4 w-4 text-muted-foreground" />
+            <span className="font-medium">
+              {t("providerAdvanced.modelMapping", {
+                defaultValue: "模型名称映射",
+              })}
+            </span>
+            {Object.keys(modelMapping).length > 0 && (
+              <span className="text-xs text-muted-foreground">
+                ({Object.keys(modelMapping).length})
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-3">
+            {isModelMappingOpen ? (
+              <ChevronDown className="h-4 w-4 text-muted-foreground" />
+            ) : (
+              <ChevronRight className="h-4 w-4 text-muted-foreground" />
+            )}
+          </div>
+        </button>
+        <div
+          className={cn(
+            "overflow-hidden transition-all duration-200",
+            isModelMappingOpen
+              ? "max-h-[800px] opacity-100"
+              : "max-h-0 opacity-0",
+          )}
+        >
+          <div className="border-t border-border/50 p-4">
+            <ModelMappingEditor
+              value={modelMapping}
+              onChange={onModelMappingChange}
+            />
           </div>
         </div>
       </div>

@@ -23,9 +23,11 @@ pub(crate) mod gemini_schema;
 pub mod gemini_shadow;
 pub mod models;
 pub mod streaming;
+pub mod streaming_codex_chat;
 pub mod streaming_gemini;
 pub mod streaming_responses;
 pub mod transform;
+pub mod transform_codex_chat;
 pub mod transform_gemini;
 pub mod transform_responses;
 

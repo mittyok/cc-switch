@@ -171,10 +171,17 @@ export interface ProviderMeta {
   promptCacheKey?: string;
   // Codex OAuth FAST mode: injects service_tier="priority" on ChatGPT Codex requests
   codexFastMode?: boolean;
+  // Codex wire API format (only for Codex providers)
+  // - "responses" (default): OpenAI Responses API, passthrough
+  // - "chat_completions": OpenAI Chat Completions API, needs conversion
+  codexWireApi?: "responses" | "chat_completions";
   // 供应商类型（用于识别 Copilot 等特殊供应商）
   providerType?: string;
   // GitHub Copilot 关联账号 ID（旧字段，保留兼容读取）
   githubAccountId?: string;
+  // 通用模型名称映射（客户端发送的模型名 → 上游实际使用的模型名）
+  // 例如: { "gpt-5.5": "gpt-4o", "claude-sonnet-4-5": "my-custom-model" }
+  modelMapping?: Record<string, string>;
 }
 
 // Skill 同步方式

@@ -962,6 +962,7 @@ impl RequestForwarder {
                 is_full_url,
             )
         } else if is_full_url {
+            log::warn!("[{tag}] is_full_url=true, 忽略 endpoint={effective_endpoint}, 直接使用 base_url={base_url}", tag = adapter.name());
             append_query_to_full_url(&base_url, passthrough_query.as_deref())
         } else {
             adapter.build_url(&base_url, &effective_endpoint)

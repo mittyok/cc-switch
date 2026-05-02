@@ -563,6 +563,7 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
         setScript({
           ...script,
           code: preset,
+          baseUrl: script.baseUrl || providerCredentials.baseUrl,
           accessToken: undefined,
           userId: undefined,
         });
@@ -570,6 +571,7 @@ const UsageScriptModal: React.FC<UsageScriptModalProps> = ({
         setScript({
           ...script,
           code: preset,
+          baseUrl: script.baseUrl || providerCredentials.baseUrl,
           apiKey: undefined,
         });
       } else if (presetName === TEMPLATE_TYPES.GITHUB_COPILOT) {

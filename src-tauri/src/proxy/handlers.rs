@@ -14,10 +14,11 @@ use super::{
     },
     handler_context::RequestContext,
     providers::{
-        get_adapter, get_claude_api_format, streaming::create_anthropic_sse_stream,
+        self, get_adapter, get_claude_api_format, streaming::create_anthropic_sse_stream,
+        streaming_codex_chat::create_responses_sse_stream_from_chat_completions,
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
         streaming_responses::create_anthropic_sse_stream_from_responses, transform,
-        transform_gemini, transform_responses,
+        transform_codex_chat, transform_gemini, transform_responses,
     },
     response_processor::{
         create_logged_passthrough_stream, process_response, read_decoded_body,
@@ -35,6 +36,137 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+
+// ============================================================================
+// 通用请求归一化
+// ============================================================================
+
+/// 归一化 Responses API 请求体，确保第三方 API 兼容性。
+///
+/// 1. 将 input 中 developer/system 角色的消息提取出来，合并到 instructions 字段
+///    （Responses API 的 input 只允许 user/assistant 角色，系统指令应放在 instructions）
+/// 2. 确保每个 tool 定义都有 parameters 字段（缺少时补充空对象）
+fn normalize_responses_body(mut body: Value) -> Value {
+    // 1. 提取 developer/system 消息 → 合并到 instructions
+    if let Some(input) = body.get_mut("input").and_then(|v| v.as_array_mut()) {
+        let mut extracted_texts: Vec<String> = Vec::new();
+
+        input.retain(|item| {
+            let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            if role == "developer" || role == "system" {
+                // 提取文本内容
+                if let Some(content) = item.get("content") {
+                    if let Some(text) = content.as_str() {
+                        if !text.is_empty() {
+                            extracted_texts.push(text.to_string());
+                        }
+                    } else if let Some(arr) = content.as_array() {
+                        for part in arr {
+                            if let Some(text) = part
+                                .get("text")
+                                .and_then(|t| t.as_str())
+                                .filter(|t| !t.is_empty())
+                            {
+                                extracted_texts.push(text.to_string());
+                            }
+                        }
+                    }
+                }
+                false // 从 input 中移除
+            } else {
+                true // 保留
+            }
+        });
+
+        if !extracted_texts.is_empty() {
+            // 合并到已有的 instructions 字段
+            let existing = body
+                .get("instructions")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let merged = if existing.is_empty() {
+                extracted_texts.join("\n")
+            } else {
+                format!("{}\n{}", existing, extracted_texts.join("\n"))
+            };
+            body["instructions"] = json!(merged);
+        }
+    }
+
+    // 2. 确保 tools 里每个 function 都有 parameters
+    if let Some(tools) = body.get_mut("tools").and_then(|v| v.as_array_mut()) {
+        for tool in tools.iter_mut() {
+            if tool.get("type").and_then(|t| t.as_str()) == Some("function")
+                && tool.get("parameters").is_none()
+            {
+                tool["parameters"] = json!({"type": "object", "properties": {}});
+            }
+        }
+    }
+
+    // 3. 移除第三方 API 不支持的字段
+    for key in &["store", "include", "previous_response_id"] {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove(*key);
+        }
+    }
+
+    body
+}
+
+/// 将 Chat Completions 请求体中的 system 消息合并到第一条 user 消息。
+///
+/// 某些第三方 API（如京东云）不支持 `system` 角色，会返回
+/// `invalid message role: system` 错误。将 system 内容前置到第一条 user 消息中
+/// 可以确保最大兼容性。
+fn merge_system_into_user(body: &mut Value) {
+    let Some(messages) = body.get_mut("messages").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+
+    // 收集所有 system 消息内容
+    let mut system_parts: Vec<String> = Vec::new();
+    messages.retain(|msg| {
+        if msg.get("role").and_then(|r| r.as_str()) == Some("system") {
+            if let Some(text) = msg.get("content").and_then(|c| c.as_str()) {
+                if !text.is_empty() {
+                    system_parts.push(text.to_string());
+                }
+            }
+            false
+        } else {
+            true
+        }
+    });
+
+    if system_parts.is_empty() {
+        return;
+    }
+
+    let system_text = system_parts.join("\n");
+
+    // 找到第一条 user 消息，将 system 内容前置
+    if let Some(first_user) = messages
+        .iter_mut()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))
+    {
+        if let Some(content) = first_user.get("content").and_then(|c| c.as_str()) {
+            first_user["content"] = json!(format!(
+                "[System Instructions]\n{}\n\n{}",
+                system_text, content
+            ));
+        } else {
+            // content 是数组格式，在开头插入一个 text 块
+            if let Some(arr) = first_user.get_mut("content").and_then(|c| c.as_array_mut()) {
+                arr.insert(0, json!({"type": "text", "text": format!("[System Instructions]\n{}", system_text)}));
+            }
+        }
+    } else {
+        // 没有 user 消息，创建一条
+        messages.insert(0, json!({"role": "user", "content": system_text}));
+    }
+}
 
 // ============================================================================
 // 健康检查和状态查询（简单端点）
@@ -417,6 +549,9 @@ pub async fn handle_chat_completions(
 }
 
 /// 处理 /v1/responses 请求（OpenAI Responses API - Codex CLI 透传）
+///
+/// 当供应商配置 `wire_api = "chat_completions"` 时，会将 Responses API 请求
+/// 转换为 Chat Completions 格式发送到上游，并将响应转换回 Responses API 格式。
 pub async fn handle_responses(
     State(state): State<ProxyState>,
     request: axum::extract::Request,
@@ -435,9 +570,33 @@ pub async fn handle_responses(
 
     let mut ctx =
         RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
-    let endpoint = endpoint_with_query(&uri, "/responses");
 
-    let is_stream = body
+    // Check if the provider uses chat_completions wire_api
+    let use_chat_completions = providers::CodexAdapter::is_chat_completions_mode(&ctx.provider);
+    log::info!(
+        "[Codex/responses] wire_api: meta.codexWireApi={:?}, use_chat_completions={}, provider={}",
+        ctx.provider
+            .meta
+            .as_ref()
+            .and_then(|m| m.codex_wire_api.as_deref()),
+        use_chat_completions,
+        ctx.provider.id,
+    );
+
+    let (endpoint, forward_body) = if use_chat_completions {
+        // Transform Responses → Chat Completions
+        // developer → system 归一化在 transform 内部处理
+        let mut transformed = transform_codex_chat::responses_request_to_chat_completions(body)?;
+        // 兼容性：将 system 消息合并到 user 消息（部分第三方 API 不支持 system 角色）
+        merge_system_into_user(&mut transformed);
+        (endpoint_with_query(&uri, "/chat/completions"), transformed)
+    } else {
+        // Responses API 透传：归一化 developer → system、确保 tools 有 parameters
+        let body = normalize_responses_body(body);
+        (endpoint_with_query(&uri, "/responses"), body)
+    };
+
+    let is_stream = forward_body
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
@@ -447,7 +606,7 @@ pub async fn handle_responses(
         .forward_with_retry(
             &AppType::Codex,
             &endpoint,
-            body,
+            forward_body,
             headers,
             extensions,
             ctx.get_providers(),
@@ -467,10 +626,18 @@ pub async fn handle_responses(
     ctx.provider = result.provider;
     let response = result.response;
 
-    process_response(response, &ctx, &state, &CODEX_PARSER_CONFIG).await
+    if use_chat_completions {
+        // Convert the Chat Completions response back to Responses API format
+        handle_codex_chat_to_responses(response, &ctx, &state, is_stream).await
+    } else {
+        process_response(response, &ctx, &state, &CODEX_PARSER_CONFIG).await
+    }
 }
 
 /// 处理 /v1/responses/compact 请求（OpenAI Responses Compact API - Codex CLI 透传）
+///
+/// 当供应商配置 `wire_api = "chat_completions"` 时，会将 Responses API 请求
+/// 转换为 Chat Completions 格式发送到上游，并将响应转换回 Responses API 格式。
 pub async fn handle_responses_compact(
     State(state): State<ProxyState>,
     request: axum::extract::Request,
@@ -489,9 +656,22 @@ pub async fn handle_responses_compact(
 
     let mut ctx =
         RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
-    let endpoint = endpoint_with_query(&uri, "/responses/compact");
 
-    let is_stream = body
+    // Check if the provider uses chat_completions wire_api
+    let use_chat_completions = providers::CodexAdapter::is_chat_completions_mode(&ctx.provider);
+
+    let (endpoint, forward_body) = if use_chat_completions {
+        // Transform Responses → Chat Completions
+        let mut transformed = transform_codex_chat::responses_request_to_chat_completions(body)?;
+        merge_system_into_user(&mut transformed);
+        (endpoint_with_query(&uri, "/chat/completions"), transformed)
+    } else {
+        // Responses API 透传：归一化 developer → system、确保 tools 有 parameters
+        let body = normalize_responses_body(body);
+        (endpoint_with_query(&uri, "/responses/compact"), body)
+    };
+
+    let is_stream = forward_body
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
@@ -501,7 +681,7 @@ pub async fn handle_responses_compact(
         .forward_with_retry(
             &AppType::Codex,
             &endpoint,
-            body,
+            forward_body,
             headers,
             extensions,
             ctx.get_providers(),
@@ -521,7 +701,170 @@ pub async fn handle_responses_compact(
     ctx.provider = result.provider;
     let response = result.response;
 
-    process_response(response, &ctx, &state, &CODEX_PARSER_CONFIG).await
+    if use_chat_completions {
+        // Convert the Chat Completions response back to Responses API format
+        handle_codex_chat_to_responses(response, &ctx, &state, is_stream).await
+    } else {
+        process_response(response, &ctx, &state, &CODEX_PARSER_CONFIG).await
+    }
+}
+
+/// Handle response conversion from Chat Completions back to Responses API format.
+///
+/// When a Codex provider has `wire_api = "chat_completions"`, the upstream response
+/// is in Chat Completions format and needs to be converted back to Responses API
+/// format before returning to the Codex CLI.
+async fn handle_codex_chat_to_responses(
+    response: super::hyper_client::ProxyResponse,
+    ctx: &RequestContext,
+    state: &ProxyState,
+    is_stream: bool,
+) -> Result<axum::response::Response, ProxyError> {
+    let status = response.status();
+    let is_sse = response.is_sse();
+
+    if is_sse || (is_stream && status.is_success()) {
+        // Streaming path: convert Chat Completions SSE → Responses API SSE
+        let upstream_stream = response.bytes_stream();
+        let responses_stream = create_responses_sse_stream_from_chat_completions(upstream_stream);
+
+        // Create usage collector for logging (parse Responses API SSE events for usage)
+        let usage_collector = {
+            let state = state.clone();
+            let provider_id = ctx.provider.id.clone();
+            let model = ctx.request_model.clone();
+            let status_code = status.as_u16();
+            let start_time = ctx.start_time;
+
+            SseUsageCollector::new(start_time, move |events, first_token_ms| {
+                // The transformed stream emits Responses API events;
+                // try to extract usage from the response.completed event.
+                if let Some(usage) = TokenUsage::from_codex_stream_events_auto(&events) {
+                    let latency_ms = start_time.elapsed().as_millis() as u64;
+                    let state = state.clone();
+                    let provider_id = provider_id.clone();
+                    let model = model.clone();
+
+                    tokio::spawn(async move {
+                        log_usage(
+                            &state,
+                            &provider_id,
+                            "codex",
+                            &model,
+                            &model,
+                            usage,
+                            latency_ms,
+                            first_token_ms,
+                            true,
+                            status_code,
+                        )
+                        .await;
+                    });
+                } else {
+                    log::debug!("[Codex/ChatCompletions] 流式响应缺少 usage 统计，跳过消费记录");
+                }
+            })
+        };
+
+        let timeout_config = ctx.streaming_timeout_config();
+
+        let logged_stream = create_logged_passthrough_stream(
+            responses_stream,
+            "Codex/ChatCompletions",
+            Some(usage_collector),
+            timeout_config,
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "Content-Type",
+            axum::http::HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            "Cache-Control",
+            axum::http::HeaderValue::from_static("no-cache"),
+        );
+
+        let body = axum::body::Body::from_stream(logged_stream);
+        Ok((headers, body).into_response())
+    } else {
+        // Non-streaming path: convert Chat Completions JSON → Responses API JSON
+        let body_timeout =
+            if ctx.app_config.auto_failover_enabled && ctx.app_config.non_streaming_timeout > 0 {
+                std::time::Duration::from_secs(ctx.app_config.non_streaming_timeout as u64)
+            } else {
+                std::time::Duration::ZERO
+            };
+        let (mut response_headers, _status, body_bytes) =
+            read_decoded_body(response, ctx.tag, body_timeout).await?;
+
+        let body_str = String::from_utf8_lossy(&body_bytes);
+
+        let upstream_response: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
+            log::error!("[Codex/ChatCompletions] 解析上游响应失败: {e}, body: {body_str}");
+            ProxyError::TransformError(format!("Failed to parse upstream response: {e}"))
+        })?;
+
+        let responses_body =
+            transform_codex_chat::chat_completions_response_to_responses(upstream_response)
+                .map_err(|e| {
+                    log::error!("[Codex/ChatCompletions] 转换响应失败: {e}");
+                    e
+                })?;
+
+        // Log usage
+        if let Some(usage) = TokenUsage::from_codex_response_auto(&responses_body) {
+            let model = responses_body
+                .get("model")
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown");
+            let latency_ms = ctx.latency_ms();
+
+            let request_model = ctx.request_model.clone();
+            tokio::spawn({
+                let state = state.clone();
+                let provider_id = ctx.provider.id.clone();
+                let model = model.to_string();
+                async move {
+                    log_usage(
+                        &state,
+                        &provider_id,
+                        "codex",
+                        &model,
+                        &request_model,
+                        usage,
+                        latency_ms,
+                        None,
+                        false,
+                        status.as_u16(),
+                    )
+                    .await;
+                }
+            });
+        }
+
+        // Build response
+        let mut builder = axum::response::Response::builder().status(status);
+        strip_entity_headers_for_rebuilt_body(&mut response_headers);
+        strip_hop_by_hop_response_headers(&mut response_headers);
+
+        for (key, value) in response_headers.iter() {
+            builder = builder.header(key, value);
+        }
+
+        builder = builder.header("content-type", "application/json");
+
+        let response_body = serde_json::to_vec(&responses_body).map_err(|e| {
+            log::error!("[Codex/ChatCompletions] 序列化响应失败: {e}");
+            ProxyError::TransformError(format!("Failed to serialize response: {e}"))
+        })?;
+
+        let body = axum::body::Body::from(response_body);
+        builder.body(body).map_err(|e| {
+            log::error!("[Codex/ChatCompletions] 构建响应失败: {e}");
+            ProxyError::Internal(format!("Failed to build response: {e}"))
+        })
+    }
 }
 
 // ============================================================================

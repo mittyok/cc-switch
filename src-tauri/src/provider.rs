@@ -284,6 +284,11 @@ pub struct ProviderMeta {
     /// Codex OAuth FAST mode: inject `service_tier = "priority"` for ChatGPT Codex requests.
     #[serde(rename = "codexFastMode", skip_serializing_if = "Option::is_none")]
     pub codex_fast_mode: Option<bool>,
+    /// Codex wire API format (only for Codex providers).
+    /// - "responses" (default): OpenAI Responses API, passthrough
+    /// - "chat_completions": OpenAI Chat Completions API, needs Responses ↔ Chat conversion
+    #[serde(rename = "codexWireApi", skip_serializing_if = "Option::is_none")]
+    pub codex_wire_api: Option<String>,
     /// 累加模式应用中，该 provider 是否已写入 live config。
     /// `None` 表示旧数据/未知状态，`Some(false)` 表示明确仅存在于数据库中。
     #[serde(rename = "liveConfigManaged", skip_serializing_if = "Option::is_none")]
@@ -296,6 +301,13 @@ pub struct ProviderMeta {
     /// 用于多账号支持，关联到特定的 GitHub 账号
     #[serde(rename = "githubAccountId", skip_serializing_if = "Option::is_none")]
     pub github_account_id: Option<String>,
+    /// 通用模型名称映射（请求中的模型名 → 实际发送给上游的模型名）
+    #[serde(
+        rename = "modelMapping",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model_mapping: Option<HashMap<String, String>>,
 }
 
 impl ProviderMeta {
@@ -303,6 +315,11 @@ impl ProviderMeta {
     /// 会按更高速率消耗 ChatGPT 订阅配额，用户需显式开启以换取更低延迟。
     pub fn codex_fast_mode_enabled(&self) -> bool {
         self.codex_fast_mode.unwrap_or(false)
+    }
+
+    /// Get the Codex wire API format. Defaults to "responses".
+    pub fn codex_wire_api(&self) -> &str {
+        self.codex_wire_api.as_deref().unwrap_or("responses")
     }
 
     /// 解析指定托管认证供应商绑定的账号 ID。

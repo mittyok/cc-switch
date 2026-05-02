@@ -9,6 +9,12 @@ import {
   TierBadge,
   utilizationColor,
 } from "@/components/SubscriptionQuotaFooter";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 interface CopilotQuotaFooterProps {
   meta?: ProviderMeta;
@@ -63,10 +69,23 @@ const CopilotQuotaFooter: React.FC<CopilotQuotaFooterProps> = ({
     if (inline) {
       return (
         <div className="inline-flex items-center gap-2 text-xs rounded-lg border border-border-default bg-card px-3 py-2 shadow-sm">
-          <div className="flex items-center gap-1.5 text-red-500 dark:text-red-400">
-            <AlertCircle size={12} />
-            <span>{quota.error || t("subscription.queryFailed")}</span>
-          </div>
+          <TooltipProvider delayDuration={300}>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <div className="flex items-center gap-1.5 text-red-500 dark:text-red-400 cursor-default">
+                  <AlertCircle size={12} />
+                  <span className="truncate max-w-[160px]">
+                    {quota.error || t("subscription.queryFailed")}
+                  </span>
+                </div>
+              </TooltipTrigger>
+              {quota.error && (
+                <TooltipContent side="top" className="max-w-xs break-words">
+                  {quota.error}
+                </TooltipContent>
+              )}
+            </Tooltip>
+          </TooltipProvider>
           <button
             onClick={() => refetch()}
             disabled={loading}

@@ -1009,7 +1009,13 @@
     "modelNamePlaceholder": "例如: gpt-5-codex",
     "contextWindow1M": "1M 上下文窗口",
     "autoCompactLimit": "压缩阈值",
-    "autoCompactLimitHint": "上下文 token 数达到此阈值时自动压缩历史"
+    "autoCompactLimitHint": "上下文 token 数达到此阈值时自动压缩历史",
+    "wireApiHint": "如果您的供应商使用 Chat Completions API 而非 Responses API，请在 TOML 配置中设置 wire_api = \"chat_completions\"",
+    "wireApiLabel": "API 协议格式",
+    "wireApiResponses": "OpenAI Responses API (原生)",
+    "wireApiChatCompletions": "OpenAI Chat Completions (需转换)",
+    "wireApiResponsesHint": "💡 供应商使用 Responses API，直接透传无需转换",
+    "wireApiChatCompletionsHint": "💡 供应商使用 Chat Completions API，Codex CLI 的请求将自动转换"
   },
   "geminiConfig": {
     "envFile": "环境变量 (.env)",

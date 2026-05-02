@@ -4,6 +4,7 @@
 
 use crate::provider::Provider;
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// 模型映射配置
 pub struct ModelMapping {
@@ -11,12 +12,27 @@ pub struct ModelMapping {
     pub sonnet_model: Option<String>,
     pub opus_model: Option<String>,
     pub default_model: Option<String>,
+    /// 通用模型映射表（优先于关键词匹配）
+    pub custom_mapping: HashMap<String, String>,
 }
 
 impl ModelMapping {
     /// 从 Provider 配置中提取模型映射
     pub fn from_provider(provider: &Provider) -> Self {
         let env = provider.settings_config.get("env");
+
+        // 从 meta.model_mapping 读取通用映射
+        let custom_mapping = provider
+            .meta
+            .as_ref()
+            .and_then(|m| m.model_mapping.as_ref())
+            .map(|mapping| {
+                mapping
+                    .iter()
+                    .map(|(k, v)| (k.to_lowercase(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         Self {
             haiku_model: env
@@ -39,6 +55,7 @@ impl ModelMapping {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(String::from),
+            custom_mapping,
         }
     }
 
@@ -48,11 +65,17 @@ impl ModelMapping {
             || self.sonnet_model.is_some()
             || self.opus_model.is_some()
             || self.default_model.is_some()
+            || !self.custom_mapping.is_empty()
     }
 
     /// 根据原始模型名称获取映射后的模型
     pub fn map_model(&self, original_model: &str) -> String {
         let model_lower = original_model.to_lowercase();
+
+        // 0. 优先检查通用映射表（精确匹配，大小写不敏感）
+        if let Some(mapped) = self.custom_mapping.get(&model_lower) {
+            return mapped.clone();
+        }
 
         // 1. 按模型类型匹配
         if model_lower.contains("haiku") {
@@ -158,6 +181,63 @@ mod tests {
         }
     }
 
+    fn create_provider_with_custom_mapping() -> Provider {
+        use crate::provider::ProviderMeta;
+        let mut mapping = HashMap::new();
+        mapping.insert("gpt-5.5".to_string(), "gpt-4o".to_string());
+        mapping.insert(
+            "my-custom-model".to_string(),
+            "claude-sonnet-4-20250514".to_string(),
+        );
+
+        Provider {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            settings_config: json!({}),
+            website_url: None,
+            category: None,
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: Some(ProviderMeta {
+                model_mapping: Some(mapping),
+                ..Default::default()
+            }),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        }
+    }
+
+    fn create_provider_with_both_mappings() -> Provider {
+        use crate::provider::ProviderMeta;
+        let mut mapping = HashMap::new();
+        mapping.insert("claude-sonnet-4-5".to_string(), "custom-sonnet".to_string());
+
+        Provider {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            settings_config: json!({
+                "env": {
+                    "ANTHROPIC_MODEL": "default-model",
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "sonnet-mapped"
+                }
+            }),
+            website_url: None,
+            category: None,
+            created_at: None,
+            sort_index: None,
+            notes: None,
+            meta: Some(ProviderMeta {
+                model_mapping: Some(mapping),
+                ..Default::default()
+            }),
+            icon: None,
+            icon_color: None,
+            in_failover_queue: false,
+        }
+    }
+
     #[test]
     fn test_sonnet_mapping() {
         let provider = create_provider_with_mapping();
@@ -248,6 +328,58 @@ mod tests {
         let provider = create_provider_with_mapping();
         let body = json!({"model": "Claude-SONNET-4-5"});
         let (result, _, mapped) = apply_model_mapping(body, &provider);
+        assert_eq!(result["model"], "sonnet-mapped");
+        assert_eq!(mapped, Some("sonnet-mapped".to_string()));
+    }
+
+    // === 通用模型映射测试 ===
+
+    #[test]
+    fn test_custom_mapping_exact_match() {
+        let provider = create_provider_with_custom_mapping();
+        let body = json!({"model": "gpt-5.5"});
+        let (result, original, mapped) = apply_model_mapping(body, &provider);
+        assert_eq!(result["model"], "gpt-4o");
+        assert_eq!(original, Some("gpt-5.5".to_string()));
+        assert_eq!(mapped, Some("gpt-4o".to_string()));
+    }
+
+    #[test]
+    fn test_custom_mapping_case_insensitive() {
+        let provider = create_provider_with_custom_mapping();
+        let body = json!({"model": "GPT-5.5"});
+        let (result, _, mapped) = apply_model_mapping(body, &provider);
+        assert_eq!(result["model"], "gpt-4o");
+        assert_eq!(mapped, Some("gpt-4o".to_string()));
+    }
+
+    #[test]
+    fn test_custom_mapping_no_match_passes_through() {
+        let provider = create_provider_with_custom_mapping();
+        let body = json!({"model": "unknown-model"});
+        let (result, original, mapped) = apply_model_mapping(body, &provider);
+        assert_eq!(result["model"], "unknown-model");
+        assert_eq!(original, Some("unknown-model".to_string()));
+        assert!(mapped.is_none());
+    }
+
+    #[test]
+    fn test_custom_mapping_takes_priority_over_keyword() {
+        // 当 custom_mapping 有精确匹配时，优先于 haiku/sonnet/opus 关键词匹配
+        let provider = create_provider_with_both_mappings();
+        let body = json!({"model": "claude-sonnet-4-5"});
+        let (result, _, mapped) = apply_model_mapping(body, &provider);
+        assert_eq!(result["model"], "custom-sonnet");
+        assert_eq!(mapped, Some("custom-sonnet".to_string()));
+    }
+
+    #[test]
+    fn test_keyword_mapping_still_works_with_custom() {
+        // 没有精确匹配时，仍然走关键词匹配
+        let provider = create_provider_with_both_mappings();
+        let body = json!({"model": "claude-sonnet-4-5-20250929"});
+        let (result, _, mapped) = apply_model_mapping(body, &provider);
+        // "claude-sonnet-4-5-20250929" 不在 custom_mapping 中，走关键词匹配到 ANTHROPIC_DEFAULT_SONNET_MODEL
         assert_eq!(result["model"], "sonnet-mapped");
         assert_eq!(mapped, Some("sonnet-mapped".to_string()));
     }

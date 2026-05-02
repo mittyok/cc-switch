@@ -1009,7 +1009,13 @@
     "modelNamePlaceholder": "例: gpt-5-codex",
     "contextWindow1M": "1M コンテキストウィンドウ",
     "autoCompactLimit": "自動圧縮しきい値",
-    "autoCompactLimitHint": "コンテキストトークン数がこのしきい値に達すると履歴を自動圧縮"
+    "autoCompactLimitHint": "コンテキストトークン数がこのしきい値に達すると履歴を自動圧縮",
+    "wireApiHint": "プロバイダーが Responses API ではなく Chat Completions API を使用する場合、TOML 設定で wire_api = \"chat_completions\" を設定してください",
+    "wireApiLabel": "API ワイヤーフォーマット",
+    "wireApiResponses": "OpenAI Responses API (ネイティブ)",
+    "wireApiChatCompletions": "OpenAI Chat Completions (変換が必要)",
+    "wireApiResponsesHint": "💡 プロバイダーは Responses API を使用、リクエストはそのまま転送されます",
+    "wireApiChatCompletionsHint": "💡 プロバイダーは Chat Completions API を使用、Codex CLI のリクエストは自動変換されます"
   },
   "geminiConfig": {
     "envFile": "環境変数 (.env)",

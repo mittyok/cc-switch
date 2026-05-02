@@ -96,13 +96,51 @@ pub async fn execute_usage_script(
     }; // Runtime 和 Context 在这里被 drop
 
     // 4. 解析 request 配置
-    let request: RequestConfig = serde_json::from_str(&request_config).map_err(|e| {
+    let mut request: RequestConfig = serde_json::from_str(&request_config).map_err(|e| {
         AppError::localized(
             "usage_script.request_format_invalid",
             format!("request 配置格式错误: {e}"),
             format!("Invalid request config format: {e}"),
         )
     })?;
+
+    // 4.5 如果 request.url 是相对路径，尝试与 base_url 拼接
+    if Url::parse(&request.url).is_err() {
+        if !base_url.is_empty() {
+            if let Ok(base) = Url::parse(base_url) {
+                match base.join(&request.url) {
+                    Ok(resolved) => {
+                        request.url = resolved.to_string();
+                    }
+                    Err(e) => {
+                        return Err(AppError::localized(
+                            "usage_script.request_url_resolve_failed",
+                            format!(
+                                "请求 URL \"{}\" 是相对路径，但无法与 base_url \"{}\" 拼接: {e}",
+                                request.url, base_url
+                            ),
+                            format!(
+                                "Request URL \"{}\" is a relative path but could not be resolved against base_url \"{}\": {e}",
+                                request.url, base_url
+                            ),
+                        ));
+                    }
+                }
+            }
+        } else {
+            return Err(AppError::localized(
+                "usage_script.request_url_relative",
+                format!(
+                    "请求 URL \"{}\" 是相对路径，需要填写 Base URL 或在脚本中使用完整的 URL（以 https:// 开头）",
+                    request.url
+                ),
+                format!(
+                    "Request URL \"{}\" is a relative path. Please provide a Base URL or use a full URL (starting with https://) in your script",
+                    request.url
+                ),
+            ));
+        }
+    }
 
     // 5. 验证请求 URL（HTTPS 强制 + 同源检查）
     validate_request_url(&request.url, base_url, is_custom_template)?;

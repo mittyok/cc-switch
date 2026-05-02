@@ -1009,7 +1009,13 @@
     "modelNamePlaceholder": "e.g., gpt-5-codex",
     "contextWindow1M": "1M Context Window",
     "autoCompactLimit": "Auto Compact Limit",
-    "autoCompactLimitHint": "Auto-compacts history when context reaches this token limit"
+    "autoCompactLimitHint": "Auto-compacts history when context reaches this token limit",
+    "wireApiHint": "Set wire_api = \"chat_completions\" in the TOML config if your provider uses the Chat Completions API instead of the Responses API",
+    "wireApiLabel": "API Wire Format",
+    "wireApiResponses": "OpenAI Responses API (Native)",
+    "wireApiChatCompletions": "OpenAI Chat Completions (Needs Conversion)",
+    "wireApiResponsesHint": "💡 Provider uses Responses API, requests are passed through directly",
+    "wireApiChatCompletionsHint": "💡 Provider uses Chat Completions API, Codex CLI requests will be automatically converted"
   },
   "geminiConfig": {
     "envFile": "Environment Variables (.env)",

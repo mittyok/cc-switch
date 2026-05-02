@@ -5,6 +5,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { FullScreenPanel } from "@/components/common/FullScreenPanel";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ProviderIcon } from "@/components/ProviderIcon";
@@ -15,6 +22,7 @@ import {
   createUniversalProviderFromPreset,
   type UniversalProviderPreset,
 } from "@/config/universalProviderPresets";
+import { ModelMappingEditor } from "@/components/providers/forms/ModelMappingEditor";
 
 interface UniversalProviderFormModalProps {
   isOpen: boolean;
@@ -54,6 +62,14 @@ export function UniversalProviderFormModal({
   // 模型配置
   const [models, setModels] = useState<UniversalProviderModels>({});
 
+  // 模型名称映射
+  const [modelMapping, setModelMapping] = useState<Record<string, string>>({});
+
+  // Codex API 协议格式
+  const [codexWireApi, setCodexWireApi] = useState<
+    "responses" | "chat_completions"
+  >("responses");
+
   // 保存并同步确认弹窗
   const [syncConfirmOpen, setSyncConfirmOpen] = useState(false);
   const [pendingProvider, setPendingProvider] =
@@ -72,6 +88,12 @@ export function UniversalProviderFormModal({
       setCodexEnabled(editingProvider.apps.codex);
       setGeminiEnabled(editingProvider.apps.gemini);
       setModels(editingProvider.models || {});
+      setModelMapping(editingProvider.meta?.modelMapping ?? {});
+      setCodexWireApi(
+        (editingProvider.meta?.codexWireApi as
+          | "responses"
+          | "chat_completions") || "responses",
+      );
 
       // 尝试匹配预设
       const preset = universalProviderPresets.find(
@@ -91,6 +113,8 @@ export function UniversalProviderFormModal({
       setCodexEnabled(defaultPreset.defaultApps.codex);
       setGeminiEnabled(defaultPreset.defaultApps.gemini);
       setModels(JSON.parse(JSON.stringify(defaultPreset.defaultModels)));
+      setModelMapping({});
+      setCodexWireApi("responses");
     }
   }, [editingProvider, initialPreset, isOpen]);
 
@@ -202,6 +226,13 @@ requires_openai_auth = true`;
             gemini: geminiEnabled,
           },
           models,
+          meta: {
+            ...(editingProvider.meta ?? {}),
+            modelMapping:
+              Object.keys(modelMapping).length > 0 ? modelMapping : undefined,
+            codexWireApi:
+              codexWireApi !== "responses" ? codexWireApi : undefined,
+          },
         }
       : createUniversalProviderFromPreset(
           selectedPreset || universalProviderPresets[0],
@@ -221,6 +252,12 @@ requires_openai_auth = true`;
       provider.models = models;
       provider.websiteUrl = websiteUrl.trim() || undefined;
       provider.notes = notes.trim() || undefined;
+      provider.meta = {
+        ...(provider.meta ?? {}),
+        modelMapping:
+          Object.keys(modelMapping).length > 0 ? modelMapping : undefined,
+        codexWireApi: codexWireApi !== "responses" ? codexWireApi : undefined,
+      };
     }
 
     onSave(provider);
@@ -236,6 +273,8 @@ requires_openai_auth = true`;
     codexEnabled,
     geminiEnabled,
     models,
+    modelMapping,
+    codexWireApi,
     selectedPreset,
     onSave,
     onClose,
@@ -261,6 +300,13 @@ requires_openai_auth = true`;
             gemini: geminiEnabled,
           },
           models,
+          meta: {
+            ...(editingProvider.meta ?? {}),
+            modelMapping:
+              Object.keys(modelMapping).length > 0 ? modelMapping : undefined,
+            codexWireApi:
+              codexWireApi !== "responses" ? codexWireApi : undefined,
+          },
         }
       : createUniversalProviderFromPreset(
           selectedPreset || universalProviderPresets[0],
@@ -280,6 +326,12 @@ requires_openai_auth = true`;
       provider.models = models;
       provider.websiteUrl = websiteUrl.trim() || undefined;
       provider.notes = notes.trim() || undefined;
+      provider.meta = {
+        ...(provider.meta ?? {}),
+        modelMapping:
+          Object.keys(modelMapping).length > 0 ? modelMapping : undefined,
+        codexWireApi: codexWireApi !== "responses" ? codexWireApi : undefined,
+      };
     }
 
     return provider;
@@ -294,6 +346,8 @@ requires_openai_auth = true`;
     codexEnabled,
     geminiEnabled,
     models,
+    modelMapping,
+    codexWireApi,
     selectedPreset,
   ]);
 
@@ -605,6 +659,36 @@ requires_openai_auth = true`;
                   />
                 </div>
               </div>
+              <div className="space-y-1">
+                <Label className="text-xs">
+                  {t("universalProvider.wireApi", {
+                    defaultValue: "API 协议格式",
+                  })}
+                </Label>
+                <Select
+                  value={codexWireApi}
+                  onValueChange={(v) =>
+                    setCodexWireApi(v as "responses" | "chat_completions")
+                  }
+                >
+                  <SelectTrigger className="h-8 text-xs">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="responses">
+                      Responses API（原生）
+                    </SelectItem>
+                    <SelectItem value="chat_completions">
+                      Chat Completions（更兼容）
+                    </SelectItem>
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  {codexWireApi === "chat_completions"
+                    ? "💡 请求将转换为 Chat Completions 格式，兼容性更好"
+                    : "💡 直接透传 Responses API 格式"}
+                </p>
+              </div>
             </div>
           )}
 
@@ -629,6 +713,11 @@ requires_openai_auth = true`;
               </div>
             </div>
           )}
+        </div>
+
+        {/* 模型名称映射 */}
+        <div className="rounded-lg border p-4">
+          <ModelMappingEditor value={modelMapping} onChange={setModelMapping} />
         </div>
 
         {/* 配置 JSON 预览 */}

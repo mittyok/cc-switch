@@ -74,6 +74,17 @@ pub fn delete_codex_provider_config(
     Ok(())
 }
 
+/// Codex CLI 只接受 `wire_api = "responses"`，任何其他值会导致启动报错。
+/// cc-switch 的 Chat Completions 转换模式存储在 `ProviderMeta.codex_wire_api` 中，
+/// 不能泄漏到 live TOML。此函数将所有 `wire_api` 字段强制归正为 `"responses"`。
+fn sanitize_wire_api(toml_text: &str) -> String {
+    use regex::Regex;
+    use std::sync::LazyLock;
+    static RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"(?m)^(\s*wire_api\s*=\s*)"[^"]*""#).unwrap());
+    RE.replace_all(toml_text, r#"${1}"responses""#).into_owned()
+}
+
 /// 原子写 Codex 的 `auth.json` 与 `config.toml`，在第二步失败时回滚第一步
 pub fn write_codex_live_atomic(
     auth: &Value,
@@ -103,6 +114,9 @@ pub fn write_codex_live_atomic(
         Some(s) => s.to_string(),
         None => String::new(),
     };
+    // Codex CLI 只接受 wire_api = "responses"，cc-switch 的 chat_completions
+    // 模式存在 ProviderMeta 中，不能写入 live TOML。这里做防御性清理。
+    let cfg_text = sanitize_wire_api(&cfg_text);
     if !cfg_text.trim().is_empty() {
         toml::from_str::<toml::Table>(&cfg_text).map_err(|e| AppError::toml(&config_path, e))?;
     }
@@ -977,5 +991,41 @@ base_url = "https://production.api/v1"
             .and_then(|v| v.get("base_url"))
             .and_then(|v| v.as_str());
         assert_eq!(base_url, Some("https://production.api/v1"));
+    }
+
+    #[test]
+    fn sanitize_wire_api_replaces_chat_completions() {
+        let input = r#"model_provider = "custom"
+model = "gpt-5.4"
+
+[model_providers.custom]
+name = "custom"
+base_url = "https://example.com/v1"
+wire_api = "chat_completions"
+requires_openai_auth = true
+"#;
+        let result = sanitize_wire_api(input);
+        assert!(result.contains(r#"wire_api = "responses""#));
+        assert!(!result.contains("chat_completions"));
+    }
+
+    #[test]
+    fn sanitize_wire_api_keeps_responses_unchanged() {
+        let input = r#"model_provider = "custom"
+
+[model_providers.custom]
+wire_api = "responses"
+"#;
+        let result = sanitize_wire_api(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn sanitize_wire_api_handles_no_wire_api() {
+        let input = r#"model_provider = "custom"
+model = "gpt-5.4"
+"#;
+        let result = sanitize_wire_api(input);
+        assert_eq!(result, input);
     }
 }

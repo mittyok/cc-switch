@@ -4,6 +4,12 @@ import { useTranslation } from "react-i18next";
 import type { AppId } from "@/lib/api";
 import { useSubscriptionQuota } from "@/lib/query/subscription";
 import type { QuotaTier, SubscriptionQuota } from "@/types/subscription";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 interface SubscriptionQuotaFooterProps {
   appId: AppId;
@@ -169,10 +175,21 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
     if (inline) {
       return (
         <div className="inline-flex items-center gap-2 text-xs rounded-lg border border-border-default bg-card px-3 py-2 shadow-sm">
-          <div className="flex items-center gap-1.5 text-red-500 dark:text-red-400">
-            <AlertCircle size={12} />
-            <span>{t("subscription.queryFailed")}</span>
-          </div>
+          <TooltipProvider delayDuration={300}>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <div className="flex items-center gap-1.5 text-red-500 dark:text-red-400 cursor-default">
+                  <AlertCircle size={12} />
+                  <span>{t("subscription.queryFailed")}</span>
+                </div>
+              </TooltipTrigger>
+              {quota.error && (
+                <TooltipContent side="top" className="max-w-xs break-words">
+                  {quota.error}
+                </TooltipContent>
+              )}
+            </Tooltip>
+          </TooltipProvider>
           <button
             onClick={() => refetch()}
             disabled={loading}
@@ -187,10 +204,23 @@ export const SubscriptionQuotaView: React.FC<SubscriptionQuotaViewProps> = ({
     return (
       <div className="mt-3 rounded-xl border border-border-default bg-card px-4 py-3 shadow-sm">
         <div className="flex items-center justify-between gap-2 text-xs">
-          <div className="flex items-center gap-2 text-red-500 dark:text-red-400">
-            <AlertCircle size={14} />
-            <span>{quota.error || t("subscription.queryFailed")}</span>
-          </div>
+          <TooltipProvider delayDuration={300}>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <div className="flex items-center gap-2 text-red-500 dark:text-red-400 cursor-default">
+                  <AlertCircle size={14} />
+                  <span className="truncate max-w-[200px]">
+                    {quota.error || t("subscription.queryFailed")}
+                  </span>
+                </div>
+              </TooltipTrigger>
+              {quota.error && (
+                <TooltipContent side="top" className="max-w-sm break-words">
+                  {quota.error}
+                </TooltipContent>
+              )}
+            </Tooltip>
+          </TooltipProvider>
           <button
             onClick={() => refetch()}
             disabled={loading}

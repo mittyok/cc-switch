@@ -6,6 +6,13 @@ import { Download, Loader2 } from "lucide-react";
 import EndpointSpeedTest from "./EndpointSpeedTest";
 import { ApiKeySection, EndpointField, ModelInputWithFetch } from "./shared";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   fetchModelsForConfig,
   showFetchModelsError,
   type FetchedModel,
@@ -44,6 +51,10 @@ interface CodexFormFieldsProps {
   modelName?: string;
   onModelNameChange?: (model: string) => void;
 
+  // Wire API format
+  wireApi?: string;
+  onWireApiChange?: (wireApi: string) => void;
+
   // Speed Test Endpoints
   speedTestEndpoints: EndpointCandidate[];
 }
@@ -70,6 +81,8 @@ export function CodexFormFields({
   shouldShowModelField = true,
   modelName = "",
   onModelNameChange,
+  wireApi = "responses",
+  onWireApiChange,
   speedTestEndpoints,
 }: CodexFormFieldsProps) {
   const { t } = useTranslation();
@@ -135,7 +148,11 @@ export function CodexFormFields({
           value={codexBaseUrl}
           onChange={onBaseUrlChange}
           placeholder={t("providerForm.codexApiEndpointPlaceholder")}
-          hint={t("providerForm.codexApiHint")}
+          hint={
+            wireApi === "chat_completions"
+              ? t("providerForm.apiHintOAI")
+              : t("providerForm.codexApiHint")
+          }
           showFullUrlToggle
           isFullUrl={isFullUrl}
           onFullUrlChange={onFullUrlChange}
@@ -186,6 +203,45 @@ export function CodexFormFields({
                 })
               : t("providerForm.modelHint", {
                   defaultValue: "💡 留空将使用供应商的默认模型",
+                })}
+          </p>
+        </div>
+      )}
+
+      {/* Wire API 格式选择 */}
+      {category !== "official" && onWireApiChange && (
+        <div className="space-y-2">
+          <label
+            htmlFor="codexWireApi"
+            className="block text-sm font-medium text-foreground"
+          >
+            {t("codexConfig.wireApiLabel", { defaultValue: "API 协议格式" })}
+          </label>
+          <Select value={wireApi} onValueChange={onWireApiChange}>
+            <SelectTrigger id="codexWireApi" className="w-full">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="responses">
+                {t("codexConfig.wireApiResponses", {
+                  defaultValue: "OpenAI Responses API (原生)",
+                })}
+              </SelectItem>
+              <SelectItem value="chat_completions">
+                {t("codexConfig.wireApiChatCompletions", {
+                  defaultValue: "OpenAI Chat Completions (需转换)",
+                })}
+              </SelectItem>
+            </SelectContent>
+          </Select>
+          <p className="text-xs text-muted-foreground">
+            {wireApi === "chat_completions"
+              ? t("codexConfig.wireApiChatCompletionsHint", {
+                  defaultValue:
+                    "💡 供应商使用 Chat Completions API，Codex CLI 的请求将自动转换",
+                })
+              : t("codexConfig.wireApiResponsesHint", {
+                  defaultValue: "💡 供应商使用 Responses API，直接透传无需转换",
                 })}
           </p>
         </div>

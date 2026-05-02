@@ -9,6 +9,7 @@ use super::{AuthInfo, AuthStrategy, ProviderAdapter};
 use crate::provider::Provider;
 use crate::proxy::error::ProxyError;
 use regex::Regex;
+use serde_json::Value;
 use std::sync::LazyLock;
 
 /// 官方 Codex 客户端 User-Agent 正则
@@ -30,6 +31,28 @@ impl CodexAdapter {
     #[allow(dead_code)]
     pub fn is_official_client(user_agent: &str) -> bool {
         CODEX_CLIENT_REGEX.is_match(user_agent)
+    }
+
+    /// 检查供应商是否配置为 chat_completions 模式
+    #[allow(dead_code)]
+    pub fn is_chat_completions_mode(provider: &Provider) -> bool {
+        provider
+            .meta
+            .as_ref()
+            .and_then(|m| m.codex_wire_api.as_deref())
+            == Some("chat_completions")
+    }
+
+    /// 从 Provider meta 中提取 wire_api 设置
+    ///
+    /// 优先从 meta.codex_wire_api 读取（cc-switch 自管），
+    /// 不再从 TOML config 读取（因为 Codex CLI 会校验 wire_api 字段）。
+    fn get_wire_api<'a>(&self, provider: &'a Provider) -> &'a str {
+        provider
+            .meta
+            .as_ref()
+            .and_then(|m| m.codex_wire_api.as_deref())
+            .unwrap_or("responses")
     }
 
     /// 从 Provider 配置中提取 API Key
@@ -180,6 +203,10 @@ impl ProviderAdapter for CodexAdapter {
             http::HeaderValue::from_str(&bearer).unwrap(),
         )]
     }
+
+    // NOTE: needs_transform / transform_request / transform_response 不在 adapter 层覆写。
+    // Chat Completions 转换由 handler 层（handle_responses / handle_codex_chat_to_responses）
+    // 在 forwarder 外部完成，避免与 forwarder 内部的 adapter.transform_request 双重转换冲突。
 }
 
 #[cfg(test)]
@@ -301,5 +328,49 @@ mod tests {
         assert!(!CodexAdapter::is_official_client(
             "prefix_codex_cli_rs/1.0.0"
         ));
+    }
+
+    // ---- wire_api / chat_completions mode tests ----
+
+    #[test]
+    fn test_get_wire_api_from_meta() {
+        let adapter = CodexAdapter::new();
+        let mut provider = create_provider(json!({
+            "base_url": "https://example.com/v1"
+        }));
+        provider.meta = Some(crate::provider::ProviderMeta {
+            codex_wire_api: Some("chat_completions".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(adapter.get_wire_api(&provider), "chat_completions");
+    }
+
+    #[test]
+    fn test_get_wire_api_default() {
+        let adapter = CodexAdapter::new();
+        let provider = create_provider(json!({
+            "base_url": "https://example.com/v1"
+        }));
+        assert_eq!(adapter.get_wire_api(&provider), "responses");
+    }
+
+    #[test]
+    fn test_is_chat_completions_mode_true() {
+        let mut provider = create_provider(json!({
+            "base_url": "https://example.com/v1"
+        }));
+        provider.meta = Some(crate::provider::ProviderMeta {
+            codex_wire_api: Some("chat_completions".to_string()),
+            ..Default::default()
+        });
+        assert!(CodexAdapter::is_chat_completions_mode(&provider));
+    }
+
+    #[test]
+    fn test_is_chat_completions_mode_false() {
+        let provider = create_provider(json!({
+            "base_url": "https://example.com/v1"
+        }));
+        assert!(!CodexAdapter::is_chat_completions_mode(&provider));
     }
 }

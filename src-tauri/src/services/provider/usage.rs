@@ -97,16 +97,52 @@ fn extract_api_key_from_provider(provider: &crate::provider::Provider) -> Option
 }
 
 /// Extract base URL from provider configuration
+/// Covers all app types: Claude (env.ANTHROPIC_BASE_URL), Gemini (env.GOOGLE_GEMINI_BASE_URL),
+/// Codex (TOML config), Hermes (top-level base_url), OpenClaw (top-level baseUrl)
 fn extract_base_url_from_provider(provider: &crate::provider::Provider) -> Option<String> {
-    if let Some(env) = provider.settings_config.get("env") {
-        // Try multiple possible base URL fields
-        env.get("ANTHROPIC_BASE_URL")
+    let config = &provider.settings_config;
+
+    // Claude / Gemini: env sub-object
+    if let Some(env) = config.get("env") {
+        let url = env
+            .get("ANTHROPIC_BASE_URL")
             .or_else(|| env.get("GOOGLE_GEMINI_BASE_URL"))
             .and_then(|v| v.as_str())
-            .map(|s| s.trim_end_matches('/').to_string())
-    } else {
-        None
+            .map(|s| s.trim_end_matches('/').to_string());
+        if url.is_some() {
+            return url;
+        }
     }
+
+    // Codex: TOML config string with base_url field
+    if let Some(toml_str) = config.get("config").and_then(|v| v.as_str()) {
+        if let Ok(toml_val) = toml_str.parse::<toml::Value>() {
+            // Try model_providers.<provider>.base_url first
+            if let Some(providers) = toml_val.get("model_providers").and_then(|v| v.as_table()) {
+                for (_key, prov) in providers.iter() {
+                    if let Some(url) = prov.get("base_url").and_then(|v| v.as_str()) {
+                        return Some(url.trim_end_matches('/').to_string());
+                    }
+                }
+            }
+            // Fallback: top-level base_url
+            if let Some(url) = toml_val.get("base_url").and_then(|v| v.as_str()) {
+                return Some(url.trim_end_matches('/').to_string());
+            }
+        }
+    }
+
+    // Hermes: top-level snake_case (config.yaml style)
+    if let Some(url) = config.get("base_url").and_then(|v| v.as_str()) {
+        return Some(url.trim_end_matches('/').to_string());
+    }
+
+    // OpenClaw: top-level camelCase (openclaw.json style)
+    if let Some(url) = config.get("baseUrl").and_then(|v| v.as_str()) {
+        return Some(url.trim_end_matches('/').to_string());
+    }
+
+    None
 }
 
 /// Query provider usage (using saved script configuration)
