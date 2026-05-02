@@ -27,6 +27,7 @@ use crate::{app_config::AppType, provider::Provider};
 use http::Extensions;
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Instant;
 use tauri::Manager;
 use tokio::sync::RwLock;
 
@@ -1418,6 +1419,7 @@ impl RequestForwarder {
             .map_err(|e| ProxyError::ForwardFailed(format!("Invalid URL '{url}': {e}")))?;
 
         // 发送请求
+        let request_start = Instant::now();
         let response = if is_socks_proxy {
             // SOCKS5 代理：只能走 reqwest（不支持 header case 保留）
             log::debug!("[Forwarder] Using reqwest for SOCKS5 proxy");
@@ -1455,14 +1457,33 @@ impl RequestForwarder {
         };
 
         // 检查响应状态
+        let elapsed = request_start.elapsed();
         let status = response.status();
+        let status_code = status.as_u16();
 
         if status.is_success() {
+            log::info!(
+                "[{tag}] <<< 响应 status={status_code} (耗时 {elapsed_ms}ms) from {url}",
+                tag = tag,
+                status_code = status_code,
+                elapsed_ms = elapsed.as_millis(),
+                url = url,
+            );
             Ok((response, resolved_claude_api_format))
         } else {
-            let status_code = status.as_u16();
             let body_text = String::from_utf8(response.bytes().await?.to_vec()).ok();
-
+            let body_preview = body_text
+                .as_deref()
+                .map(|s| summarize_text_for_log(s, 200))
+                .unwrap_or_default();
+            log::warn!(
+                "[{tag}] <<< 响应 status={status_code} (耗时 {elapsed_ms}ms) from {url} | body: {body_preview}",
+                tag = tag,
+                status_code = status_code,
+                elapsed_ms = elapsed.as_millis(),
+                url = url,
+                body_preview = body_preview,
+            );
             Err(ProxyError::UpstreamError {
                 status: status_code,
                 body: body_text,

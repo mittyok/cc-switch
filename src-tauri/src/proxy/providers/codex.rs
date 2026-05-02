@@ -9,7 +9,7 @@ use super::{AuthInfo, AuthStrategy, ProviderAdapter};
 use crate::provider::Provider;
 use crate::proxy::error::ProxyError;
 use regex::Regex;
-use serde_json::Value;
+
 use std::sync::LazyLock;
 
 /// 官方 Codex 客户端 User-Agent 正则
@@ -41,18 +41,6 @@ impl CodexAdapter {
             .as_ref()
             .and_then(|m| m.codex_wire_api.as_deref())
             == Some("chat_completions")
-    }
-
-    /// 从 Provider meta 中提取 wire_api 设置
-    ///
-    /// 优先从 meta.codex_wire_api 读取（cc-switch 自管），
-    /// 不再从 TOML config 读取（因为 Codex CLI 会校验 wire_api 字段）。
-    fn get_wire_api<'a>(&self, provider: &'a Provider) -> &'a str {
-        provider
-            .meta
-            .as_ref()
-            .and_then(|m| m.codex_wire_api.as_deref())
-            .unwrap_or("responses")
     }
 
     /// 从 Provider 配置中提取 API Key
@@ -331,28 +319,6 @@ mod tests {
     }
 
     // ---- wire_api / chat_completions mode tests ----
-
-    #[test]
-    fn test_get_wire_api_from_meta() {
-        let adapter = CodexAdapter::new();
-        let mut provider = create_provider(json!({
-            "base_url": "https://example.com/v1"
-        }));
-        provider.meta = Some(crate::provider::ProviderMeta {
-            codex_wire_api: Some("chat_completions".to_string()),
-            ..Default::default()
-        });
-        assert_eq!(adapter.get_wire_api(&provider), "chat_completions");
-    }
-
-    #[test]
-    fn test_get_wire_api_default() {
-        let adapter = CodexAdapter::new();
-        let provider = create_provider(json!({
-            "base_url": "https://example.com/v1"
-        }));
-        assert_eq!(adapter.get_wire_api(&provider), "responses");
-    }
 
     #[test]
     fn test_is_chat_completions_mode_true() {
