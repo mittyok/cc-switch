@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { Plus, Trash2, ArrowRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -35,6 +35,32 @@ export function ModelMappingEditor({
     onChange(next);
   };
 
+  /** Update the "from" key of an existing mapping */
+  const handleFromChange = useCallback(
+    (oldKey: string, newKey: string) => {
+      if (newKey === oldKey) return;
+      // Rebuild preserving order, replacing the old key with the new one
+      const next: Record<string, string> = {};
+      for (const [k, v] of Object.entries(value)) {
+        if (k === oldKey) {
+          next[newKey] = v;
+        } else {
+          next[k] = v;
+        }
+      }
+      onChange(next);
+    },
+    [value, onChange],
+  );
+
+  /** Update the "to" value of an existing mapping */
+  const handleToChange = useCallback(
+    (key: string, newValue: string) => {
+      onChange({ ...value, [key]: newValue });
+    },
+    [value, onChange],
+  );
+
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter") {
       e.preventDefault();
@@ -58,31 +84,18 @@ export function ModelMappingEditor({
         })}
       </p>
 
-      {/* Existing mappings */}
+      {/* Existing mappings — directly editable */}
       {entries.length > 0 && (
         <div className="space-y-2">
           {entries.map(([from, to]) => (
-            <div
+            <MappingRow
               key={from}
-              className="flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-2"
-            >
-              <span className="min-w-0 flex-1 truncate text-sm font-mono">
-                {from}
-              </span>
-              <ArrowRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-              <span className="min-w-0 flex-1 truncate text-sm font-mono">
-                {to}
-              </span>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="h-7 w-7 shrink-0 text-destructive hover:text-destructive"
-                onClick={() => handleRemove(from)}
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-              </Button>
-            </div>
+              fromValue={from}
+              toValue={to}
+              onFromCommit={(newKey) => handleFromChange(from, newKey)}
+              onToChange={(newVal) => handleToChange(from, newVal)}
+              onRemove={() => handleRemove(from)}
+            />
           ))}
         </div>
       )}
@@ -119,6 +132,84 @@ export function ModelMappingEditor({
           <Plus className="h-4 w-4" />
         </Button>
       </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  Inline-editable row for a single mapping entry                     */
+/* ------------------------------------------------------------------ */
+
+interface MappingRowProps {
+  fromValue: string;
+  toValue: string;
+  onFromCommit: (newKey: string) => void;
+  onToChange: (newValue: string) => void;
+  onRemove: () => void;
+}
+
+function MappingRow({
+  fromValue,
+  toValue,
+  onFromCommit,
+  onToChange,
+  onRemove,
+}: MappingRowProps) {
+  // We keep a local draft for the "from" key so we only commit on blur / Enter
+  // (changing the key on every keystroke would constantly recreate the object).
+  const [localFrom, setLocalFrom] = useState(fromValue);
+
+  const commitFrom = () => {
+    const trimmed = localFrom.trim();
+    if (!trimmed) {
+      // Revert if the user cleared the field
+      setLocalFrom(fromValue);
+      return;
+    }
+    if (trimmed !== fromValue) {
+      onFromCommit(trimmed);
+    }
+  };
+
+  const handleFromKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      (e.target as HTMLInputElement).blur();
+    }
+  };
+
+  const handleToKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      (e.target as HTMLInputElement).blur();
+    }
+  };
+
+  return (
+    <div className="flex items-center gap-2">
+      <Input
+        value={localFrom}
+        onChange={(e) => setLocalFrom(e.target.value)}
+        onBlur={commitFrom}
+        onKeyDown={handleFromKeyDown}
+        className="flex-1 font-mono text-sm"
+      />
+      <ArrowRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+      <Input
+        value={toValue}
+        onChange={(e) => onToChange(e.target.value)}
+        onKeyDown={handleToKeyDown}
+        className="flex-1 font-mono text-sm"
+      />
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className="h-7 w-7 shrink-0 text-destructive hover:text-destructive"
+        onClick={onRemove}
+      >
+        <Trash2 className="h-3.5 w-3.5" />
+      </Button>
     </div>
   );
 }
