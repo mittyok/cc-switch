@@ -9,6 +9,31 @@
 use crate::proxy::error::ProxyError;
 use serde_json::{json, Value};
 
+/// Strip `<think>…</think>` blocks from text content.
+///
+/// Many third-party models embed chain-of-thought inside `<think>` tags in the
+/// `content` field.  These waste tokens when round-tripped and confuse clients.
+fn strip_think_tags(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(start) = remaining.find("<think>") {
+        result.push_str(&remaining[..start]);
+        if let Some(end) = remaining[start..].find("</think>") {
+            remaining = &remaining[start + end + "</think>".len()..];
+        } else {
+            remaining = "";
+            break;
+        }
+    }
+    result.push_str(remaining);
+    let trimmed = result.trim();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Responses API request → Chat Completions request
 // ---------------------------------------------------------------------------
@@ -200,12 +225,10 @@ fn convert_input_to_messages(input: &[Value]) -> Result<Vec<Value>, ProxyError> 
             // ----- message items (have a `role` field) -----
             _ => {
                 let raw_role = item.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-                // 兼容性：developer → system（许多第三方 OpenAI 兼容 API 不支持 developer 角色）
-                let role = if raw_role == "developer" {
-                    "system"
-                } else {
-                    raw_role
-                };
+                // 保留 developer 角色：OpenAI 兼容 API 中 developer role 比 system
+                // 有更高的指令遵循优先级，对 agent 行为（持续使用工具等）至关重要。
+                // 不支持 developer 的 provider 通常会自行降级为 system。
+                let role = raw_role;
 
                 let chat_content = convert_responses_content_to_chat(item)?;
 
@@ -245,7 +268,14 @@ fn convert_responses_content_to_chat(msg: &Value) -> Result<Value, ProxyError> {
         match item_type {
             "input_text" | "output_text" | "text" => {
                 if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                    parts.push(json!({"type": "text", "text": text}));
+                    let text = if item_type == "output_text" {
+                        strip_think_tags(text)
+                    } else {
+                        text.to_string()
+                    };
+                    if !text.is_empty() {
+                        parts.push(json!({"type": "text", "text": text}));
+                    }
                 }
             }
             "input_image" => {
@@ -321,6 +351,7 @@ pub fn chat_completions_response_to_responses(body: Value) -> Result<Value, Prox
         .and_then(|m| m.get("content"))
         .and_then(|v| v.as_str())
     {
+        let content = strip_think_tags(content);
         if !content.is_empty() {
             output.push(json!({
                 "type": "message",
@@ -998,8 +1029,8 @@ mod tests {
     }
 
     #[test]
-    fn test_developer_role_normalized_to_system() {
-        // 第三方 OpenAI 兼容 API（如京东云）不支持 developer 角色
+    fn test_developer_role_preserved() {
+        // developer 角色应保留（比 system 有更高的指令遵循优先级）
         let input = json!({
             "model": "gpt-4o",
             "input": [
@@ -1016,7 +1047,7 @@ mod tests {
 
         let result = responses_request_to_chat_completions(input).unwrap();
         let messages = result["messages"].as_array().unwrap();
-        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["role"], "developer");
         assert_eq!(messages[1]["role"], "user");
     }
 

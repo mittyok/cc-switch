@@ -42,6 +42,13 @@ struct ChatDelta {
     role: Option<String>,
     #[serde(default)]
     content: Option<String>,
+    /// Some models (e.g. MiniMax) emit chain-of-thought via a dedicated
+    /// `reasoning_content` field instead of `<think>` tags in `content`.
+    /// We capture it here so it is silently consumed rather than discarded
+    /// by serde (which would lose the bytes for diagnostics).
+    #[serde(default)]
+    #[allow(dead_code)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Option<Vec<DeltaToolCall>>,
 }
@@ -65,6 +72,12 @@ struct DeltaFunction {
     arguments: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u32,
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatUsage {
     #[serde(default)]
@@ -73,6 +86,8 @@ struct ChatUsage {
     completion_tokens: u32,
     #[serde(default)]
     total_tokens: u32,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
 // ── Per-tool-call streaming state ──────────────────────────────────────────────
@@ -86,6 +101,38 @@ struct ToolState {
     accumulated_args: String,
     /// Whether `response.output_item.added` has been emitted for this tool.
     _started: bool,
+}
+
+// ── Think-tag stripping ────────────────────────────────────────────────────────
+
+/// Strip `<think>…</think>` blocks from text content.
+///
+/// Many third-party models (e.g. MiniMax) embed chain-of-thought inside
+/// `<think>` tags in the `content` field instead of using the structured
+/// `reasoning_content` field.  These tags waste tokens when round-tripped
+/// back to the model and confuse the Codex client.
+fn strip_think_tags(text: &str) -> String {
+    // Use a simple state machine approach: remove everything between <think> and </think> (inclusive)
+    let mut result = String::with_capacity(text.len());
+    let mut remaining = text;
+    while let Some(start) = remaining.find("<think>") {
+        result.push_str(&remaining[..start]);
+        if let Some(end) = remaining[start..].find("</think>") {
+            remaining = &remaining[start + end + "</think>".len()..];
+        } else {
+            // Unclosed <think> tag — drop everything after it
+            remaining = "";
+            break;
+        }
+    }
+    result.push_str(remaining);
+    // Clean up leading/trailing whitespace that may result from stripping
+    let trimmed = result.trim();
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 // ── SSE event helper ───────────────────────────────────────────────────────────
@@ -112,6 +159,8 @@ pub fn create_responses_sse_stream_from_chat_completions<E: std::error::Error + 
         // ── SSE parse buffer ───────────────────────────────────────────────
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
+        // Track total raw bytes received for diagnostics when no SSE events are produced
+        let mut total_raw_bytes: usize = 0;
 
         // ── State machine ──────────────────────────────────────────────────
         let mut response_id = String::new();
@@ -134,6 +183,7 @@ pub fn create_responses_sse_stream_from_chat_completions<E: std::error::Error + 
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
+                    total_raw_bytes += bytes.len();
                     crate::proxy::sse::append_utf8_safe(
                         &mut buffer,
                         &mut utf8_remainder,
@@ -415,6 +465,24 @@ pub fn create_responses_sse_stream_from_chat_completions<E: std::error::Error + 
             );
             yield Ok(sse_event("response.completed", &completed));
         }
+
+        // ── Empty stream detection ─────────────────────────────────────────
+        // If we received upstream bytes but never produced a single SSE event
+        // (has_sent_created is still false), the upstream likely returned a
+        // non-SSE response (e.g. rate-limit JSON with status 200). Log the
+        // raw content and yield an IO error so the Codex client's built-in
+        // retry mechanism kicks in instead of silently hanging.
+        if !has_sent_created && total_raw_bytes > 0 {
+            // Log remaining buffer content for debugging (truncate to avoid flooding)
+            let preview: String = buffer.chars().take(500).collect();
+            log::warn!(
+                "[Codex/ChatToResponses] 上游返回了 {total_raw_bytes} 字节但未包含有效 SSE 事件，\
+                 Codex 客户端将触发重试。上游原始内容: {preview}"
+            );
+            yield Err(std::io::Error::other(
+                "upstream returned non-SSE response; triggering client retry",
+            ));
+        }
     }
 }
 
@@ -448,6 +516,7 @@ fn finalize_open_items(
 
     // ── Close text content ─────────────────────────────────────────────────
     if has_content_part {
+        let cleaned_text = strip_think_tags(accumulated_text);
         // response.output_text.done
         events.push(sse_event(
             "response.output_text.done",
@@ -456,7 +525,7 @@ fn finalize_open_items(
                 "item_id": message_item_id,
                 "output_index": 0,
                 "content_index": 0,
-                "text": accumulated_text
+                "text": cleaned_text
             }),
         ));
 
@@ -470,7 +539,7 @@ fn finalize_open_items(
                 "content_index": 0,
                 "part": {
                     "type": "output_text",
-                    "text": accumulated_text
+                    "text": cleaned_text
                 }
             }),
         ));
@@ -480,9 +549,10 @@ fn finalize_open_items(
     if has_message_item {
         let mut content_parts = Vec::new();
         if has_content_part {
+            let cleaned_text = strip_think_tags(accumulated_text);
             content_parts.push(json!({
                 "type": "output_text",
-                "text": accumulated_text
+                "text": cleaned_text
             }));
         }
         events.push(sse_event(
@@ -552,10 +622,11 @@ fn build_response_completed(
     // Message item (if any).
     if has_message_item {
         let mut content = Vec::new();
-        if !accumulated_text.is_empty() {
+        let cleaned_text = strip_think_tags(accumulated_text);
+        if !cleaned_text.is_empty() {
             content.push(json!({
                 "type": "output_text",
-                "text": accumulated_text
+                "text": cleaned_text
             }));
         }
         output.push(json!({
@@ -581,11 +652,22 @@ fn build_response_completed(
     }
 
     let usage_json = match usage {
-        Some(u) => json!({
-            "input_tokens": u.prompt_tokens,
-            "output_tokens": u.completion_tokens,
-            "total_tokens": u.total_tokens
-        }),
+        Some(u) => {
+            let mut uj = json!({
+                "input_tokens": u.prompt_tokens,
+                "output_tokens": u.completion_tokens,
+                "total_tokens": u.total_tokens
+            });
+            // Forward cached_tokens from prompt_tokens_details
+            if let Some(details) = &u.prompt_tokens_details {
+                if details.cached_tokens > 0 {
+                    uj["input_tokens_details"] = json!({
+                        "cached_tokens": details.cached_tokens
+                    });
+                }
+            }
+            uj
+        }
         None => json!({
             "input_tokens": 0,
             "output_tokens": 0,
