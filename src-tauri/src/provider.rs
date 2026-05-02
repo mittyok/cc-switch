@@ -308,6 +308,15 @@ pub struct ProviderMeta {
         skip_serializing_if = "Option::is_none"
     )]
     pub model_mapping: Option<HashMap<String, String>>,
+    /// 每个模型的上下文窗口大小映射（目标模型名 → tokens）。
+    /// 当请求模型匹配时，cc-switch 会在 input_tokens 超过 80% 阈值时
+    /// 放大上报 token 数以触发 Codex auto compact。
+    #[serde(
+        rename = "modelContextWindows",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub model_context_windows: Option<HashMap<String, u32>>,
 }
 
 impl ProviderMeta {

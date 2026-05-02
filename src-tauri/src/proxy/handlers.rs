@@ -189,6 +189,52 @@ pub async fn get_status(State(state): State<ProxyState>) -> Result<Json<ProxySta
     Ok(Json(status))
 }
 
+/// `/v1/models` — Returns a synthetic models list with a capped `context_window`.
+///
+/// Codex Desktop uses `context_window * effective_context_window_percent / 100`
+/// to calculate `auto_compact_limit`.  By advertising a smaller context window
+/// for third-party providers (like MiniMax) that degrade before their nominal
+/// limit, we cause Codex to trigger auto-compaction early enough to keep the
+/// model working reliably.
+///
+/// The context window is capped at 100 000 tokens → auto_compact ≈ 90 000.
+pub async fn handle_models(State(state): State<ProxyState>) -> (StatusCode, Json<Value>) {
+    // Try to determine the model name from the active Codex provider
+    let model_name = {
+        let current = state.current_providers.read().await;
+        current
+            .get("codex")
+            .map(|(_, name)| name.clone())
+            .unwrap_or_else(|| "gpt-4o".to_string())
+    };
+
+    const CONTEXT_WINDOW: u64 = 100_000;
+
+    let model = json!({
+        "id": model_name,
+        "object": "model",
+        "created": 1_700_000_000u64,
+        "owned_by": "cc-switch",
+        "context_window": CONTEXT_WINDOW,
+        "effective_context_window_percent": 90,
+        "auto_compact_token_limit": (CONTEXT_WINDOW as f64 * 0.9) as u64,
+    });
+
+    log::debug!(
+        "[Models] 返回模型列表: {} (context_window={})",
+        model_name,
+        CONTEXT_WINDOW
+    );
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "object": "list",
+            "data": [model]
+        })),
+    )
+}
+
 // ============================================================================
 // Claude API 处理器（包含格式转换逻辑）
 // ============================================================================
@@ -726,7 +772,14 @@ async fn handle_codex_chat_to_responses(
     if is_sse || (is_stream && status.is_success()) {
         // Streaming path: convert Chat Completions SSE → Responses API SSE
         let upstream_stream = response.bytes_stream();
-        let responses_stream = create_responses_sse_stream_from_chat_completions(upstream_stream);
+        let context_window = ctx.provider.meta.as_ref().and_then(|m| {
+            m.model_context_windows
+                .as_ref()?
+                .get(&ctx.request_model)
+                .copied()
+        });
+        let responses_stream =
+            create_responses_sse_stream_from_chat_completions(upstream_stream, context_window);
 
         // Create usage collector for logging (parse Responses API SSE events for usage)
         let usage_collector = {

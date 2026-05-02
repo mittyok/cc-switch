@@ -282,6 +282,9 @@ impl ProxyServer {
             // 健康检查
             .route("/health", get(handlers::health_check))
             .route("/status", get(handlers::get_status))
+            // Models list — caps context_window to trigger Codex auto-compact early
+            .route("/v1/models", get(handlers::handle_models))
+            .route("/models", get(handlers::handle_models))
             // Claude API (支持带前缀和不带前缀两种格式)
             .route("/v1/messages", post(handlers::handle_messages))
             .route("/claude/v1/messages", post(handlers::handle_messages))

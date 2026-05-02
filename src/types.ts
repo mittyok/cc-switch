@@ -182,6 +182,8 @@ export interface ProviderMeta {
   // 通用模型名称映射（客户端发送的模型名 → 上游实际使用的模型名）
   // 例如: { "gpt-5.5": "gpt-4o", "claude-sonnet-4-5": "my-custom-model" }
   modelMapping?: Record<string, string>;
+  // 每个模型的上下文窗口大小（tokens），键为请求模型名
+  modelContextWindows?: Record<string, number>;
 }
 
 // Skill 同步方式

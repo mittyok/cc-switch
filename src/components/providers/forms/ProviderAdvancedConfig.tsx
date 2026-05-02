@@ -33,18 +33,22 @@ interface ProviderAdvancedConfigProps {
   testConfig: ProviderTestConfig;
   pricingConfig: ProviderPricingConfig;
   modelMapping: Record<string, string>;
+  modelContextWindows: Record<string, number>;
   onTestConfigChange: (config: ProviderTestConfig) => void;
   onPricingConfigChange: (config: ProviderPricingConfig) => void;
   onModelMappingChange: (mapping: Record<string, string>) => void;
+  onModelContextWindowsChange: (cw: Record<string, number>) => void;
 }
 
 export function ProviderAdvancedConfig({
   testConfig,
   pricingConfig,
   modelMapping,
+  modelContextWindows,
   onTestConfigChange,
   onPricingConfigChange,
   onModelMappingChange,
+  onModelContextWindowsChange,
 }: ProviderAdvancedConfigProps) {
   const { t } = useTranslation();
   const [isTestConfigOpen, setIsTestConfigOpen] = useState(testConfig.enabled);
@@ -383,6 +387,8 @@ export function ProviderAdvancedConfig({
           </div>
         </div>
       </div>
+      {/* 上下文窗口 — now shown inside model-mapping section */}
+
       {/* 模型名称映射 */}
       <div className="rounded-lg border border-border/50 bg-muted/20">
         <button
@@ -423,6 +429,8 @@ export function ProviderAdvancedConfig({
             <ModelMappingEditor
               value={modelMapping}
               onChange={onModelMappingChange}
+              contextWindows={modelContextWindows}
+              onContextWindowsChange={onModelContextWindowsChange}
             />
           </div>
         </div>

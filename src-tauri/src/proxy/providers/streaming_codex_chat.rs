@@ -152,8 +152,13 @@ fn sse_event(event_name: &str, data: &Value) -> Bytes {
 /// (`event: …\ndata: …\n\n`).  Each upstream `data: {…}` line is parsed and
 /// mapped through a state machine that emits the corresponding Responses API
 /// lifecycle events.
+///
+/// `context_window` — optional model context window size (tokens). When set,
+/// input_tokens exceeding 80% of this value will be inflated to trigger Codex
+/// Desktop's auto-compact mechanism. When `None`, no inflation is applied.
 pub fn create_responses_sse_stream_from_chat_completions<E: std::error::Error + Send + 'static>(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    context_window: Option<u32>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         // ── SSE parse buffer ───────────────────────────────────────────────
@@ -220,6 +225,20 @@ pub fn create_responses_sse_stream_from_chat_completions<E: std::error::Error + 
 
                                 // Emit response.completed
                                 if !has_sent_completed {
+                                    // Inject continuation if model stopped prematurely
+                                    if let Some((events, idx, state)) = maybe_inject_continuation(
+                                        &tool_states,
+                                        &latest_usage,
+                                        has_sent_message_item,
+                                        output_index,
+                                        &accumulated_text,
+                                    ) {
+                                        for ev in events {
+                                            yield Ok(ev);
+                                        }
+                                        tool_states.insert(idx, state);
+                                    }
+
                                     let completed = build_response_completed(
                                         &response_id,
                                         &model,
@@ -229,6 +248,7 @@ pub fn create_responses_sse_stream_from_chat_completions<E: std::error::Error + 
                                         has_sent_message_item,
                                         &tool_states,
                                         &latest_usage,
+                                        context_window,
                                     );
                                     yield Ok(sse_event("response.completed", &completed));
                                     has_sent_completed = true;
@@ -453,6 +473,20 @@ pub fn create_responses_sse_stream_from_chat_completions<E: std::error::Error + 
         }
 
         if finished && !has_sent_completed {
+            // Inject continuation if model stopped prematurely
+            if let Some((events, idx, state)) = maybe_inject_continuation(
+                &tool_states,
+                &latest_usage,
+                has_sent_message_item,
+                output_index,
+                &accumulated_text,
+            ) {
+                for ev in events {
+                    yield Ok(ev);
+                }
+                tool_states.insert(idx, state);
+            }
+
             let completed = build_response_completed(
                 &response_id,
                 &model,
@@ -462,6 +496,7 @@ pub fn create_responses_sse_stream_from_chat_completions<E: std::error::Error + 
                 has_sent_message_item,
                 &tool_states,
                 &latest_usage,
+                context_window,
             );
             yield Ok(sse_event("response.completed", &completed));
         }
@@ -489,6 +524,115 @@ pub fn create_responses_sse_stream_from_chat_completions<E: std::error::Error + 
 // ── Internal helpers ───────────────────────────────────────────────────────────
 
 /// Map Chat Completions `finish_reason` to a Responses API status string.
+/// When the model returns text-only (no tool calls) with a short output, it
+/// likely stopped prematurely instead of continuing the agent loop.  Inject a
+/// synthetic `exec_command` tool call so Codex treats the turn as incomplete
+/// and feeds the tool result back, giving the model another chance to continue.
+///
+/// Returns SSE events to yield + the synthetic tool state to add.
+fn maybe_inject_continuation(
+    tool_states: &HashMap<usize, ToolState>,
+    usage: &Option<ChatUsage>,
+    has_message_item: bool,
+    output_index: u32,
+    accumulated_text: &str,
+) -> Option<(Vec<Bytes>, usize, ToolState)> {
+    // Only inject when there are zero tool calls
+    if !tool_states.is_empty() {
+        return None;
+    }
+
+    // Only inject when output is short (< 150 tokens = likely premature stop)
+    let output_tokens = usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0);
+    if output_tokens > 150 {
+        return None;
+    }
+
+    // If the model's text contains our continuation marker or generic
+    // "waiting" patterns, it already received a continuation nudge and
+    // chose not to work.  Don't inject again to avoid infinite loops.
+    let lower = accumulated_text.to_lowercase();
+    if lower.contains("继续执行任务")
+        || lower.contains("已就位")
+        || lower.contains("等你指示")
+        || lower.contains("等你的下一步")
+        || lower.contains("ready")
+        || lower.contains("waiting for")
+    {
+        log::info!("[Codex/ChatToResponses] 模型回复了等待指示类文本，停止注入以避免空循环");
+        return None;
+    }
+
+    log::info!(
+        "[Codex/ChatToResponses] 模型未产出 tool call 且 output 较短 ({output_tokens} tokens), \
+         注入 continuation tool call 以维持 agent 循环"
+    );
+
+    let call_id = format!("call_continue_{}", chrono::Utc::now().timestamp_millis());
+    let tool_output_index = if has_message_item {
+        output_index + 1
+    } else {
+        output_index
+    };
+    let args = r#"{"cmd":["echo","继续执行任务"]}"#.to_string();
+
+    let state = ToolState {
+        output_index: tool_output_index,
+        call_id: call_id.clone(),
+        name: "exec_command".to_string(),
+        accumulated_args: args.clone(),
+        _started: true,
+    };
+
+    let mut events = Vec::new();
+
+    // response.output_item.added
+    events.push(sse_event(
+        "response.output_item.added",
+        &json!({
+            "type": "response.output_item.added",
+            "output_index": tool_output_index,
+            "item": {
+                "type": "function_call",
+                "call_id": &call_id,
+                "name": "exec_command",
+                "arguments": "",
+                "status": "in_progress"
+            }
+        }),
+    ));
+
+    // response.function_call_arguments.done
+    events.push(sse_event(
+        "response.function_call_arguments.done",
+        &json!({
+            "type": "response.function_call_arguments.done",
+            "item_id": &call_id,
+            "output_index": tool_output_index,
+            "arguments": &args
+        }),
+    ));
+
+    // response.output_item.done
+    events.push(sse_event(
+        "response.output_item.done",
+        &json!({
+            "type": "response.output_item.done",
+            "output_index": tool_output_index,
+            "item": {
+                "type": "function_call",
+                "call_id": &call_id,
+                "name": "exec_command",
+                "arguments": &args,
+                "status": "completed"
+            }
+        }),
+    ));
+
+    // Use index usize::MAX as a sentinel so it doesn't collide with real tool indices
+    Some((events, usize::MAX, state))
+}
+
 fn map_finish_reason(reason: &str) -> &'static str {
     match reason {
         "stop" | "tool_calls" => "completed",
@@ -616,6 +760,7 @@ fn build_response_completed(
     has_message_item: bool,
     tool_states: &HashMap<usize, ToolState>,
     usage: &Option<ChatUsage>,
+    context_window: Option<u32>,
 ) -> Value {
     let mut output = Vec::new();
 
@@ -653,10 +798,47 @@ fn build_response_completed(
 
     let usage_json = match usage {
         Some(u) => {
+            // ── Auto-compact nudge ────────────────────────────────────────────
+            // Codex Desktop triggers context compaction when the cumulative
+            // `total_usage_tokens` exceeds `auto_compact_limit` (244 800 by
+            // default, derived from the native 272 K context window).
+            // Third-party models like MiniMax stop producing tool calls around
+            // 120-130 K tokens — well below that threshold, so compaction never
+            // fires automatically.
+            //
+            // Work-around: when `input_tokens` crosses SOFT_LIMIT we report
+            // inflated values that push Codex's internal counter past its
+            // auto_compact_limit, triggering compaction on the next turn.
+            // Only `input_tokens` / `total_tokens` in the *reported* usage are
+            // affected; the real upstream values are used for cost tracking.
+            // Use configured context_window if available; otherwise no inflation
+            let (soft_limit, codex_auto_compact_limit) = match context_window {
+                Some(cw) => ((cw as f64 * 0.8) as u32, 244_800u32),
+                None => (u32::MAX, 244_800u32), // No inflation when not configured
+            };
+
+            let (reported_input, reported_total) = if u.prompt_tokens > soft_limit {
+                // Scale up so the cumulative counter exceeds the Codex threshold
+                let scale =
+                    (codex_auto_compact_limit as f64 / u.prompt_tokens as f64).max(1.0) * 1.05; // 5 % margin to ensure we actually exceed it
+                let inflated_input = (u.prompt_tokens as f64 * scale).round() as u32;
+                let inflated_total = inflated_input + u.completion_tokens;
+                log::info!(
+                    "[Codex/ChatToResponses] 上下文放大触发 auto-compact: \
+                         真实 input={} → 上报 {} (×{:.2})",
+                    u.prompt_tokens,
+                    inflated_input,
+                    scale
+                );
+                (inflated_input, inflated_total)
+            } else {
+                (u.prompt_tokens, u.total_tokens)
+            };
+
             let mut uj = json!({
-                "input_tokens": u.prompt_tokens,
+                "input_tokens": reported_input,
                 "output_tokens": u.completion_tokens,
-                "total_tokens": u.total_tokens
+                "total_tokens": reported_total
             });
             // Forward cached_tokens from prompt_tokens_details
             if let Some(details) = &u.prompt_tokens_details {
@@ -743,7 +925,7 @@ mod tests {
             "data: [DONE]\n\n",
         );
 
-        let converted = create_responses_sse_stream_from_chat_completions(mock_stream(input));
+        let converted = create_responses_sse_stream_from_chat_completions(mock_stream(input), None);
         let events = collect_events(converted).await;
         let parsed: Vec<_> = events.iter().filter_map(|e| parse_sse(e)).collect();
 
@@ -804,7 +986,7 @@ mod tests {
             "data: [DONE]\n\n",
         );
 
-        let converted = create_responses_sse_stream_from_chat_completions(mock_stream(input));
+        let converted = create_responses_sse_stream_from_chat_completions(mock_stream(input), None);
         let events = collect_events(converted).await;
         let parsed: Vec<_> = events.iter().filter_map(|e| parse_sse(e)).collect();
 
@@ -857,7 +1039,7 @@ mod tests {
             "data: [DONE]\n\n",
         );
 
-        let converted = create_responses_sse_stream_from_chat_completions(mock_stream(input));
+        let converted = create_responses_sse_stream_from_chat_completions(mock_stream(input), None);
         let events = collect_events(converted).await;
         let parsed: Vec<_> = events.iter().filter_map(|e| parse_sse(e)).collect();
 
@@ -878,7 +1060,7 @@ mod tests {
             "data: [DONE]\n\n",
         );
 
-        let converted = create_responses_sse_stream_from_chat_completions(mock_stream(input));
+        let converted = create_responses_sse_stream_from_chat_completions(mock_stream(input), None);
         let events = collect_events(converted).await;
         let parsed: Vec<_> = events.iter().filter_map(|e| parse_sse(e)).collect();
 
@@ -898,7 +1080,7 @@ mod tests {
             "data: {\"id\":\"chatcmpl-nd\",\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}]}\n\n",
         );
 
-        let converted = create_responses_sse_stream_from_chat_completions(mock_stream(input));
+        let converted = create_responses_sse_stream_from_chat_completions(mock_stream(input), None);
         let events = collect_events(converted).await;
         let parsed: Vec<_> = events.iter().filter_map(|e| parse_sse(e)).collect();
 
@@ -922,7 +1104,7 @@ mod tests {
             "data: [DONE]\n\n",
         );
 
-        let converted = create_responses_sse_stream_from_chat_completions(mock_stream(input));
+        let converted = create_responses_sse_stream_from_chat_completions(mock_stream(input), None);
         let events = collect_events(converted).await;
         let parsed: Vec<_> = events.iter().filter_map(|e| parse_sse(e)).collect();
 
@@ -948,7 +1130,7 @@ mod tests {
             "data: [DONE]\n\n",
         );
 
-        let converted = create_responses_sse_stream_from_chat_completions(mock_stream(input));
+        let converted = create_responses_sse_stream_from_chat_completions(mock_stream(input), None);
         let events = collect_events(converted).await;
         let parsed: Vec<_> = events.iter().filter_map(|e| parse_sse(e)).collect();
 

@@ -218,6 +218,10 @@ export function ProviderForm({
     () => initialData?.meta?.modelMapping ?? {},
   );
 
+  const [modelContextWindows, setModelContextWindows] = useState<
+    Record<string, number>
+  >(() => initialData?.meta?.modelContextWindows ?? {});
+
   const { category } = useProviderCategory({
     appId,
     selectedPresetId,
@@ -250,6 +254,7 @@ export function ProviderForm({
       ),
     });
     setModelMapping(initialData?.meta?.modelMapping ?? {});
+    setModelContextWindows(initialData?.meta?.modelContextWindows ?? {});
   }, [appId, initialData, supportsFullUrl]);
 
   const defaultValues: ProviderFormData = useMemo(
@@ -1230,6 +1235,11 @@ export function ProviderForm({
       // 模型名称映射（仅在有映射时保存）
       modelMapping:
         Object.keys(modelMapping).length > 0 ? modelMapping : undefined,
+      // 每个模型的上下文窗口
+      modelContextWindows:
+        Object.keys(modelContextWindows).length > 0
+          ? modelContextWindows
+          : undefined,
     };
 
     if (!isCodexOauthProvider && "codexFastMode" in nextMeta) {
@@ -2131,9 +2141,11 @@ export function ProviderForm({
                 testConfig={testConfig}
                 pricingConfig={pricingConfig}
                 modelMapping={modelMapping}
+                modelContextWindows={modelContextWindows}
                 onTestConfigChange={setTestConfig}
                 onPricingConfigChange={setPricingConfig}
                 onModelMappingChange={setModelMapping}
+                onModelContextWindowsChange={setModelContextWindows}
               />
             )}
 
