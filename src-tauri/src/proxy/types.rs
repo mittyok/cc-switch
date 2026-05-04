@@ -28,11 +28,11 @@ pub struct ProxyConfig {
 }
 
 fn default_streaming_first_byte_timeout() -> u64 {
-    60
+    120
 }
 
 fn default_streaming_idle_timeout() -> u64 {
-    120
+    600
 }
 
 fn default_non_streaming_timeout() -> u64 {
@@ -48,8 +48,8 @@ impl Default for ProxyConfig {
             request_timeout: 600,
             enable_logging: true,
             live_takeover_active: false,
-            streaming_first_byte_timeout: 60,
-            streaming_idle_timeout: 120,
+            streaming_first_byte_timeout: 120,
+            streaming_idle_timeout: 600,
             non_streaming_timeout: 600,
         }
     }

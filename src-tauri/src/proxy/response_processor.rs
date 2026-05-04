@@ -610,6 +610,8 @@ pub fn create_logged_passthrough_stream(
         let mut utf8_remainder: Vec<u8> = Vec::new();
         let mut collector = usage_collector;
         let mut is_first_chunk = true;
+        let mut total_bytes: usize = 0;
+        let mut chunk_count: usize = 0;
 
         // 超时配置
         let first_byte_timeout = if timeout_config.first_byte_timeout > 0 {
@@ -652,10 +654,19 @@ pub fn create_logged_passthrough_stream(
 
             match chunk_result {
                 Some(Ok(bytes)) => {
+                    total_bytes += bytes.len();
+                    chunk_count += 1;
                     if is_first_chunk {
+                        log::info!(
+                            "[{tag}] 已接收上游流式首包: bytes={}, 配置: first_byte={}s idle={}s",
+                            bytes.len(),
+                            timeout_config.first_byte_timeout,
+                            timeout_config.idle_timeout
+                        );
+                    } else if chunk_count % 10 == 0 {
                         log::debug!(
-                            "[{tag}] 已接收上游流式首包: bytes={}",
-                            bytes.len()
+                            "[{tag}] 上游流式数据: chunk #{}/{} bytes (total {})",
+                            chunk_count, bytes.len(), total_bytes
                         );
                     }
                     is_first_chunk = false;
@@ -687,12 +698,19 @@ pub fn create_logged_passthrough_stream(
                     yield Ok(bytes);
                 }
                 Some(Err(e)) => {
-                    log::error!("[{tag}] 流错误: {e}");
+                    log::error!(
+                        "[{tag}] 上游流异常中断 (已收 {} chunks, {} bytes): {}",
+                        chunk_count, total_bytes, e
+                    );
                     yield Err(std::io::Error::other(e.to_string()));
                     break;
                 }
                 None => {
                     // 流正常结束
+                    log::info!(
+                        "[{tag}] 上游流正常结束: {} chunks, {} bytes total",
+                        chunk_count, total_bytes
+                    );
                     break;
                 }
             }

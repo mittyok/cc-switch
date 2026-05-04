@@ -185,7 +185,10 @@ pub fn create_responses_sse_stream_from_chat_completions<E: std::error::Error + 
 
         tokio::pin!(stream);
 
+        let mut upstream_chunk_count: usize = 0;
+
         while let Some(chunk) = stream.next().await {
+            upstream_chunk_count += 1;
             match chunk {
                 Ok(bytes) => {
                     total_raw_bytes += bytes.len();
@@ -208,6 +211,10 @@ pub fn create_responses_sse_stream_from_chat_completions<E: std::error::Error + 
 
                             // ── [DONE] sentinel ────────────────────────────
                             if data.trim() == "[DONE]" {
+                                log::info!(
+                                    "[Codex/ChatToResponses] 收到 [DONE], has_sent_created={}, finished={}",
+                                    has_sent_created, finished
+                                );
                                 if !finished {
                                     // Close any still-open text / tool items.
                                     for event in finalize_open_items(
@@ -451,7 +458,10 @@ pub fn create_responses_sse_stream_from_chat_completions<E: std::error::Error + 
                     }
                 }
                 Err(e) => {
-                    log::error!("[Codex/ChatToResponses] Stream error: {e}");
+                    log::error!(
+                        "[Codex/ChatToResponses] Stream error (已收 {} upstream chunks, {} bytes): {}",
+                        upstream_chunk_count, total_raw_bytes, e
+                    );
                     break;
                 }
             }
@@ -500,6 +510,18 @@ pub fn create_responses_sse_stream_from_chat_completions<E: std::error::Error + 
             );
             yield Ok(sse_event("response.completed", &completed));
         }
+
+        // ── Stream end summary ──────────────────────────────────────────────
+        log::info!(
+            "[Codex/ChatToResponses] 上游流结束: upstream_chunks={}, total_raw_bytes={}, \
+             has_sent_created={}, finished={}, has_sent_completed={}, sent_message_item={}",
+            upstream_chunk_count,
+            total_raw_bytes,
+            has_sent_created,
+            finished,
+            has_sent_completed,
+            has_sent_message_item
+        );
 
         // ── Empty stream detection ─────────────────────────────────────────
         // If we received upstream bytes but never produced a single SSE event

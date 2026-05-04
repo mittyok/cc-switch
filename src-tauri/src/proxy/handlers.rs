@@ -764,12 +764,12 @@ async fn handle_codex_chat_to_responses(
     response: super::hyper_client::ProxyResponse,
     ctx: &RequestContext,
     state: &ProxyState,
-    is_stream: bool,
+    _is_stream: bool,
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
     let is_sse = response.is_sse();
 
-    if is_sse || (is_stream && status.is_success()) {
+    if is_sse {
         // Streaming path: convert Chat Completions SSE → Responses API SSE
         let upstream_stream = response.bytes_stream();
         let context_window = ctx.provider.meta.as_ref().and_then(|m| {

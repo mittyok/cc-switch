@@ -25,8 +25,8 @@ export function AutoFailoverConfigPanel({
   const [formData, setFormData] = useState({
     autoFailoverEnabled: false,
     maxRetries: "3",
-    streamingFirstByteTimeout: "60",
-    streamingIdleTimeout: "120",
+    streamingFirstByteTimeout: "120",
+    streamingIdleTimeout: "600",
     nonStreamingTimeout: "600",
     circuitFailureThreshold: "5",
     circuitSuccessThreshold: "2",
@@ -67,8 +67,8 @@ export function AutoFailoverConfigPanel({
     // 定义各字段的有效范围
     const ranges = {
       maxRetries: { min: 0, max: 10 },
-      streamingFirstByteTimeout: { min: 1, max: 120 },
-      streamingIdleTimeout: { min: 0, max: 600 },
+      streamingFirstByteTimeout: { min: 1, max: 300 },
+      streamingIdleTimeout: { min: 0, max: 1800 },
       nonStreamingTimeout: { min: 60, max: 1200 },
       circuitFailureThreshold: { min: 1, max: 20 },
       circuitSuccessThreshold: { min: 1, max: 10 },
@@ -308,7 +308,7 @@ export function AutoFailoverConfigPanel({
                 id={`streamingFirstByte-${appType}`}
                 type="number"
                 min="1"
-                max="120"
+                max="300"
                 value={formData.streamingFirstByteTimeout}
                 onChange={(e) =>
                   setFormData({
@@ -321,7 +321,7 @@ export function AutoFailoverConfigPanel({
               <p className="text-xs text-muted-foreground">
                 {t(
                   "proxy.autoFailover.streamingFirstByteHint",
-                  "等待首个数据块的最大时间，范围 1-120 秒，默认 60 秒",
+                  "等待首个数据块的最大时间，范围 1-300 秒，默认 120 秒",
                 )}
               </p>
             </div>
@@ -334,7 +334,7 @@ export function AutoFailoverConfigPanel({
                 id={`streamingIdle-${appType}`}
                 type="number"
                 min="0"
-                max="600"
+                max="1800"
                 value={formData.streamingIdleTimeout}
                 onChange={(e) =>
                   setFormData({
@@ -347,7 +347,7 @@ export function AutoFailoverConfigPanel({
               <p className="text-xs text-muted-foreground">
                 {t(
                   "proxy.autoFailover.streamingIdleHint",
-                  "数据块之间的最大间隔，范围 60-600 秒，填 0 禁用（防止中途卡住）",
+                  "数据块之间的最大间隔，范围 0-1800 秒，填 0 禁用（防止中途卡住）",
                 )}
               </p>
             </div>
