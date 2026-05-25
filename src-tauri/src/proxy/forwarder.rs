@@ -11,8 +11,8 @@ use super::{
     log_codes::fwd as log_fwd,
     provider_router::ProviderRouter,
     providers::{
-        gemini_shadow::GeminiShadowStore, get_adapter, AuthInfo, AuthStrategy, ProviderAdapter,
-        ProviderType,
+        codex_chat_history::CodexChatHistoryStore, gemini_shadow::GeminiShadowStore, get_adapter,
+        AuthInfo, AuthStrategy, ProviderAdapter, ProviderType,
     },
     thinking_budget_rectifier::{rectify_thinking_budget, should_rectify_thinking_budget},
     thinking_rectifier::{
@@ -92,6 +92,7 @@ pub struct RequestForwarder {
     status: Arc<RwLock<ProxyStatus>>,
     current_providers: Arc<RwLock<std::collections::HashMap<String, (String, String)>>>,
     gemini_shadow: Arc<GeminiShadowStore>,
+    codex_chat_history: Arc<CodexChatHistoryStore>,
     /// 故障转移切换管理器
     failover_manager: Arc<FailoverSwitchManager>,
     /// AppHandle，用于发射事件和更新托盘
@@ -128,6 +129,7 @@ impl RequestForwarder {
         status: Arc<RwLock<ProxyStatus>>,
         current_providers: Arc<RwLock<std::collections::HashMap<String, (String, String)>>>,
         gemini_shadow: Arc<GeminiShadowStore>,
+        codex_chat_history: Arc<CodexChatHistoryStore>,
         failover_manager: Arc<FailoverSwitchManager>,
         app_handle: Option<tauri::AppHandle>,
         current_provider_id_at_start: String,
@@ -148,6 +150,7 @@ impl RequestForwarder {
             status,
             current_providers,
             gemini_shadow,
+            codex_chat_history,
             failover_manager,
             app_handle,
             current_provider_id_at_start,
@@ -1146,69 +1149,23 @@ impl RequestForwarder {
 
         // 转换请求体（如果需要）
         let request_body = if codex_responses_to_chat {
-            let input_items = mapped_body.get("input").and_then(|v| v.as_array());
-            if let Some(items) = input_items {
-                log::warn!(
-                    "[codex->chat] converting {} input items: {}",
-                    items.len(),
-                    items
-                        .iter()
-                        .enumerate()
-                        .map(|(i, item)| {
-                            let t = item
-                                .get("type")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("message");
-                            let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("-");
-                            let call_id = item
-                                .get("call_id")
-                                .or_else(|| item.get("id"))
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("-");
-                            format!("[{i}] type={t} role={role} call_id={call_id}")
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
-            log_codex_chat_tools_summary("incoming", mapped_body.get("tools"));
-            let converted =
-                super::providers::transform_codex_chat::responses_to_chat_completions(mapped_body)?;
-            log_codex_chat_tools_summary("converted", converted.get("tools"));
-            if let Some(msgs) = converted.get("messages").and_then(|v| v.as_array()) {
+            let mut mapped_body = mapped_body;
+            let restored = self
+                .codex_chat_history
+                .enrich_request(&mut mapped_body)
+                .await;
+            if restored > 0 {
                 log::debug!(
-                    "[codex->chat] produced {} chat messages: {}",
-                    msgs.len(),
-                    msgs.iter()
-                        .enumerate()
-                        .map(|(i, m)| {
-                            let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
-                            let tc_ids: Vec<&str> = m
-                                .get("tool_calls")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
-                            let tid = m
-                                .get("tool_call_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("-");
-                            if !tc_ids.is_empty() {
-                                format!("[{i}] role={role} tool_calls={}", tc_ids.join("+"))
-                            } else if tid != "-" {
-                                format!("[{i}] role={role} tool_call_id={tid}")
-                            } else {
-                                format!("[{i}] role={role}")
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    "[Codex] Restored {restored} cached function call(s) for Chat upstream"
                 );
             }
-            converted
+            super::providers::apply_codex_chat_upstream_model(provider, &mut mapped_body);
+            let reasoning_config =
+                super::providers::resolve_codex_chat_reasoning_config(provider, &mapped_body);
+            super::providers::transform_codex_chat::responses_to_chat_completions_with_reasoning(
+                mapped_body,
+                reasoning_config.as_ref(),
+            )?
         } else if needs_transform {
             if adapter.name() == "Claude" {
                 let api_format = resolved_claude_api_format
@@ -1963,34 +1920,6 @@ impl RequestForwarder {
     }
 }
 
-fn log_codex_chat_tools_summary(stage: &str, tools: Option<&Value>) {
-    let Some(tools) = tools.and_then(|value| value.as_array()) else {
-        log::warn!("[codex->chat] {stage} tools: absent");
-        return;
-    };
-
-    log::warn!(
-        "[codex->chat] {stage} tools: count={} {}",
-        tools.len(),
-        tools
-            .iter()
-            .take(20)
-            .enumerate()
-            .map(|(i, tool)| {
-                let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("?");
-                let name = tool
-                    .pointer("/function/name")
-                    .or_else(|| tool.get("name"))
-                    .or_else(|| tool.get("tool_name"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
-                format!("[{i}] type={tool_type} name={name}")
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-}
-
 /// 从 ProxyError 中提取错误消息
 fn extract_error_message(error: &ProxyError) -> Option<String> {
     match error {
@@ -2479,6 +2408,7 @@ mod tests {
             status: Arc::new(RwLock::new(ProxyStatus::default())),
             current_providers: Arc::new(RwLock::new(HashMap::new())),
             gemini_shadow: Arc::new(GeminiShadowStore::new()),
+            codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
             app_handle: None,
             current_provider_id_at_start: String::new(),

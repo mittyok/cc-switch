@@ -1,9 +1,15 @@
 //! OpenAI Chat Completions SSE → OpenAI Responses SSE conversion.
 
-use super::transform_codex_chat::{
-    chat_usage_to_responses_usage, is_likely_tool_name, response_id_from_chat_id,
-    response_status_from_finish_reason, split_leading_think_block, strip_leading_think_open_tag,
+use super::{
+    codex_chat_common::{
+        extract_reasoning_field_text, response_function_call_item, split_leading_think_block,
+        strip_leading_think_open_tag,
+    },
+    transform_codex_chat::{
+        chat_usage_to_responses_usage, response_id_from_chat_id, response_status_from_finish_reason,
+    },
 };
+use crate::proxy::json_canonical::canonicalize_tool_arguments_str;
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
@@ -42,18 +48,6 @@ struct InlineThinkState {
     buffer: String,
 }
 
-/// State machine for detecting pseudo-tool-call text:
-///   `TOOLNAME\n{...json...}`
-/// Text is buffered until the first newline; if the preceding word
-/// is a known tool name the rest is treated as function-call arguments.
-#[derive(Debug, Default, PartialEq)]
-enum PseudoDetect {
-    #[default]
-    Pending, // collecting text before the first newline
-    ToolCall, // confirmed tool call — buffering JSON args
-    Text,     // not a tool call — normal text output
-}
-
 #[derive(Debug, Default)]
 struct ToolCallState {
     output_index: Option<u32>,
@@ -61,6 +55,7 @@ struct ToolCallState {
     call_id: String,
     name: String,
     arguments: String,
+    reasoning_content: String,
     added: bool,
     done: bool,
 }
@@ -80,12 +75,6 @@ struct ChatToResponsesState {
     output_items: Vec<(u32, Value)>,
     latest_usage: Option<Value>,
     finish_reason: Option<String>,
-    // pseudo-tool-call detection
-    known_tool_names: std::collections::HashSet<String>,
-    pseudo_detect: PseudoDetect,
-    pseudo_line_buf: String,  // text before first newline
-    pseudo_args_buf: String,  // JSON args buffer (ToolCall mode)
-    pseudo_tool_name: String, // confirmed tool name (ToolCall mode)
 }
 
 impl Default for ChatToResponsesState {
@@ -104,11 +93,6 @@ impl Default for ChatToResponsesState {
             output_items: Vec::new(),
             latest_usage: None,
             finish_reason: None,
-            known_tool_names: std::collections::HashSet::new(),
-            pseudo_detect: PseudoDetect::Pending,
-            pseudo_line_buf: String::new(),
-            pseudo_args_buf: String::new(),
-            pseudo_tool_name: String::new(),
         }
     }
 }
@@ -156,9 +140,12 @@ impl ChatToResponsesState {
 
             if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                 events.extend(self.flush_inline_think_at_boundary());
+                let reasoning_for_tool_call = self.current_reasoning_text();
                 events.extend(self.finalize_reasoning());
                 for tool_call in tool_calls {
-                    events.extend(self.push_tool_call_delta(tool_call));
+                    events.extend(
+                        self.push_tool_call_delta(tool_call, reasoning_for_tool_call.as_deref()),
+                    );
                 }
             }
         }
@@ -342,8 +329,7 @@ impl ChatToResponsesState {
         events
     }
 
-    /// Internal emitter: unconditionally emit text delta events (bypasses detection).
-    fn emit_text_delta(&mut self, delta: &str) -> Vec<Bytes> {
+    fn push_text_delta(&mut self, delta: &str) -> Vec<Bytes> {
         let mut events = Vec::new();
 
         if !self.text.added {
@@ -399,58 +385,11 @@ impl ChatToResponsesState {
         events
     }
 
-    /// Outer text entry point: detects pseudo-tool-call pattern before emitting.
-    ///
-    /// Buffers text until the first newline.  If the text before that newline
-    /// is a known tool name the content is accumulated as JSON arguments and
-    /// no text events are emitted; a function_call item is synthesised at
-    /// finalisation time.  Otherwise text flows through normally.
-    fn push_text_delta(&mut self, delta: &str) -> Vec<Bytes> {
-        if self.known_tool_names.is_empty() {
-            return self.emit_text_delta(delta);
-        }
-
-        match self.pseudo_detect {
-            PseudoDetect::Text => self.emit_text_delta(delta),
-            PseudoDetect::ToolCall => {
-                self.pseudo_args_buf.push_str(delta);
-                Vec::new()
-            }
-            PseudoDetect::Pending => {
-                if let Some(nl_pos) = delta.find('\n') {
-                    let before = &delta[..nl_pos];
-                    let after = &delta[nl_pos + 1..];
-                    self.pseudo_line_buf.push_str(before);
-                    let name = self.pseudo_line_buf.trim().to_string();
-
-                    if is_likely_tool_name(&name) && self.known_tool_names.contains(&name) {
-                        log::debug!("[Codex-stream] pseudo-tool-call detected: tool={name}");
-                        self.pseudo_tool_name = name;
-                        self.pseudo_detect = PseudoDetect::ToolCall;
-                        if !after.is_empty() {
-                            self.pseudo_args_buf.push_str(after);
-                        }
-                        Vec::new()
-                    } else {
-                        self.pseudo_detect = PseudoDetect::Text;
-                        let first_line = std::mem::take(&mut self.pseudo_line_buf);
-                        // Reconstruct: first_line + '\n' + after
-                        let flush = if after.is_empty() {
-                            format!("{first_line}\n")
-                        } else {
-                            format!("{first_line}\n{after}")
-                        };
-                        self.emit_text_delta(&flush)
-                    }
-                } else {
-                    self.pseudo_line_buf.push_str(delta);
-                    Vec::new()
-                }
-            }
-        }
+    fn current_reasoning_text(&self) -> Option<String> {
+        (!self.reasoning.text.trim().is_empty()).then(|| self.reasoning.text.trim().to_string())
     }
 
-    fn push_tool_call_delta(&mut self, tool_call: &Value) -> Vec<Bytes> {
+    fn push_tool_call_delta(&mut self, tool_call: &Value, reasoning: Option<&str>) -> Vec<Bytes> {
         let chat_index = tool_call.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let id_delta = tool_call
             .get("id")
@@ -483,6 +422,12 @@ impl ChatToResponsesState {
             if !args_delta.is_empty() {
                 state.arguments.push_str(&args_delta);
             }
+            if state.reasoning_content.is_empty() {
+                if let Some(reasoning) = reasoning.map(str::trim).filter(|value| !value.is_empty())
+                {
+                    state.reasoning_content = reasoning.to_string();
+                }
+            }
 
             if !state.added && (!state.call_id.is_empty() || !state.name.is_empty()) {
                 should_add = true;
@@ -497,7 +442,9 @@ impl ChatToResponsesState {
 
         if should_add {
             let assigned = self.next_output_index();
-            let state = self.tools.get_mut(&chat_index).expect("tool state exists");
+            let Some(state) = self.tools.get_mut(&chat_index) else {
+                return events;
+            };
             state.added = true;
             if state.call_id.is_empty() {
                 state.call_id = format!("call_{chat_index}");
@@ -509,19 +456,21 @@ impl ChatToResponsesState {
             state.item_id = format!("fc_{}", state.call_id);
             item_id = state.item_id.clone();
 
+            let item = response_function_call_item(
+                &item_id,
+                "in_progress",
+                &state.call_id,
+                &state.name,
+                "",
+                Some(&state.reasoning_content),
+            );
+
             events.push(sse_event(
                 "response.output_item.added",
                 json!({
                     "type": "response.output_item.added",
                     "output_index": assigned,
-                    "item": {
-                        "id": item_id,
-                        "type": "function_call",
-                        "status": "in_progress",
-                        "call_id": state.call_id,
-                        "name": state.name,
-                        "arguments": ""
-                    }
+                    "item": item
                 }),
             ));
 
@@ -561,7 +510,6 @@ impl ChatToResponsesState {
         let mut events = self.ensure_response_started();
         events.extend(self.flush_inline_think_at_boundary());
         events.extend(self.finalize_reasoning());
-        events.extend(self.finalize_pseudo_tool_call());
         events.extend(self.finalize_text());
         events.extend(self.finalize_tools());
 
@@ -580,114 +528,6 @@ impl ChatToResponsesState {
         ));
         self.completed = true;
         events
-    }
-
-    /// Resolve pending pseudo-tool-call detection at stream end.
-    ///
-    /// - `Pending` (no newline seen): flush buffered text as normal text.
-    /// - `ToolCall`: parse JSON from args buffer and emit function_call events.
-    ///   Falls back to text if the args buffer doesn't contain valid JSON.
-    fn finalize_pseudo_tool_call(&mut self) -> Vec<Bytes> {
-        match self.pseudo_detect {
-            PseudoDetect::Text => Vec::new(),
-            PseudoDetect::Pending => {
-                self.pseudo_detect = PseudoDetect::Text;
-                let buf = std::mem::take(&mut self.pseudo_line_buf);
-                if buf.is_empty() {
-                    Vec::new()
-                } else {
-                    self.emit_text_delta(&buf)
-                }
-            }
-            PseudoDetect::ToolCall => {
-                let name = std::mem::take(&mut self.pseudo_tool_name);
-                let args_buf = std::mem::take(&mut self.pseudo_args_buf);
-
-                // Lenient parse: accept trailing non-JSON content
-                let arguments_value: Option<Value> = serde_json::Deserializer::from_str(&args_buf)
-                    .into_iter::<Value>()
-                    .next()
-                    .and_then(|r| r.ok())
-                    .filter(|v| v.is_object());
-
-                let arguments = match arguments_value {
-                    Some(v) => serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string()),
-                    None => {
-                        log::warn!(
-                            "[Codex-stream] pseudo-tool-call args not valid JSON \
-                             (tool={name}), falling back to text"
-                        );
-                        self.pseudo_detect = PseudoDetect::Text;
-                        let text = format!("{name}\n{args_buf}");
-                        return self.emit_text_delta(&text);
-                    }
-                };
-
-                let output_index = self.next_output_index();
-                let call_id = "call_pseudo_0".to_string();
-                let item_id = format!("fc_{call_id}");
-                let item = json!({
-                    "id": item_id,
-                    "type": "function_call",
-                    "status": "completed",
-                    "call_id": call_id,
-                    "name": name,
-                    "arguments": arguments
-                });
-                self.output_items.push((output_index, item.clone()));
-
-                log::debug!(
-                    "[Codex-stream] pseudo-tool-call finalised: \
-                     tool={}, args_len={}",
-                    item["name"],
-                    arguments.len()
-                );
-
-                vec![
-                    sse_event(
-                        "response.output_item.added",
-                        json!({
-                            "type": "response.output_item.added",
-                            "output_index": output_index,
-                            "item": {
-                                "id": item_id,
-                                "type": "function_call",
-                                "status": "in_progress",
-                                "call_id": call_id,
-                                "name": name,
-                                "arguments": ""
-                            }
-                        }),
-                    ),
-                    sse_event(
-                        "response.function_call_arguments.delta",
-                        json!({
-                            "type": "response.function_call_arguments.delta",
-                            "item_id": item_id,
-                            "output_index": output_index,
-                            "delta": arguments
-                        }),
-                    ),
-                    sse_event(
-                        "response.function_call_arguments.done",
-                        json!({
-                            "type": "response.function_call_arguments.done",
-                            "item_id": item_id,
-                            "output_index": output_index,
-                            "arguments": arguments
-                        }),
-                    ),
-                    sse_event(
-                        "response.output_item.done",
-                        json!({
-                            "type": "response.output_item.done",
-                            "output_index": output_index,
-                            "item": item
-                        }),
-                    ),
-                ]
-            }
-        }
     }
 
     fn finalize_reasoning(&mut self) -> Vec<Bytes> {
@@ -817,7 +657,9 @@ impl ChatToResponsesState {
                 .unwrap_or(false)
             {
                 let assigned = self.next_output_index();
-                let state = self.tools.get_mut(&key).expect("tool state exists");
+                let Some(state) = self.tools.get_mut(&key) else {
+                    continue;
+                };
                 state.added = true;
                 if state.call_id.is_empty() {
                     state.call_id = format!("call_{key}");
@@ -827,19 +669,20 @@ impl ChatToResponsesState {
                 }
                 state.output_index = Some(assigned);
                 state.item_id = format!("fc_{}", state.call_id);
+                let item = response_function_call_item(
+                    &state.item_id,
+                    "in_progress",
+                    &state.call_id,
+                    &state.name,
+                    "",
+                    Some(&state.reasoning_content),
+                );
                 add_event = Some(sse_event(
                     "response.output_item.added",
                     json!({
                         "type": "response.output_item.added",
                         "output_index": assigned,
-                        "item": {
-                            "id": state.item_id,
-                            "type": "function_call",
-                            "status": "in_progress",
-                            "call_id": state.call_id,
-                            "name": state.name,
-                            "arguments": ""
-                        }
+                        "item": item
                     }),
                 ));
             }
@@ -848,16 +691,19 @@ impl ChatToResponsesState {
                 events.push(event);
             }
 
-            let state = self.tools.get_mut(&key).expect("tool state exists");
+            let Some(state) = self.tools.get_mut(&key) else {
+                continue;
+            };
             let output_index = state.output_index.unwrap_or(0);
-            let item = json!({
-                "id": state.item_id,
-                "type": "function_call",
-                "status": "completed",
-                "call_id": state.call_id,
-                "name": state.name,
-                "arguments": state.arguments
-            });
+            let arguments = canonicalize_tool_arguments_str(&state.arguments);
+            let item = response_function_call_item(
+                &state.item_id,
+                "completed",
+                &state.call_id,
+                &state.name,
+                &arguments,
+                Some(&state.reasoning_content),
+            );
             state.done = true;
             self.output_items.push((output_index, item.clone()));
 
@@ -867,7 +713,7 @@ impl ChatToResponsesState {
                     "type": "response.function_call_arguments.done",
                     "item_id": state.item_id,
                     "output_index": output_index,
-                    "arguments": state.arguments
+                    "arguments": arguments
                 }),
             ));
             events.push(sse_event(
@@ -937,24 +783,7 @@ impl ChatToResponsesState {
 }
 
 fn chat_delta_reasoning_text(delta: &Value) -> Option<String> {
-    for key in ["reasoning_content", "reasoning"] {
-        if let Some(text) = delta.get(key).and_then(|v| v.as_str()) {
-            if !text.is_empty() {
-                return Some(text.to_string());
-            }
-        }
-    }
-
-    let reasoning = delta.get("reasoning")?;
-    for key in ["content", "text", "summary"] {
-        if let Some(text) = reasoning.get(key).and_then(|v| v.as_str()) {
-            if !text.is_empty() {
-                return Some(text.to_string());
-            }
-        }
-    }
-
-    None
+    extract_reasoning_field_text(delta)
 }
 
 enum ThinkPrefixDecision {
@@ -981,17 +810,22 @@ fn leading_think_prefix_decision(buffer: &str) -> ThinkPrefixDecision {
 }
 
 /// Create a stream that converts Chat Completions SSE chunks into Responses SSE events.
+#[allow(dead_code)]
 pub fn create_responses_sse_stream_from_chat<E: std::error::Error + Send + 'static>(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
-    known_tool_names: std::collections::HashSet<String>,
+) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    create_responses_sse_stream_from_chat_with_tools(stream, std::collections::HashSet::new())
+}
+
+/// Create a stream that converts Chat Completions SSE chunks into Responses SSE events.
+pub fn create_responses_sse_stream_from_chat_with_tools<E: std::error::Error + Send + 'static>(
+    stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    _known_tool_names: std::collections::HashSet<String>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
-        let mut state = ChatToResponsesState {
-            known_tool_names,
-            ..Default::default()
-        };
+        let mut state = ChatToResponsesState::default();
         let mut stream_failed = false;
 
         tokio::pin!(stream);
@@ -1109,7 +943,7 @@ mod tests {
             .map(|chunk| Ok(Bytes::copy_from_slice(chunk.as_bytes())))
             .collect();
         let upstream = stream::iter(chunks);
-        let converted = create_responses_sse_stream_from_chat(upstream, Default::default());
+        let converted = create_responses_sse_stream_from_chat(upstream);
         let bytes: Vec<Bytes> = converted.map(|item| item.unwrap()).collect().await;
         String::from_utf8(bytes.concat()).unwrap()
     }
@@ -1187,11 +1021,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canonicalizes_streamed_tool_call_arguments_on_done_events() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_args\",\"model\":\"gpt-5.4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_args\",\"model\":\"gpt-5.4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{ \\\"b\\\": 2,\"}}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_args\",\"model\":\"gpt-5.4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\" \\\"a\\\": 1 }\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert!(output.contains(r#""arguments":"{\"a\":1,\"b\":2}""#));
+    }
+
+    #[tokio::test]
+    async fn preserves_reasoning_content_on_streamed_tool_call_items() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_tool_reasoning\",\"model\":\"deepseek-v4-flash\",\"choices\":[{\"delta\":{\"reasoning_content\":\"Need file.\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_tool_reasoning\",\"model\":\"deepseek-v4-flash\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\"}}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_tool_reasoning\",\"model\":\"deepseek-v4-flash\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert!(output.contains("event: response.output_item.done"));
+        assert!(output.contains("\"type\":\"function_call\""));
+        assert!(output.contains("\"reasoning_content\":\"Need file.\""));
+    }
+
+    #[tokio::test]
     async fn stream_error_emits_failed_without_completed() {
         let upstream = stream::iter(vec![Err::<Bytes, std::io::Error>(std::io::Error::other(
             "boom",
         ))]);
-        let converted = create_responses_sse_stream_from_chat(upstream, Default::default());
+        let converted = create_responses_sse_stream_from_chat(upstream);
         let bytes: Vec<Bytes> = converted.map(|item| item.unwrap()).collect().await;
         let output = String::from_utf8(bytes.concat()).unwrap();
 
