@@ -1,8 +1,8 @@
 //! OpenAI Chat Completions SSE → OpenAI Responses SSE conversion.
 
 use super::transform_codex_chat::{
-    chat_usage_to_responses_usage, response_id_from_chat_id, response_status_from_finish_reason,
-    split_leading_think_block, strip_leading_think_open_tag,
+    chat_usage_to_responses_usage, is_likely_tool_name, response_id_from_chat_id,
+    response_status_from_finish_reason, split_leading_think_block, strip_leading_think_open_tag,
 };
 use crate::proxy::sse::{strip_sse_field, take_sse_block};
 use bytes::Bytes;
@@ -42,6 +42,18 @@ struct InlineThinkState {
     buffer: String,
 }
 
+/// State machine for detecting pseudo-tool-call text:
+///   `TOOLNAME\n{...json...}`
+/// Text is buffered until the first newline; if the preceding word
+/// is a known tool name the rest is treated as function-call arguments.
+#[derive(Debug, Default, PartialEq)]
+enum PseudoDetect {
+    #[default]
+    Pending, // collecting text before the first newline
+    ToolCall, // confirmed tool call — buffering JSON args
+    Text,     // not a tool call — normal text output
+}
+
 #[derive(Debug, Default)]
 struct ToolCallState {
     output_index: Option<u32>,
@@ -68,6 +80,12 @@ struct ChatToResponsesState {
     output_items: Vec<(u32, Value)>,
     latest_usage: Option<Value>,
     finish_reason: Option<String>,
+    // pseudo-tool-call detection
+    known_tool_names: std::collections::HashSet<String>,
+    pseudo_detect: PseudoDetect,
+    pseudo_line_buf: String,  // text before first newline
+    pseudo_args_buf: String,  // JSON args buffer (ToolCall mode)
+    pseudo_tool_name: String, // confirmed tool name (ToolCall mode)
 }
 
 impl Default for ChatToResponsesState {
@@ -86,6 +104,11 @@ impl Default for ChatToResponsesState {
             output_items: Vec::new(),
             latest_usage: None,
             finish_reason: None,
+            known_tool_names: std::collections::HashSet::new(),
+            pseudo_detect: PseudoDetect::Pending,
+            pseudo_line_buf: String::new(),
+            pseudo_args_buf: String::new(),
+            pseudo_tool_name: String::new(),
         }
     }
 }
@@ -319,7 +342,8 @@ impl ChatToResponsesState {
         events
     }
 
-    fn push_text_delta(&mut self, delta: &str) -> Vec<Bytes> {
+    /// Internal emitter: unconditionally emit text delta events (bypasses detection).
+    fn emit_text_delta(&mut self, delta: &str) -> Vec<Bytes> {
         let mut events = Vec::new();
 
         if !self.text.added {
@@ -373,6 +397,57 @@ impl ChatToResponsesState {
         ));
 
         events
+    }
+
+    /// Outer text entry point: detects pseudo-tool-call pattern before emitting.
+    ///
+    /// Buffers text until the first newline.  If the text before that newline
+    /// is a known tool name the content is accumulated as JSON arguments and
+    /// no text events are emitted; a function_call item is synthesised at
+    /// finalisation time.  Otherwise text flows through normally.
+    fn push_text_delta(&mut self, delta: &str) -> Vec<Bytes> {
+        if self.known_tool_names.is_empty() {
+            return self.emit_text_delta(delta);
+        }
+
+        match self.pseudo_detect {
+            PseudoDetect::Text => self.emit_text_delta(delta),
+            PseudoDetect::ToolCall => {
+                self.pseudo_args_buf.push_str(delta);
+                Vec::new()
+            }
+            PseudoDetect::Pending => {
+                if let Some(nl_pos) = delta.find('\n') {
+                    let before = &delta[..nl_pos];
+                    let after = &delta[nl_pos + 1..];
+                    self.pseudo_line_buf.push_str(before);
+                    let name = self.pseudo_line_buf.trim().to_string();
+
+                    if is_likely_tool_name(&name) && self.known_tool_names.contains(&name) {
+                        log::debug!("[Codex-stream] pseudo-tool-call detected: tool={name}");
+                        self.pseudo_tool_name = name;
+                        self.pseudo_detect = PseudoDetect::ToolCall;
+                        if !after.is_empty() {
+                            self.pseudo_args_buf.push_str(after);
+                        }
+                        Vec::new()
+                    } else {
+                        self.pseudo_detect = PseudoDetect::Text;
+                        let first_line = std::mem::take(&mut self.pseudo_line_buf);
+                        // Reconstruct: first_line + '\n' + after
+                        let flush = if after.is_empty() {
+                            format!("{first_line}\n")
+                        } else {
+                            format!("{first_line}\n{after}")
+                        };
+                        self.emit_text_delta(&flush)
+                    }
+                } else {
+                    self.pseudo_line_buf.push_str(delta);
+                    Vec::new()
+                }
+            }
+        }
     }
 
     fn push_tool_call_delta(&mut self, tool_call: &Value) -> Vec<Bytes> {
@@ -486,6 +561,7 @@ impl ChatToResponsesState {
         let mut events = self.ensure_response_started();
         events.extend(self.flush_inline_think_at_boundary());
         events.extend(self.finalize_reasoning());
+        events.extend(self.finalize_pseudo_tool_call());
         events.extend(self.finalize_text());
         events.extend(self.finalize_tools());
 
@@ -504,6 +580,114 @@ impl ChatToResponsesState {
         ));
         self.completed = true;
         events
+    }
+
+    /// Resolve pending pseudo-tool-call detection at stream end.
+    ///
+    /// - `Pending` (no newline seen): flush buffered text as normal text.
+    /// - `ToolCall`: parse JSON from args buffer and emit function_call events.
+    ///   Falls back to text if the args buffer doesn't contain valid JSON.
+    fn finalize_pseudo_tool_call(&mut self) -> Vec<Bytes> {
+        match self.pseudo_detect {
+            PseudoDetect::Text => Vec::new(),
+            PseudoDetect::Pending => {
+                self.pseudo_detect = PseudoDetect::Text;
+                let buf = std::mem::take(&mut self.pseudo_line_buf);
+                if buf.is_empty() {
+                    Vec::new()
+                } else {
+                    self.emit_text_delta(&buf)
+                }
+            }
+            PseudoDetect::ToolCall => {
+                let name = std::mem::take(&mut self.pseudo_tool_name);
+                let args_buf = std::mem::take(&mut self.pseudo_args_buf);
+
+                // Lenient parse: accept trailing non-JSON content
+                let arguments_value: Option<Value> = serde_json::Deserializer::from_str(&args_buf)
+                    .into_iter::<Value>()
+                    .next()
+                    .and_then(|r| r.ok())
+                    .filter(|v| v.is_object());
+
+                let arguments = match arguments_value {
+                    Some(v) => serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string()),
+                    None => {
+                        log::warn!(
+                            "[Codex-stream] pseudo-tool-call args not valid JSON \
+                             (tool={name}), falling back to text"
+                        );
+                        self.pseudo_detect = PseudoDetect::Text;
+                        let text = format!("{name}\n{args_buf}");
+                        return self.emit_text_delta(&text);
+                    }
+                };
+
+                let output_index = self.next_output_index();
+                let call_id = "call_pseudo_0".to_string();
+                let item_id = format!("fc_{call_id}");
+                let item = json!({
+                    "id": item_id,
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments
+                });
+                self.output_items.push((output_index, item.clone()));
+
+                log::debug!(
+                    "[Codex-stream] pseudo-tool-call finalised: \
+                     tool={}, args_len={}",
+                    item["name"],
+                    arguments.len()
+                );
+
+                vec![
+                    sse_event(
+                        "response.output_item.added",
+                        json!({
+                            "type": "response.output_item.added",
+                            "output_index": output_index,
+                            "item": {
+                                "id": item_id,
+                                "type": "function_call",
+                                "status": "in_progress",
+                                "call_id": call_id,
+                                "name": name,
+                                "arguments": ""
+                            }
+                        }),
+                    ),
+                    sse_event(
+                        "response.function_call_arguments.delta",
+                        json!({
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "delta": arguments
+                        }),
+                    ),
+                    sse_event(
+                        "response.function_call_arguments.done",
+                        json!({
+                            "type": "response.function_call_arguments.done",
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "arguments": arguments
+                        }),
+                    ),
+                    sse_event(
+                        "response.output_item.done",
+                        json!({
+                            "type": "response.output_item.done",
+                            "output_index": output_index,
+                            "item": item
+                        }),
+                    ),
+                ]
+            }
+        }
     }
 
     fn finalize_reasoning(&mut self) -> Vec<Bytes> {
@@ -799,11 +983,15 @@ fn leading_think_prefix_decision(buffer: &str) -> ThinkPrefixDecision {
 /// Create a stream that converts Chat Completions SSE chunks into Responses SSE events.
 pub fn create_responses_sse_stream_from_chat<E: std::error::Error + Send + 'static>(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
+    known_tool_names: std::collections::HashSet<String>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
-        let mut state = ChatToResponsesState::default();
+        let mut state = ChatToResponsesState {
+            known_tool_names,
+            ..Default::default()
+        };
         let mut stream_failed = false;
 
         tokio::pin!(stream);
@@ -921,7 +1109,7 @@ mod tests {
             .map(|chunk| Ok(Bytes::copy_from_slice(chunk.as_bytes())))
             .collect();
         let upstream = stream::iter(chunks);
-        let converted = create_responses_sse_stream_from_chat(upstream);
+        let converted = create_responses_sse_stream_from_chat(upstream, Default::default());
         let bytes: Vec<Bytes> = converted.map(|item| item.unwrap()).collect().await;
         String::from_utf8(bytes.concat()).unwrap()
     }
@@ -1003,7 +1191,7 @@ mod tests {
         let upstream = stream::iter(vec![Err::<Bytes, std::io::Error>(std::io::Error::other(
             "boom",
         ))]);
-        let converted = create_responses_sse_stream_from_chat(upstream);
+        let converted = create_responses_sse_stream_from_chat(upstream, Default::default());
         let bytes: Vec<Bytes> = converted.map(|item| item.unwrap()).collect().await;
         let output = String::from_utf8(bytes.concat()).unwrap();
 
