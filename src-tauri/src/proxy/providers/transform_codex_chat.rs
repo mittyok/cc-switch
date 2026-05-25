@@ -409,6 +409,13 @@ fn responses_tool_to_chat_tool(tool: &Value) -> Option<Value> {
     if tool.get("function").is_some() {
         let mut chat_tool = tool.clone();
         chat_tool["type"] = json!("function");
+        if let Some(function) = chat_tool
+            .get_mut("function")
+            .and_then(|value| value.as_object_mut())
+        {
+            let parameters = normalize_chat_tool_parameters(function.get("parameters"));
+            function.insert("parameters".to_string(), parameters);
+        }
         if let Some(strict) = tool.get("strict").cloned() {
             if let Some(function) = chat_tool
                 .get_mut("function")
@@ -435,13 +442,9 @@ fn responses_tool_to_chat_tool(tool: &Value) -> Option<Value> {
     let mut function = json!({
         "name": name,
         "description": tool.get("description").cloned().unwrap_or(Value::Null),
-        "parameters": tool.get("parameters")
-            .or_else(|| tool.get("input_schema"))
-            .cloned()
-            .unwrap_or_else(|| json!({
-                "type": "object",
-                "additionalProperties": true
-            }))
+        "parameters": normalize_chat_tool_parameters(
+            tool.get("parameters").or_else(|| tool.get("input_schema"))
+        )
     });
     if let Some(strict) = tool.get("strict") {
         function["strict"] = strict.clone();
@@ -451,6 +454,23 @@ fn responses_tool_to_chat_tool(tool: &Value) -> Option<Value> {
         "type": "function",
         "function": function
     }))
+}
+
+fn normalize_chat_tool_parameters(parameters: Option<&Value>) -> Value {
+    let mut schema = parameters.cloned().unwrap_or_else(|| json!({}));
+    if !schema.is_object() {
+        schema = json!({});
+    }
+
+    let object = schema.as_object_mut().expect("schema is object");
+    object
+        .entry("type".to_string())
+        .or_insert_with(|| json!("object"));
+    object
+        .entry("properties".to_string())
+        .or_insert_with(|| json!({}));
+
+    schema
 }
 
 fn responses_tool_choice_to_chat(tool_choice: &Value) -> Value {
@@ -885,6 +905,46 @@ mod tests {
         );
         assert_eq!(result["tool_choice"]["type"], "function");
         assert_eq!(result["tool_choice"]["function"]["name"], "AISHELL");
+    }
+
+    #[test]
+    fn responses_request_to_chat_adds_missing_schema_properties() {
+        let input = json!({
+            "model": "gpt-5.4",
+            "input": [{"role": "user", "content": "Run multiple agents"}],
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "multi_agent_v1",
+                    "description": "Coordinate multiple agents",
+                    "input_schema": {"type": "object"}
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "already_chat_style",
+                        "description": "Chat-style function",
+                        "parameters": {"type": "object"}
+                    }
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+
+        assert_eq!(result["tools"][0]["function"]["name"], "multi_agent_v1");
+        assert_eq!(
+            result["tools"][0]["function"]["parameters"]["type"],
+            "object"
+        );
+        assert_eq!(
+            result["tools"][0]["function"]["parameters"]["properties"],
+            json!({})
+        );
+        assert_eq!(
+            result["tools"][1]["function"]["parameters"]["properties"],
+            json!({})
+        );
     }
 
     #[test]
