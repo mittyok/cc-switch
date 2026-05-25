@@ -1151,37 +1151,61 @@ impl RequestForwarder {
                 log::warn!(
                     "[codex->chat] converting {} input items: {}",
                     items.len(),
-                    items.iter().enumerate().map(|(i, item)| {
-                        let t = item.get("type").and_then(|v| v.as_str()).unwrap_or("message");
-                        let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("-");
-                        let call_id = item.get("call_id").or_else(|| item.get("id"))
-                            .and_then(|v| v.as_str()).unwrap_or("-");
-                        format!("[{i}] type={t} role={role} call_id={call_id}")
-                    }).collect::<Vec<_>>().join(", ")
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(i, item)| {
+                            let t = item
+                                .get("type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("message");
+                            let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("-");
+                            let call_id = item
+                                .get("call_id")
+                                .or_else(|| item.get("id"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("-");
+                            format!("[{i}] type={t} role={role} call_id={call_id}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
             }
-            let converted = super::providers::transform_codex_chat::responses_to_chat_completions(mapped_body)?;
+            log_codex_chat_tools_summary("incoming", mapped_body.get("tools"));
+            let converted =
+                super::providers::transform_codex_chat::responses_to_chat_completions(mapped_body)?;
+            log_codex_chat_tools_summary("converted", converted.get("tools"));
             if let Some(msgs) = converted.get("messages").and_then(|v| v.as_array()) {
                 log::debug!(
                     "[codex->chat] produced {} chat messages: {}",
                     msgs.len(),
-                    msgs.iter().enumerate().map(|(i, m)| {
-                        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
-                        let tc_ids: Vec<&str> = m.get("tool_calls")
-                            .and_then(|v| v.as_array())
-                            .map(|arr| arr.iter()
-                                .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()))
-                                .collect())
-                            .unwrap_or_default();
-                        let tid = m.get("tool_call_id").and_then(|v| v.as_str()).unwrap_or("-");
-                        if !tc_ids.is_empty() {
-                            format!("[{i}] role={role} tool_calls={}", tc_ids.join("+"))
-                        } else if tid != "-" {
-                            format!("[{i}] role={role} tool_call_id={tid}")
-                        } else {
-                            format!("[{i}] role={role}")
-                        }
-                    }).collect::<Vec<_>>().join(", ")
+                    msgs.iter()
+                        .enumerate()
+                        .map(|(i, m)| {
+                            let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+                            let tc_ids: Vec<&str> = m
+                                .get("tool_calls")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|tc| tc.get("id").and_then(|v| v.as_str()))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let tid = m
+                                .get("tool_call_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("-");
+                            if !tc_ids.is_empty() {
+                                format!("[{i}] role={role} tool_calls={}", tc_ids.join("+"))
+                            } else if tid != "-" {
+                                format!("[{i}] role={role} tool_call_id={tid}")
+                            } else {
+                                format!("[{i}] role={role}")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 );
             }
             converted
@@ -1937,6 +1961,34 @@ impl RequestForwarder {
             _ => ErrorCategory::NonRetryable,
         }
     }
+}
+
+fn log_codex_chat_tools_summary(stage: &str, tools: Option<&Value>) {
+    let Some(tools) = tools.and_then(|value| value.as_array()) else {
+        log::warn!("[codex->chat] {stage} tools: absent");
+        return;
+    };
+
+    log::warn!(
+        "[codex->chat] {stage} tools: count={} {}",
+        tools.len(),
+        tools
+            .iter()
+            .take(20)
+            .enumerate()
+            .map(|(i, tool)| {
+                let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+                let name = tool
+                    .pointer("/function/name")
+                    .or_else(|| tool.get("name"))
+                    .or_else(|| tool.get("tool_name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                format!("[{i}] type={tool_type} name={name}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 }
 
 /// 从 ProxyError 中提取错误消息
