@@ -158,10 +158,15 @@ fn append_responses_items_as_chat_messages(
 fn append_contiguous_tool_block(items: &[Value], start: usize, messages: &mut Vec<Value>) -> usize {
     let mut next_index = start;
     let mut tool_calls = Vec::new();
-    let mut call_id_to_index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut call_id_to_index: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     while next_index < items.len() && is_responses_function_call(&items[next_index]) {
         let tc = responses_function_call_to_chat_tool_call(&items[next_index]);
-        if let Some(id) = tc.get("id").and_then(|v| v.as_str()).filter(|id| !id.is_empty()) {
+        if let Some(id) = tc
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+        {
             call_id_to_index.insert(id.to_string(), tool_calls.len());
         }
         tool_calls.push(tc);
@@ -173,7 +178,8 @@ fn append_contiguous_tool_block(items: &[Value], start: usize, messages: &mut Ve
     }
 
     let mut output_index = next_index;
-    let mut paired_call_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut paired_call_indices: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
     let mut tool_messages: Vec<Value> = Vec::new();
     while output_index < items.len() {
         let output_item = &items[output_index];
@@ -198,7 +204,9 @@ fn append_contiguous_tool_block(items: &[Value], start: usize, messages: &mut Ve
         return next_index;
     }
 
-    let final_tool_calls: Vec<Value> = tool_calls.into_iter().enumerate()
+    let final_tool_calls: Vec<Value> = tool_calls
+        .into_iter()
+        .enumerate()
         .filter(|(i, _)| paired_call_indices.contains(&i))
         .map(|(_, tc)| tc)
         .collect();
@@ -218,7 +226,10 @@ fn append_responses_item_as_chat_message(
 ) -> Result<(), ProxyError> {
     let item_type = item.get("type").and_then(|v| v.as_str());
     match item_type {
-        Some("function_call") | Some("function_call_output") => {}
+        Some("function_call") | Some("custom_tool_call") => {}
+        Some("function_call_output") | Some("custom_tool_call_output") => {
+            messages.push(unpaired_function_call_output_to_user_message(item));
+        }
         Some("reasoning") => {
             // Reasoning items are Responses-specific context. Chat-only providers
             // cannot consume encrypted reasoning state, so omit it.
@@ -238,12 +249,38 @@ fn append_responses_item_as_chat_message(
     Ok(())
 }
 
+fn unpaired_function_call_output_to_user_message(item: &Value) -> Value {
+    let call_id = responses_call_id(item).unwrap_or("");
+    let output = match item.get("output") {
+        Some(Value::String(s)) => s.clone(),
+        Some(v) => canonical_json_string(v),
+        None => String::new(),
+    };
+
+    let content = if call_id.is_empty() {
+        format!("Tool result:\n{output}")
+    } else {
+        format!("Tool result for {call_id}:\n{output}")
+    };
+
+    json!({
+        "role": "user",
+        "content": content
+    })
+}
+
 fn is_responses_function_call(item: &Value) -> bool {
-    item.get("type").and_then(|value| value.as_str()) == Some("function_call")
+    matches!(
+        item.get("type").and_then(|value| value.as_str()),
+        Some("function_call") | Some("custom_tool_call")
+    )
 }
 
 fn is_responses_function_call_output(item: &Value) -> bool {
-    item.get("type").and_then(|value| value.as_str()) == Some("function_call_output")
+    matches!(
+        item.get("type").and_then(|value| value.as_str()),
+        Some("function_call_output") | Some("custom_tool_call_output")
+    )
 }
 
 fn responses_call_id(item: &Value) -> Option<&str> {
@@ -352,7 +389,7 @@ fn responses_function_call_to_chat_tool_call(item: &Value) -> Value {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    let arguments = match item.get("arguments") {
+    let arguments = match item.get("arguments").or_else(|| item.get("input")) {
         Some(Value::String(s)) => s.clone(),
         Some(v) => canonical_json_string(v),
         None => "{}".to_string(),
@@ -369,12 +406,9 @@ fn responses_function_call_to_chat_tool_call(item: &Value) -> Value {
 }
 
 fn responses_tool_to_chat_tool(tool: &Value) -> Option<Value> {
-    if tool.get("type").and_then(|v| v.as_str()) != Some("function") {
-        return None;
-    }
-
     if tool.get("function").is_some() {
         let mut chat_tool = tool.clone();
+        chat_tool["type"] = json!("function");
         if let Some(strict) = tool.get("strict").cloned() {
             if let Some(function) = chat_tool
                 .get_mut("function")
@@ -389,10 +423,25 @@ fn responses_tool_to_chat_tool(tool: &Value) -> Option<Value> {
         return Some(chat_tool);
     }
 
+    let name = tool
+        .get("name")
+        .or_else(|| tool.get("tool_name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if name.is_empty() {
+        return None;
+    }
+
     let mut function = json!({
-        "name": tool.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+        "name": name,
         "description": tool.get("description").cloned().unwrap_or(Value::Null),
-        "parameters": tool.get("parameters").cloned().unwrap_or_else(|| json!({}))
+        "parameters": tool.get("parameters")
+            .or_else(|| tool.get("input_schema"))
+            .cloned()
+            .unwrap_or_else(|| json!({
+                "type": "object",
+                "additionalProperties": true
+            }))
     });
     if let Some(strict) = tool.get("strict") {
         function["strict"] = strict.clone();
@@ -406,11 +455,19 @@ fn responses_tool_to_chat_tool(tool: &Value) -> Option<Value> {
 
 fn responses_tool_choice_to_chat(tool_choice: &Value) -> Value {
     match tool_choice {
-        Value::Object(obj) if obj.get("type").and_then(|v| v.as_str()) == Some("function") => {
+        Value::Object(obj)
+            if matches!(
+                obj.get("type").and_then(|v| v.as_str()),
+                Some("function") | Some("custom")
+            ) =>
+        {
             json!({
                 "type": "function",
                 "function": {
-                    "name": obj.get("name").and_then(|v| v.as_str()).unwrap_or("")
+                    "name": obj.get("name")
+                        .or_else(|| obj.get("tool_name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
                 }
             })
         }
@@ -799,6 +856,71 @@ mod tests {
     }
 
     #[test]
+    fn responses_request_to_chat_preserves_custom_tool_as_function_tool() {
+        let input = json!({
+            "model": "gpt-5.4",
+            "input": [{"role": "user", "content": "List agents"}],
+            "tools": [{
+                "type": "custom",
+                "name": "AISHELL",
+                "description": "Run agent shell commands",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {"type": "integer"},
+                        "chars": {"type": "string"}
+                    }
+                }
+            }],
+            "tool_choice": {"type": "custom", "name": "AISHELL"}
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+
+        assert_eq!(result["tools"][0]["type"], "function");
+        assert_eq!(result["tools"][0]["function"]["name"], "AISHELL");
+        assert_eq!(
+            result["tools"][0]["function"]["parameters"]["properties"]["session_id"]["type"],
+            "integer"
+        );
+        assert_eq!(result["tool_choice"]["type"], "function");
+        assert_eq!(result["tool_choice"]["function"]["name"], "AISHELL");
+    }
+
+    #[test]
+    fn responses_request_to_chat_maps_custom_tool_call_and_output() {
+        let input = json!({
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_shell",
+                    "name": "AISHELL",
+                    "input": {"session_id": 57771, "chars": ""}
+                },
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_shell",
+                    "output": "ok"
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["tool_calls"][0]["function"]["name"], "AISHELL");
+        assert!(messages[0]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("\"session_id\":57771"));
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call_shell");
+    }
+
+    #[test]
     fn responses_request_to_chat_keeps_multiple_tool_calls_adjacent_to_outputs() {
         let input = json!({
             "model": "gpt-5.4",
@@ -1003,6 +1125,42 @@ mod tests {
         assert_eq!(messages[1]["role"], "tool");
         assert_eq!(messages[1]["tool_call_id"], "call_1");
         assert_eq!(messages[2]["role"], "user");
+    }
+
+    #[test]
+    fn unpaired_function_call_output_is_preserved_as_user_context() {
+        let input = json!({
+            "model": "gpt-5.4",
+            "input": [
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_shell",
+                    "output": {
+                        "session_id": 35758,
+                        "status": "accepted"
+                    }
+                },
+                {
+                    "role": "user",
+                    "content": "Continue"
+                }
+            ]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Tool result for call_shell:"));
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("\"session_id\":35758"));
+        assert_eq!(messages[1]["role"], "user");
     }
 
     #[test]
