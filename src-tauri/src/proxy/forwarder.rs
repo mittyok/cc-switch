@@ -1171,8 +1171,10 @@ impl RequestForwarder {
                         .join(", ")
                 );
             }
+            log_codex_chat_tools_summary("incoming", mapped_body.get("tools"));
             let converted =
                 super::providers::transform_codex_chat::responses_to_chat_completions(mapped_body)?;
+            log_codex_chat_tools_summary("converted", converted.get("tools"));
             if let Some(msgs) = converted.get("messages").and_then(|v| v.as_array()) {
                 log::debug!(
                     "[codex->chat] produced {} chat messages: {}",
@@ -1959,6 +1961,34 @@ impl RequestForwarder {
             _ => ErrorCategory::NonRetryable,
         }
     }
+}
+
+fn log_codex_chat_tools_summary(stage: &str, tools: Option<&Value>) {
+    let Some(tools) = tools.and_then(|value| value.as_array()) else {
+        log::warn!("[codex->chat] {stage} tools: absent");
+        return;
+    };
+
+    log::warn!(
+        "[codex->chat] {stage} tools: count={} {}",
+        tools.len(),
+        tools
+            .iter()
+            .take(20)
+            .enumerate()
+            .map(|(i, tool)| {
+                let tool_type = tool.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+                let name = tool
+                    .pointer("/function/name")
+                    .or_else(|| tool.get("name"))
+                    .or_else(|| tool.get("tool_name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                format!("[{i}] type={tool_type} name={name}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 }
 
 /// 从 ProxyError 中提取错误消息
