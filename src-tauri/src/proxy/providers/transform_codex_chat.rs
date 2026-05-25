@@ -84,11 +84,13 @@ pub fn responses_to_chat_completions(body: Value) -> Result<Value, ProxyError> {
             .collect();
         if !tools.is_empty() {
             result["tools"] = json!(tools);
+            // Only emit tool_choice when tools are present; sending it without
+            // tools causes a 400 "tool_choice is only allowed when tools are
+            // specified" from many providers.
+            if let Some(tool_choice) = body.get("tool_choice") {
+                result["tool_choice"] = responses_tool_choice_to_chat(tool_choice);
+            }
         }
-    }
-
-    if let Some(tool_choice) = body.get("tool_choice") {
-        result["tool_choice"] = responses_tool_choice_to_chat(tool_choice);
     }
 
     for key in EXTRA_CHAT_PASSTHROUGH_FIELDS {
@@ -496,7 +498,14 @@ fn responses_tool_choice_to_chat(tool_choice: &Value) -> Value {
 }
 
 /// Convert a non-streaming Chat Completions response into a Responses response.
-pub fn chat_completion_to_response(body: Value) -> Result<Value, ProxyError> {
+///
+/// `known_tool_names` is the set of tool names declared in the original Responses
+/// request. Pseudo-tool-call detection (plain-text `TOOLNAME\n{json}` pattern) is
+/// only attempted when the name appears in this set; an empty set disables it.
+pub fn chat_completion_to_response(
+    body: Value,
+    known_tool_names: &std::collections::HashSet<String>,
+) -> Result<Value, ProxyError> {
     let choices = body
         .get("choices")
         .and_then(|v| v.as_array())
@@ -517,10 +526,17 @@ pub fn chat_completion_to_response(body: Value) -> Result<Value, ProxyError> {
     if let Some(reasoning_item) = chat_reasoning_to_response_output_item(message, &response_id) {
         output.push(reasoning_item);
     }
-    if let Some(message_item) = chat_message_to_response_output_item(message, &response_id) {
-        output.push(message_item);
+    let pseudo_tool_call = chat_pseudo_tool_call_text(message, known_tool_names)
+        .and_then(|text| pseudo_tool_call_text_to_response_item(&text, 0));
+    if pseudo_tool_call.is_none() {
+        if let Some(message_item) = chat_message_to_response_output_item(message, &response_id) {
+            output.push(message_item);
+        }
     }
     output.extend(chat_tool_calls_to_response_output_items(message));
+    if let Some(tool_call) = pseudo_tool_call {
+        output.push(tool_call);
+    }
 
     let mut response = json!({
         "id": response_id,
@@ -693,6 +709,71 @@ fn chat_tool_calls_to_response_output_items(message: &Value) -> Vec<Value> {
     }
 
     output
+}
+
+fn chat_pseudo_tool_call_text(
+    message: &Value,
+    known_tool_names: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if known_tool_names.is_empty() {
+        return None;
+    }
+    let text = message.get("content")?.as_str()?.trim();
+    let first_newline = text.find('\n')?;
+    let name = text[..first_newline].trim();
+    if !is_likely_tool_name(name) || !known_tool_names.contains(name) {
+        return None;
+    }
+
+    let arguments = text[first_newline..].trim();
+    if arguments.is_empty() {
+        return None;
+    }
+
+    // Lenient: accept trailing content after the JSON object (e.g. "} malformed, use tool.")
+    let parsed = serde_json::Deserializer::from_str(arguments)
+        .into_iter::<Value>()
+        .next()?
+        .ok()?;
+    if !parsed.is_object() {
+        return None;
+    }
+
+    Some(text.to_string())
+}
+
+fn pseudo_tool_call_text_to_response_item(text: &str, index: usize) -> Option<Value> {
+    let first_newline = text.find('\n')?;
+    let name = text[..first_newline].trim();
+    let arguments_str = text[first_newline..].trim();
+    if !is_likely_tool_name(name) {
+        return None;
+    }
+
+    // Extract just the leading JSON object, ignoring any trailing content
+    let arguments_value: Value = serde_json::Deserializer::from_str(arguments_str)
+        .into_iter::<Value>()
+        .next()?
+        .ok()?;
+    let arguments = serde_json::to_string(&arguments_value).unwrap_or_else(|_| "{}".to_string());
+
+    Some(json!({
+        "id": format!("fc_pseudo_{index}"),
+        "type": "function_call",
+        "status": "completed",
+        "call_id": format!("call_pseudo_{index}"),
+        "name": name,
+        "arguments": arguments
+    }))
+}
+
+pub(crate) fn is_likely_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.')
+        && (name.chars().any(|ch| ch == '_') || name.chars().any(|ch| ch.is_ascii_uppercase()))
 }
 
 fn chat_tool_call_to_response_item(tool_call: &Value, index: usize) -> Value {
@@ -1060,7 +1141,7 @@ mod tests {
             }
         });
 
-        let result = chat_completion_to_response(input).unwrap();
+        let result = chat_completion_to_response(input, &Default::default()).unwrap();
 
         assert_eq!(result["id"], "resp_chatcmpl_1");
         assert_eq!(result["status"], "completed");
@@ -1100,7 +1181,7 @@ mod tests {
             }
         });
 
-        let result = chat_completion_to_response(input).unwrap();
+        let result = chat_completion_to_response(input, &Default::default()).unwrap();
 
         assert_eq!(result["output"][0]["type"], "reasoning");
         assert_eq!(
@@ -1113,6 +1194,60 @@ mod tests {
             result["usage"]["output_tokens_details"]["reasoning_tokens"],
             18
         );
+    }
+
+    #[test]
+    fn chat_response_to_responses_recovers_pseudo_tool_call_text() {
+        let input = json!({
+            "id": "chatcmpl_pseudo_tool",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "gpt-5.4",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "AISHELL\n{\"session_id\":86200,\"chars\":\"\",\"yield_time_ms\":1000,\"max_output_tokens\":50000}"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let known = ["AISHELL".to_string()].into_iter().collect();
+        let result = chat_completion_to_response(input, &known).unwrap();
+        let output = result["output"].as_array().unwrap();
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "function_call");
+        assert_eq!(output[0]["name"], "AISHELL");
+        assert!(output[0]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("\"session_id\":86200"));
+    }
+
+    #[test]
+    fn chat_response_pseudo_tool_call_ignored_when_name_not_in_known_tools() {
+        // Same content as the previous test, but known_tool_names is empty.
+        // The model output must be treated as plain text, not a function_call.
+        let input = json!({
+            "id": "chatcmpl_no_tool",
+            "object": "chat.completion",
+            "created": 123,
+            "model": "gpt-5.4",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "AISHELL\n{\"session_id\":86200,\"chars\":\"\",\"yield_time_ms\":1000,\"max_output_tokens\":50000}"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let result = chat_completion_to_response(input, &Default::default()).unwrap();
+        let output = result["output"].as_array().unwrap();
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "message");
     }
 
     #[test]
@@ -1234,7 +1369,7 @@ mod tests {
             }]
         });
 
-        let result = chat_completion_to_response(input).unwrap();
+        let result = chat_completion_to_response(input, &Default::default()).unwrap();
 
         assert_eq!(result["status"], "incomplete");
         assert_eq!(result["incomplete_details"]["reason"], "max_output_tokens");

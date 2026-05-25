@@ -466,6 +466,26 @@ fn endpoint_with_query(uri: &axum::http::Uri, endpoint: &str) -> String {
     }
 }
 
+fn extract_tool_names_from_responses_body(
+    body: &serde_json::Value,
+) -> std::collections::HashSet<String> {
+    body.get("tools")
+        .and_then(|v| v.as_array())
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|t| {
+                    t.get("name")
+                        .or_else(|| t.get("tool_name"))
+                        .or_else(|| t.get("function").and_then(|f| f.get("name")))
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 // ============================================================================
 // Codex API 处理器
 // ============================================================================
@@ -561,6 +581,8 @@ pub async fn handle_responses(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let known_tool_names = extract_tool_names_from_responses_body(&body);
+
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
         .forward_with_retry(
@@ -595,6 +617,7 @@ pub async fn handle_responses(
             &state,
             is_stream,
             connection_guard,
+            known_tool_names,
         )
         .await;
     }
@@ -636,6 +659,8 @@ pub async fn handle_responses_compact(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let known_tool_names = extract_tool_names_from_responses_body(&body);
+
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder
         .forward_with_retry(
@@ -670,6 +695,7 @@ pub async fn handle_responses_compact(
             &state,
             is_stream,
             connection_guard,
+            known_tool_names,
         )
         .await;
     }
@@ -690,6 +716,7 @@ async fn handle_codex_chat_to_responses_transform(
     state: &ProxyState,
     is_stream: bool,
     connection_guard: Option<ActiveConnectionGuard>,
+    known_tool_names: std::collections::HashSet<String>,
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
 
@@ -700,7 +727,7 @@ async fn handle_codex_chat_to_responses_transform(
 
     if is_stream || response.is_sse() {
         let stream = response.bytes_stream();
-        let sse_stream = create_responses_sse_stream_from_chat(stream);
+        let sse_stream = create_responses_sse_stream_from_chat(stream, known_tool_names);
 
         let usage_collector = if usage_logging_enabled(state) {
             let state = state.clone();
@@ -781,11 +808,12 @@ async fn handle_codex_chat_to_responses_transform(
         log::error!("[Codex] 解析 Chat 上游响应失败: {e}, body: {body_str}");
         ProxyError::TransformError(format!("Failed to parse upstream chat response: {e}"))
     })?;
-    let responses_response = transform_codex_chat::chat_completion_to_response(chat_response)
-        .map_err(|e| {
-            log::error!("[Codex] Chat → Responses 响应转换失败: {e}");
-            e
-        })?;
+    let responses_response =
+        transform_codex_chat::chat_completion_to_response(chat_response, &known_tool_names)
+            .map_err(|e| {
+                log::error!("[Codex] Chat → Responses 响应转换失败: {e}");
+                e
+            })?;
 
     if let Some(usage) = TokenUsage::from_codex_response_auto(&responses_response) {
         let model = responses_response
