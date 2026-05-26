@@ -89,7 +89,11 @@ pub fn responses_to_chat_completions_with_reasoning(
         }
     }
 
-    apply_reasoning_options(&mut result, &body, model, reasoning_config);
+    let has_tools = body
+        .get("tools")
+        .and_then(|value| value.as_array())
+        .is_some_and(|tools| !tools.is_empty());
+    apply_reasoning_options(&mut result, &body, model, reasoning_config, has_tools);
 
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
         let tools: Vec<Value> = tools
@@ -139,9 +143,10 @@ fn apply_reasoning_options(
     body: &Value,
     model: &str,
     config: Option<&CodexChatReasoningConfig>,
+    has_tools: bool,
 ) {
     let Some(config) = config else {
-        if super::transform::supports_reasoning_effort(model) {
+        if !has_tools && super::transform::supports_reasoning_effort(model) {
             if let Some(effort) = body.pointer("/reasoning/effort") {
                 result["reasoning_effort"] = effort.clone();
             }
@@ -1396,6 +1401,31 @@ mod tests {
         // none 不是 OpenAI 顶层 reasoning_effort 的合法枚举，不写顶层别名；也不写 thinking。
         assert!(result.get("reasoning_effort").is_none());
         assert!(result.get("thinking").is_none());
+    }
+
+    #[test]
+    fn responses_request_to_chat_drops_default_reasoning_effort_for_gpt_with_tools() {
+        let input = json!({
+            "model": "gpt-5.5",
+            "input": "hello",
+            "reasoning": {"effort": "high"},
+            "tools": [{
+                "type": "function",
+                "name": "Bash",
+                "description": "Run a shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "cmd": {"type": "string"}
+                    }
+                }
+            }]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+
+        assert!(result.get("tools").is_some());
+        assert!(result.get("reasoning_effort").is_none());
     }
 
     #[test]
