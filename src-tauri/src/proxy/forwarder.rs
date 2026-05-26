@@ -1188,7 +1188,8 @@ impl RequestForwarder {
 
         // 过滤私有参数（以 `_` 开头的字段），防止内部信息泄露到上游
         // 默认使用空白名单，过滤所有 _ 前缀字段
-        let filtered_body = prepare_upstream_request_body(request_body);
+        let filtered_body =
+            prepare_upstream_request_body_for_endpoint(&effective_endpoint, request_body);
         log_prompt_cache_trace(
             app_type,
             provider,
@@ -2306,8 +2307,62 @@ fn summarize_text_for_log(text: &str, max_chars: usize) -> String {
     format!("{truncated}...")
 }
 
-fn prepare_upstream_request_body(request_body: Value) -> Value {
+fn prepare_upstream_request_body_for_endpoint(endpoint: &str, request_body: Value) -> Value {
+    let request_body = strip_unsupported_chat_reasoning_effort(endpoint, request_body);
     canonicalize_value(filter_private_params_with_whitelist(request_body, &[]))
+}
+
+#[cfg(test)]
+fn prepare_upstream_request_body(request_body: Value) -> Value {
+    prepare_upstream_request_body_for_endpoint("", request_body)
+}
+
+fn strip_unsupported_chat_reasoning_effort(endpoint: &str, mut body: Value) -> Value {
+    if !is_chat_completions_endpoint(endpoint) || !has_function_tools(&body) {
+        return body;
+    }
+
+    let model = body
+        .get("model")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    if is_gpt5_or_newer_model(model) {
+        if let Some(object) = body.as_object_mut() {
+            object.remove("reasoning_effort");
+        }
+    }
+
+    body
+}
+
+fn is_chat_completions_endpoint(endpoint: &str) -> bool {
+    endpoint
+        .split_once('?')
+        .map_or(endpoint, |(path, _query)| path)
+        .trim_end_matches('/')
+        .ends_with("/chat/completions")
+}
+
+fn has_function_tools(body: &Value) -> bool {
+    let has_tools = body
+        .get("tools")
+        .and_then(|value| value.as_array())
+        .is_some_and(|tools| !tools.is_empty());
+    let has_legacy_functions = body
+        .get("functions")
+        .and_then(|value| value.as_array())
+        .is_some_and(|functions| !functions.is_empty());
+
+    has_tools || has_legacy_functions
+}
+
+fn is_gpt5_or_newer_model(model: &str) -> bool {
+    model
+        .trim()
+        .to_ascii_lowercase()
+        .strip_prefix("gpt-")
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|character| character.is_ascii_digit() && character >= '5')
 }
 
 fn log_prompt_cache_trace(
@@ -2566,6 +2621,77 @@ mod tests {
             serde_json::to_string(&prepared).unwrap(),
             r#"{"a":2,"tools":[{"name":"lookup","parameters":{"properties":{"_id":{"type":"string"},"a":{"type":"string"},"b":{"type":"number"}},"type":"object"}}],"z":1}"#
         );
+    }
+
+    #[test]
+    fn prepare_upstream_request_body_strips_gpt5_chat_reasoning_effort_with_tools() {
+        let body = json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "high",
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "Bash",
+                    "parameters": {"type": "object"}
+                }
+            }]
+        });
+
+        let prepared = prepare_upstream_request_body_for_endpoint("/v1/chat/completions", body);
+
+        assert!(prepared.get("tools").is_some());
+        assert!(prepared.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn prepare_upstream_request_body_strips_gpt5_reasoning_effort_with_codex_style_tools() {
+        let body = json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "high",
+            "tools": [{
+                "name": "Bash",
+                "description": "Run a shell command",
+                "parameters": {"type": "object"}
+            }]
+        });
+
+        let prepared = prepare_upstream_request_body_for_endpoint("/v1/chat/completions", body);
+
+        assert!(prepared.get("tools").is_some());
+        assert!(prepared.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn prepare_upstream_request_body_strips_gpt5_reasoning_effort_with_legacy_functions() {
+        let body = json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "high",
+            "functions": [{
+                "name": "Bash",
+                "parameters": {"type": "object"}
+            }]
+        });
+
+        let prepared = prepare_upstream_request_body_for_endpoint("/v1/chat/completions", body);
+
+        assert!(prepared.get("functions").is_some());
+        assert!(prepared.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn prepare_upstream_request_body_keeps_reasoning_effort_without_chat_tools() {
+        let body = json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "hello"}],
+            "reasoning_effort": "high"
+        });
+
+        let prepared = prepare_upstream_request_body_for_endpoint("/v1/chat/completions", body);
+
+        assert_eq!(prepared["reasoning_effort"], "high");
     }
 
     #[tokio::test]
