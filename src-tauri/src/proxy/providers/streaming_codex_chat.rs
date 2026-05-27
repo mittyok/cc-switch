@@ -75,6 +75,7 @@ struct ChatToResponsesState {
     output_items: Vec<(u32, Value)>,
     latest_usage: Option<Value>,
     finish_reason: Option<String>,
+    saw_tool_calls: bool,
 }
 
 impl Default for ChatToResponsesState {
@@ -93,6 +94,7 @@ impl Default for ChatToResponsesState {
             output_items: Vec::new(),
             latest_usage: None,
             finish_reason: None,
+            saw_tool_calls: false,
         }
     }
 }
@@ -139,6 +141,9 @@ impl ChatToResponsesState {
             }
 
             if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                if !tool_calls.is_empty() {
+                    self.saw_tool_calls = true;
+                }
                 events.extend(self.flush_inline_think_at_boundary());
                 let reasoning_for_tool_call = self.current_reasoning_text();
                 events.extend(self.finalize_reasoning());
@@ -152,6 +157,15 @@ impl ChatToResponsesState {
 
         if let Some(finish_reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
             self.finish_reason = Some(finish_reason.to_string());
+            log::info!(
+                "[CodexChatSSE] finish_reason={finish_reason}, response_id={}, model={}, saw_tool_calls={}, tool_count={}, text_chars={}, reasoning_chars={}",
+                self.response_id,
+                self.model,
+                self.saw_tool_calls,
+                self.tools.len(),
+                self.text.text.chars().count(),
+                self.reasoning.text.chars().count()
+            );
         }
 
         events
@@ -519,6 +533,17 @@ impl ChatToResponsesState {
             response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
         }
 
+        log::info!(
+            "[CodexChatSSE] finalize response_id={}, status={status}, finish_reason={}, saw_tool_calls={}, tool_count={}, output_items={}, text_done={}, reasoning_done={}",
+            self.response_id,
+            self.finish_reason.as_deref().unwrap_or("<none>"),
+            self.saw_tool_calls,
+            self.tools.len(),
+            self.output_items.len(),
+            self.text.done,
+            self.reasoning.done
+        );
+
         events.push(sse_event(
             "response.completed",
             json!({
@@ -857,6 +882,13 @@ pub fn create_responses_sse_stream_from_chat_with_tools<E: std::error::Error + S
 
                         let data = data_parts.join("\n");
                         if data.trim() == "[DONE]" {
+                            log::info!(
+                                "[CodexChatSSE] upstream_done response_id={}, finish_reason={}, saw_tool_calls={}, tool_count={}",
+                                state.response_id,
+                                state.finish_reason.as_deref().unwrap_or("<none>"),
+                                state.saw_tool_calls,
+                                state.tools.len()
+                            );
                             for event in state.finalize() {
                                 yield Ok(event);
                             }
