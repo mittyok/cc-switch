@@ -23,7 +23,6 @@ const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
     "logprobs",
     "metadata",
     "n",
-    "parallel_tool_calls",
     "presence_penalty",
     "response_format",
     "seed",
@@ -95,6 +94,7 @@ pub fn responses_to_chat_completions_with_reasoning(
         .is_some_and(|tools| !tools.is_empty());
     apply_reasoning_options(&mut result, &body, model, reasoning_config, has_tools);
 
+    let mut forwarded_tools = false;
     if let Some(tools) = body.get("tools").and_then(|v| v.as_array()) {
         let tools: Vec<Value> = tools
             .iter()
@@ -102,11 +102,17 @@ pub fn responses_to_chat_completions_with_reasoning(
             .collect();
         if !tools.is_empty() {
             result["tools"] = json!(tools);
+            forwarded_tools = true;
         }
     }
 
-    if let Some(tool_choice) = body.get("tool_choice") {
-        result["tool_choice"] = responses_tool_choice_to_chat(tool_choice);
+    if forwarded_tools {
+        if let Some(tool_choice) = body.get("tool_choice") {
+            result["tool_choice"] = responses_tool_choice_to_chat(tool_choice);
+        }
+        if let Some(parallel_tool_calls) = body.get("parallel_tool_calls") {
+            result["parallel_tool_calls"] = parallel_tool_calls.clone();
+        }
     }
 
     for key in EXTRA_CHAT_PASSTHROUGH_FIELDS {
@@ -1291,6 +1297,7 @@ mod tests {
                 "strict": true
             }],
             "tool_choice": {"type": "function", "name": "get_weather"},
+            "parallel_tool_calls": false,
             "max_output_tokens": 100,
             "reasoning": {"effort": "high"},
             "stream": true
@@ -1310,8 +1317,44 @@ mod tests {
         assert_eq!(result["tools"][0]["function"]["name"], "get_weather");
         assert_eq!(result["tools"][0]["function"]["strict"], true);
         assert_eq!(result["tool_choice"]["function"]["name"], "get_weather");
+        assert_eq!(result["parallel_tool_calls"], false);
         assert_eq!(result["max_tokens"], 100);
-        assert_eq!(result["reasoning_effort"], "high");
+        assert!(result.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn responses_request_to_chat_drops_tool_choice_without_tools() {
+        let input = json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "tool_choice": "auto",
+            "parallel_tool_calls": true
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+
+        assert!(result.get("tools").is_none());
+        assert!(result.get("tool_choice").is_none());
+        assert!(result.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
+    fn responses_request_to_chat_drops_tool_options_when_tools_filter_empty() {
+        let input = json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "tools": [{
+                "type": "web_search_preview"
+            }],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+
+        assert!(result.get("tools").is_none());
+        assert!(result.get("tool_choice").is_none());
+        assert!(result.get("parallel_tool_calls").is_none());
     }
 
     #[test]
