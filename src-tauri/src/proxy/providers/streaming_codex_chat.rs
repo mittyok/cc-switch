@@ -143,6 +143,14 @@ impl ChatToResponsesState {
             if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                 if !tool_calls.is_empty() {
                     self.saw_tool_calls = true;
+                    if self.text.added && !self.text.done {
+                        log::info!(
+                            "[CodexChatSSE] finalizing_text_before_tool_call response_id={}, tool_delta_count={}, text_chars={}",
+                            self.response_id,
+                            tool_calls.len(),
+                            self.text.text.chars().count()
+                        );
+                    }
                 }
                 events.extend(self.flush_inline_think_at_boundary());
                 let reasoning_for_tool_call = self.current_reasoning_text();
@@ -1075,6 +1083,35 @@ mod tests {
 
         assert!(message_done_pos < tool_added_pos);
         assert!(output.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn tool_call_turn_completes_after_all_output_items_are_done() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_order\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"Checking.\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_order\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"exec_command\"}}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_order\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"cmd\\\":\\\"pwd\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        let first_done_pos = output
+            .find("event: response.output_item.done")
+            .expect("message item should be done");
+        let function_done_pos = output[first_done_pos + 1..]
+            .find("event: response.output_item.done")
+            .map(|offset| first_done_pos + 1 + offset)
+            .expect("function item should be done");
+        let completed_pos = output
+            .find("event: response.completed")
+            .expect("response should complete");
+
+        assert!(first_done_pos < function_done_pos);
+        assert!(function_done_pos < completed_pos);
+        assert!(output.contains(r#""type":"message""#));
+        assert!(output.contains(r#""type":"function_call""#));
+        assert!(output.contains(r#""arguments""#));
+        assert!(output.contains("pwd"));
     }
 
     #[tokio::test]
