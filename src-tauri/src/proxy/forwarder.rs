@@ -340,8 +340,17 @@ impl RequestForwarder {
         // 单 Provider 场景下跳过熔断器检查（故障转移关闭时）
         let bypass_circuit_breaker = providers.len() == 1;
 
-        // 依次尝试每个供应商
-        for provider in providers.iter() {
+        let provider_attempts: Vec<&Provider> = if providers.len() == 1 {
+            std::iter::repeat(&providers[0])
+                .take(self.max_attempts)
+                .collect()
+        } else {
+            providers.iter().take(self.max_attempts).collect()
+        };
+        let total_attempts = provider_attempts.len();
+
+        // 依次尝试供应商；单 Provider 场景会按 max_retries 原地重试同一家。
+        for provider in provider_attempts {
             // 整流器重试标记：每个 provider 独立持有，避免标记跨 provider 短路故障转移
             // —— 首家 provider 整流后被 5xx/timeout 击落时，下家仍能用整流后的请求体走整流流程
             let mut rectifier_retried = false;
@@ -403,7 +412,7 @@ impl RequestForwarder {
                 status.current_provider_id = Some(provider.id.clone());
             }
 
-            // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
+            // 转发请求。多 Provider 场景每家最多尝试一次；单 Provider 场景按 max_retries 原地重试。
             match self
                 .forward(
                     app_type,
@@ -834,6 +843,7 @@ impl RequestForwarder {
                             let (log_code, log_message) = build_retryable_failure_log(
                                 &provider.name,
                                 attempted_providers,
+                                total_attempts,
                                 providers.len(),
                                 &e,
                             );
@@ -841,7 +851,7 @@ impl RequestForwarder {
 
                             last_error = Some(e);
                             last_provider = Some(provider.clone());
-                            // 继续尝试下一个供应商
+                            // 多 Provider: 继续尝试下一家；单 Provider: 继续原地重试。
                             continue;
                         }
                         ErrorCategory::NonRetryable | ErrorCategory::ClientAbort => {
@@ -902,7 +912,12 @@ impl RequestForwarder {
         }
 
         if let Some((log_code, log_message)) =
-            build_terminal_failure_log(attempted_providers, providers.len(), last_error.as_ref())
+            build_terminal_failure_log(
+                attempted_providers,
+                total_attempts,
+                providers.len(),
+                last_error.as_ref(),
+            )
         {
             log::warn!("[{app_type_str}] [{log_code}] {log_message}");
         }
@@ -1942,33 +1957,40 @@ fn is_bedrock_provider(provider: &Provider) -> bool {
 
 fn build_retryable_failure_log(
     provider_name: &str,
-    attempted_providers: usize,
-    total_providers: usize,
+    attempted_attempts: usize,
+    total_attempts: usize,
+    unique_provider_count: usize,
     error: &ProxyError,
 ) -> (&'static str, String) {
     let error_summary = summarize_proxy_error(error);
 
-    if total_providers <= 1 {
+    if unique_provider_count <= 1 {
+        let retry_hint = if total_attempts > 1 && attempted_attempts < total_attempts {
+            format!("，将重试同一 Provider ({attempted_attempts}/{total_attempts})")
+        } else {
+            String::new()
+        };
         (
             log_fwd::SINGLE_PROVIDER_FAILED,
-            format!("Provider {provider_name} 请求失败: {error_summary}"),
+            format!("Provider {provider_name} 请求失败{retry_hint}: {error_summary}"),
         )
     } else {
         (
             log_fwd::PROVIDER_FAILED_RETRY,
             format!(
-                "Provider {provider_name} 失败，继续尝试下一个 ({attempted_providers}/{total_providers}): {error_summary}"
+                "Provider {provider_name} 失败，继续尝试下一个 ({attempted_attempts}/{total_attempts}): {error_summary}"
             ),
         )
     }
 }
 
 fn build_terminal_failure_log(
-    attempted_providers: usize,
-    total_providers: usize,
+    attempted_attempts: usize,
+    total_attempts: usize,
+    unique_provider_count: usize,
     last_error: Option<&ProxyError>,
 ) -> Option<(&'static str, String)> {
-    if total_providers <= 1 {
+    if unique_provider_count <= 1 {
         return None;
     }
 
@@ -1977,9 +1999,9 @@ fn build_terminal_failure_log(
         .unwrap_or_else(|| "未知错误".to_string());
 
     Some((
-        log_fwd::ALL_PROVIDERS_FAILED,
-        format!(
-            "已尝试 {attempted_providers}/{total_providers} 个 Provider，均失败。最后错误: {error_summary}"
+            log_fwd::ALL_PROVIDERS_FAILED,
+            format!(
+            "已尝试 {attempted_attempts}/{total_attempts} 个 Provider，均失败。最后错误: {error_summary}"
         ),
     ))
 }
@@ -2485,7 +2507,7 @@ mod tests {
             body: Some(r#"{"error":{"message":"rate limit exceeded"}}"#.to_string()),
         };
 
-        let (code, message) = build_retryable_failure_log("PackyCode-response", 1, 1, &error);
+        let (code, message) = build_retryable_failure_log("PackyCode-response", 1, 1, 1, &error);
 
         assert_eq!(code, log_fwd::SINGLE_PROVIDER_FAILED);
         assert!(message.contains("Provider PackyCode-response 请求失败"));
@@ -2498,7 +2520,7 @@ mod tests {
     fn multi_provider_retryable_log_keeps_failover_wording() {
         let error = ProxyError::Timeout("upstream timed out after 30s".to_string());
 
-        let (code, message) = build_retryable_failure_log("primary", 1, 3, &error);
+        let (code, message) = build_retryable_failure_log("primary", 1, 3, 3, &error);
 
         assert_eq!(code, log_fwd::PROVIDER_FAILED_RETRY);
         assert!(message.contains("继续尝试下一个 (1/3)"));
@@ -2507,7 +2529,7 @@ mod tests {
 
     #[test]
     fn single_provider_has_no_terminal_all_failed_log() {
-        assert!(build_terminal_failure_log(1, 1, None).is_none());
+        assert!(build_terminal_failure_log(1, 1, 1, None).is_none());
     }
 
     #[test]
@@ -2515,7 +2537,7 @@ mod tests {
         let error = ProxyError::ForwardFailed("connection reset by peer".to_string());
 
         let (code, message) =
-            build_terminal_failure_log(2, 2, Some(&error)).expect("expected terminal log");
+            build_terminal_failure_log(2, 2, 2, Some(&error)).expect("expected terminal log");
 
         assert_eq!(code, log_fwd::ALL_PROVIDERS_FAILED);
         assert!(message.contains("已尝试 2/2 个 Provider，均失败"));

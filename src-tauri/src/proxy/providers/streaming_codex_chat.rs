@@ -147,6 +147,7 @@ impl ChatToResponsesState {
                 events.extend(self.flush_inline_think_at_boundary());
                 let reasoning_for_tool_call = self.current_reasoning_text();
                 events.extend(self.finalize_reasoning());
+                events.extend(self.finalize_text());
                 for tool_call in tool_calls {
                     events.extend(
                         self.push_tool_call_delta(tool_call, reasoning_for_tool_call.as_deref()),
@@ -1050,6 +1051,30 @@ mod tests {
         assert!(output.contains("event: response.function_call_arguments.done"));
         assert!(output.contains("\"type\":\"function_call\""));
         assert!(output.contains("\"call_id\":\"call_1\""));
+    }
+
+    #[tokio::test]
+    async fn finalizes_text_item_before_tool_call_item() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_text_tool\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"I will inspect the files.\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_text_tool\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"ls\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        let text_done_pos = output
+            .find("event: response.output_text.done")
+            .expect("text should be finalized");
+        let message_done_pos = output[text_done_pos..]
+            .find("event: response.output_item.done")
+            .map(|offset| text_done_pos + offset)
+            .expect("message output item should be finalized");
+        let tool_added_pos = output
+            .find("\"type\":\"function_call\"")
+            .expect("tool call item should be added");
+
+        assert!(message_done_pos < tool_added_pos);
+        assert!(output.contains("event: response.completed"));
     }
 
     #[tokio::test]
