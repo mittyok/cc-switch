@@ -830,7 +830,12 @@ pub fn chat_completion_to_response_with_tools(
     let response_id = response_id_from_chat_id(body.get("id").and_then(|v| v.as_str()));
     let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
     let created_at = body.get("created").and_then(|v| v.as_u64()).unwrap_or(0);
-    let finish_reason = choice.get("finish_reason").and_then(|v| v.as_str());
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            ProxyError::TransformError("Chat response choice missing finish_reason".to_string())
+        })?;
 
     let reasoning = chat_reasoning_text(message);
     let mut output = Vec::new();
@@ -858,13 +863,13 @@ pub fn chat_completion_to_response_with_tools(
         "id": response_id,
         "object": "response",
         "created_at": created_at,
-        "status": response_status_from_finish_reason(finish_reason),
+        "status": response_status_from_finish_reason(Some(finish_reason)),
         "model": model,
         "output": output,
         "usage": chat_usage_to_responses_usage(body.get("usage"))
     });
 
-    if finish_reason == Some("length") {
+    if finish_reason == "length" {
         response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
     }
 
@@ -2127,6 +2132,24 @@ mod tests {
 
         assert_eq!(result["status"], "incomplete");
         assert_eq!(result["incomplete_details"]["reason"], "max_output_tokens");
+    }
+
+    #[test]
+    fn chat_response_missing_finish_reason_returns_transform_error() {
+        let input = json!({
+            "id": "chatcmpl_missing_finish",
+            "model": "gpt-5.5",
+            "choices": [{
+                "message": {"role": "assistant", "content": "I will continue."}
+            }]
+        });
+
+        let error = chat_completion_to_response(input).unwrap_err();
+
+        assert!(matches!(error, ProxyError::TransformError(_)));
+        assert!(error
+            .to_string()
+            .contains("Chat response choice missing finish_reason"));
     }
 
     #[test]

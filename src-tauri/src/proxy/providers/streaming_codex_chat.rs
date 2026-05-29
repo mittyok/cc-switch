@@ -564,6 +564,52 @@ impl ChatToResponsesState {
         events
     }
 
+    fn finalize_missing_finish_reason(&mut self) -> Vec<Bytes> {
+        if self.completed {
+            return Vec::new();
+        }
+
+        let mut events = self.ensure_response_started();
+        events.extend(self.flush_inline_think_at_boundary());
+        events.extend(self.finalize_reasoning());
+        events.extend(self.finalize_text());
+        events.extend(self.finalize_tools());
+
+        log::warn!(
+            "[CodexChatSSE] missing_finish_reason response_id={}, saw_tool_calls={}, tool_count={}, output_items={}, text_done={}, reasoning_done={}",
+            self.response_id,
+            self.saw_tool_calls,
+            self.tools.len(),
+            self.output_items.len(),
+            self.text.done,
+            self.reasoning.done
+        );
+
+        let mut response = self.base_response("failed", self.completed_output_items());
+        response["error"] = json!({
+            "message": "Upstream stream ended without a finish_reason",
+            "type": "upstream_incomplete_stream"
+        });
+
+        events.push(sse_event(
+            "response.failed",
+            json!({
+                "type": "response.failed",
+                "response": response
+            }),
+        ));
+        self.completed = true;
+        events
+    }
+
+    fn finalize_terminal(&mut self) -> Vec<Bytes> {
+        if self.finish_reason.is_none() {
+            self.finalize_missing_finish_reason()
+        } else {
+            self.finalize()
+        }
+    }
+
     fn finalize_reasoning(&mut self) -> Vec<Bytes> {
         if !self.reasoning.added || self.reasoning.done {
             return Vec::new();
@@ -898,7 +944,7 @@ pub fn create_responses_sse_stream_from_chat_with_tools<E: std::error::Error + S
                                 state.saw_tool_calls,
                                 state.tools.len()
                             );
-                            for event in state.finalize() {
+                            for event in state.finalize_terminal() {
                                 yield Ok(event);
                             }
                             continue;
@@ -937,7 +983,7 @@ pub fn create_responses_sse_stream_from_chat_with_tools<E: std::error::Error + S
         }
 
         if !stream_failed {
-            for event in state.finalize() {
+            for event in state.finalize_terminal() {
                 yield Ok(event);
             }
         }
@@ -1180,6 +1226,33 @@ mod tests {
         assert!(output.contains("event: response.failed"));
         assert!(output.contains("quota exceeded"));
         assert!(output.contains("rate_limit_exceeded"));
+        assert!(!output.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn done_without_finish_reason_emits_failed_without_completed() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_no_finish\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"I will continue.\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert!(output.contains("event: response.output_text.delta"));
+        assert!(output.contains("event: response.output_item.done"));
+        assert!(output.contains("event: response.failed"));
+        assert!(output.contains("upstream_incomplete_stream"));
+        assert!(!output.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn eof_without_finish_reason_emits_failed_without_completed() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_eof_no_finish\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"Still working.\"}}]}\n\n",
+        ])
+        .await;
+
+        assert!(output.contains("event: response.failed"));
+        assert!(output.contains("upstream_incomplete_stream"));
         assert!(!output.contains("event: response.completed"));
     }
 }
