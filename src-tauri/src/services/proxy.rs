@@ -41,7 +41,7 @@ const CLAUDE_MODEL_OVERRIDE_ENV_KEYS: [&str; 9] = [
 
 const CLAUDE_TAKEOVER_HAIKU_MODEL: &str = "claude-haiku-4-5";
 const CLAUDE_TAKEOVER_SONNET_MODEL: &str = "claude-sonnet-4-6";
-const CLAUDE_TAKEOVER_OPUS_MODEL: &str = "claude-opus-4-7";
+const CLAUDE_TAKEOVER_OPUS_MODEL: &str = "claude-opus-4-8";
 // 写给 Claude Code 时沿用文档示例的大写形式；解析侧大小写不敏感。
 const CLAUDE_ONE_M_MARKER_FOR_CLIENT: &str = "[1M]";
 
@@ -1774,11 +1774,6 @@ impl ProxyService {
                     existing_value,
                 )?;
             }
-
-            crate::codex_config::normalize_codex_settings_config_model_provider(
-                &mut effective_settings,
-            )
-            .map_err(|e| format!("归一化 Codex restore backup 失败: {e}"))?;
         }
 
         let backup_json = match app_type_enum {
@@ -2456,7 +2451,7 @@ mod tests {
             "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME",
             Some("claude-sonnet-4.6"),
         );
-        assert_env_str(env, "ANTHROPIC_DEFAULT_OPUS_MODEL", Some("claude-opus-4-7"));
+        assert_env_str(env, "ANTHROPIC_DEFAULT_OPUS_MODEL", Some("claude-opus-4-8"));
         assert_env_str(
             env,
             "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME",
@@ -2527,7 +2522,7 @@ mod tests {
             Some("claude-sonnet-4-6"),
         );
         assert_env_str(env, "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME", Some("gpt-5.4"));
-        assert_env_str(env, "ANTHROPIC_DEFAULT_OPUS_MODEL", Some("claude-opus-4-7"));
+        assert_env_str(env, "ANTHROPIC_DEFAULT_OPUS_MODEL", Some("claude-opus-4-8"));
         assert_env_str(env, "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME", Some("gpt-5.4"));
         assert_env_str(env, "ANTHROPIC_API_KEY", Some(PROXY_TOKEN_PLACEHOLDER));
         assert_env_str(env, "ANTHROPIC_AUTH_TOKEN", None);
@@ -3175,7 +3170,7 @@ model = "gpt-5.1-codex"
             live_env
                 .get("ANTHROPIC_DEFAULT_OPUS_MODEL")
                 .and_then(|v| v.as_str()),
-            Some("claude-opus-4-7[1M]"),
+            Some("claude-opus-4-8[1M]"),
             "Opus role should preserve the current provider 1M capability marker"
         );
         assert_eq!(
@@ -3566,7 +3561,7 @@ base_url = "https://new.example/v1"
 
     #[tokio::test]
     #[serial]
-    async fn hot_switch_codex_provider_keeps_model_provider_stable_in_backup_and_restore() {
+    async fn hot_switch_codex_provider_preserves_provider_model_provider_in_backup_and_restore() {
         let _home = TempHome::new();
         crate::settings::reload_settings().expect("reload settings");
 
@@ -3663,21 +3658,21 @@ requires_openai_auth = true
             toml::from_str(backup_config).expect("parse backup config");
         assert_eq!(
             parsed_backup.get("model_provider").and_then(|v| v.as_str()),
-            Some("custom"),
-            "provider-derived restore backup should retain stable Codex model_provider"
+            Some("aihubmix"),
+            "provider-derived restore backup should preserve the provider's model_provider"
         );
         let backup_model_providers = parsed_backup
             .get("model_providers")
             .and_then(|v| v.as_table())
             .expect("backup model_providers");
-        assert!(backup_model_providers.get("aihubmix").is_none());
+        assert!(backup_model_providers.get("custom").is_none());
         assert_eq!(
             backup_model_providers
-                .get("custom")
+                .get("aihubmix")
                 .and_then(|v| v.get("base_url"))
                 .and_then(|v| v.as_str()),
             Some("https://aihubmix.example/v1"),
-            "stable provider id should point at the hot-switched provider endpoint"
+            "provider id should point at the hot-switched provider endpoint"
         );
 
         service
@@ -3693,8 +3688,8 @@ requires_openai_auth = true
         let parsed_live: toml::Value = toml::from_str(live_config).expect("parse live config");
         assert_eq!(
             parsed_live.get("model_provider").and_then(|v| v.as_str()),
-            Some("custom"),
-            "restored Codex live config should not switch history buckets"
+            Some("aihubmix"),
+            "restored Codex live config should preserve the provider's model_provider"
         );
         assert_eq!(
             live.get("auth")
@@ -3802,7 +3797,7 @@ requires_openai_auth = true
 
         assert_eq!(
             parsed_live.get("model_provider").and_then(|v| v.as_str()),
-            Some("custom")
+            Some("stable")
         );
         assert_eq!(
             parsed_live.get("model").and_then(|v| v.as_str()),
