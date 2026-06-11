@@ -299,6 +299,38 @@ impl Default for McpRoot {
     }
 }
 
+// ============================================================================
+// Embedding Provider 配置
+// ============================================================================
+
+/// Embedding Provider 定义
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingProvider {
+    pub id: String,
+    pub name: String,
+    #[serde(rename = "apiKey", skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(rename = "baseUrl")]
+    pub base_url: String,
+    #[serde(default = "default_embedding_model")]
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+fn default_embedding_model() -> String {
+    "text-embedding-3-small".to_string()
+}
+
+/// Embedding 配置
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct EmbeddingConfig {
+    #[serde(default)]
+    pub providers: HashMap<String, EmbeddingProvider>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+}
+
 /// Prompt 配置：单客户端维度
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PromptConfig {
@@ -487,6 +519,9 @@ pub struct MultiAppConfig {
     /// Claude 通用配置片段（旧字段，用于向后兼容迁移）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_common_config_snippet: Option<String>,
+    /// Embedding Provider 配置
+    #[serde(default)]
+    pub embedding: EmbeddingConfig,
 }
 
 fn default_version() -> u32 {
@@ -512,6 +547,7 @@ impl Default for MultiAppConfig {
             skills: SkillStore::default(),
             common_config_snippets: CommonConfigSnippets::default(),
             claude_common_config_snippet: None,
+            embedding: EmbeddingConfig::default(),
         }
     }
 }

@@ -1340,6 +1340,116 @@ fn responses_sse_to_response_value(body: &str) -> Result<Value, ProxyError> {
 }
 
 // ============================================================================
+// Embedding API 处理器
+// ============================================================================
+
+use crate::app_config::MultiAppConfig;
+
+/// 处理 /v1/embeddings 请求（OpenAI Embeddings API）
+///
+/// Embedding 请求透传到配置的 provider
+pub async fn handle_embeddings(
+    State(_state): State<ProxyState>,
+    request: axum::extract::Request,
+) -> Result<axum::response::Response, ProxyError> {
+    let (parts, req_body) = request.into_parts();
+    let method = parts.method.clone();
+    let _uri = parts.uri;
+    let headers = parts.headers;
+
+    let body_bytes = req_body
+        .collect()
+        .await
+        .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
+        .to_bytes();
+
+    // 从配置中获取 embedding provider
+    let config = match MultiAppConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(ProxyError::UpstreamError {
+                status: 500,
+                body: Some(format!("Failed to load embedding config: {}", e)),
+            });
+        }
+    };
+
+    let current_id = config.embedding.current.clone();
+    let provider = if let Some(id) = current_id {
+        config.embedding.providers.get(&id).cloned()
+    } else {
+        // 如果没有设置 current，取第一个
+        config.embedding.providers.values().next().cloned()
+    };
+
+    let provider = match provider {
+        Some(p) => p,
+        None => {
+            return Err(ProxyError::UpstreamError {
+                status: 500,
+                body: Some("No embedding provider configured".to_string()),
+            });
+        }
+    };
+
+    // 构建转发目标 URL
+    let base_url = provider.base_url.trim_end_matches('/');
+    let target_url = format!("{}/embeddings", base_url);
+
+    // 构建请求
+    let client = reqwest::Client::new();
+    let mut req_builder = client.request(
+        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::POST),
+        &target_url,
+    );
+
+    // 添加 headers
+    for (key, value) in headers.iter() {
+        if key.as_str() != "host" {
+            req_builder = req_builder.header(key.as_str(), value.to_str().unwrap_or(""));
+        }
+    }
+
+    // 添加 API Key
+    if let Some(api_key) = &provider.api_key {
+        req_builder = req_builder.header("Authorization", format!("Bearer {}", api_key));
+    }
+
+    // 添加 body
+    req_builder = req_builder.body(body_bytes.to_vec());
+
+    // 发送请求
+    let upstream_response = req_builder
+        .send()
+        .await
+        .map_err(|e| ProxyError::UpstreamError {
+            status: 502,
+            body: Some(format!("Failed to forward embedding request: {}", e)),
+        })?;
+
+    let status = upstream_response.status();
+    let headers = upstream_response.headers().clone();
+    let body = upstream_response
+        .bytes()
+        .await
+        .map_err(|e| ProxyError::UpstreamError {
+            status: 502,
+            body: Some(format!("Failed to read embedding response: {}", e)),
+        })?;
+
+    // 构建响应
+    let mut response = axum::response::Response::new(body.into());
+    *response.status_mut() = status;
+    for (key, value) in headers.iter() {
+        if key.as_str() != "transfer-encoding" {
+            response.headers_mut().insert(key.clone(), value.clone());
+        }
+    }
+
+    Ok(response)
+}
+
+// ============================================================================
 // 使用量记录（保留用于 Claude 转换逻辑）
 // ============================================================================
 
