@@ -1352,9 +1352,10 @@ pub async fn handle_embeddings(
     State(_state): State<ProxyState>,
     request: axum::extract::Request,
 ) -> Result<axum::response::Response, ProxyError> {
+    let start = std::time::Instant::now();
     let (parts, req_body) = request.into_parts();
     let method = parts.method.clone();
-    let _uri = parts.uri;
+    let uri = parts.uri.to_string();
     let headers = parts.headers;
 
     let body_bytes = req_body
@@ -1363,10 +1364,23 @@ pub async fn handle_embeddings(
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
 
+    // 解析请求参数用于日志
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    let request_params: serde_json::Value = serde_json::from_str(&body_str).unwrap_or_default();
+    let request_model = request_params.get("model").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let input_texts = request_params.get("input").map(|v| {
+        if let Some(arr) = v.as_array() {
+            arr.len()
+        } else {
+            1
+        }
+    }).unwrap_or(0);
+
     // 从配置中获取 embedding provider
     let config = match MultiAppConfig::load() {
         Ok(c) => c,
         Err(e) => {
+            log::error!("[Embedding] 加载配置失败: {}", e);
             return Err(ProxyError::UpstreamError {
                 status: 500,
                 body: Some(format!("Failed to load embedding config: {}", e)),
@@ -1385,6 +1399,7 @@ pub async fn handle_embeddings(
     let provider = match provider {
         Some(p) => p,
         None => {
+            log::error!("[Embedding] 未配置 provider");
             return Err(ProxyError::UpstreamError {
                 status: 500,
                 body: Some("No embedding provider configured".to_string()),
@@ -1395,6 +1410,18 @@ pub async fn handle_embeddings(
     // 构建转发目标 URL
     let base_url = provider.base_url.trim_end_matches('/');
     let target_url = format!("{}/embeddings", base_url);
+
+    log::info!(
+        "[Embedding] provider={}, base_url={}, model={}, target={}, input_count={}, method={}, uri={}",
+        provider.name,
+        base_url,
+        provider.model,
+        target_url,
+        input_texts,
+        method,
+        uri
+    );
+    log::debug!("[Embedding] request_params: {}", body_str);
 
     // 构建请求
     let client = reqwest::Client::new();
