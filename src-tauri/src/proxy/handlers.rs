@@ -8,6 +8,7 @@
 //! - Claude 的格式转换逻辑保留在此文件（用于 OpenRouter 旧接口回退）
 
 use super::{
+    content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
     error_mapper::{get_error_message, map_proxy_error_to_status},
     forwarder::ActiveConnectionGuard,
     handler_config::{
@@ -39,9 +40,9 @@ use crate::app_config::AppType;
 use crate::database::PRICING_SOURCE_REQUEST;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use bytes::Bytes;
-use std::collections::HashSet;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
 // ============================================================================
 // 健康检查和状态查询（简单端点）
@@ -578,13 +579,59 @@ fn extract_tool_names_from_responses_body(body: &Value) -> HashSet<String> {
                 .filter_map(|tool| {
                     tool.get("name")
                         .or_else(|| tool.get("tool_name"))
-                        .or_else(|| tool.get("function").and_then(|function| function.get("name")))
+                        .or_else(|| {
+                            tool.get("function")
+                                .and_then(|function| function.get("name"))
+                        })
                         .and_then(|v| v.as_str())
                         .map(String::from)
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Codex 客户端（尤其 Desktop 登录态）可能对请求体启用 zstd 压缩，使得后续
+/// `serde_json::from_slice` 直接解析失败。这里在解析前解压，并剥掉已失真的实体头
+/// （content-encoding / content-length / transfer-encoding）——转发层会基于解压后的
+/// 明文 JSON 重新生成正确的头。
+fn decode_codex_request_body(
+    headers: &mut axum::http::HeaderMap,
+    body_bytes: Bytes,
+) -> Result<Bytes, ProxyError> {
+    let Some(encoding) = get_content_encoding(headers) else {
+        return Ok(body_bytes);
+    };
+
+    if !is_supported_content_encoding(&encoding) {
+        return Err(ProxyError::InvalidRequest(format!(
+            "Unsupported request content-encoding: {encoding}"
+        )));
+    }
+
+    log::debug!("[Codex] 解压请求体: content-encoding={encoding}");
+    let decompressed = match decompress_body(&encoding, &body_bytes) {
+        Ok(Some(decompressed)) => decompressed,
+        // is_supported_content_encoding 已确保编码受支持，正常不会返回 None；
+        // 防御性兜底：宁可报错，也不能把压缩字节当 JSON 透传下去。
+        Ok(None) => {
+            return Err(ProxyError::InvalidRequest(format!(
+                "Unsupported request content-encoding: {encoding}"
+            )));
+        }
+        Err(e) => {
+            log::warn!("[Codex] 请求体解压失败 ({encoding}): {e}");
+            return Err(ProxyError::InvalidRequest(format!(
+                "Failed to decompress request body ({encoding}): {e}"
+            )));
+        }
+    };
+
+    headers.remove(axum::http::header::CONTENT_ENCODING);
+    headers.remove(axum::http::header::CONTENT_LENGTH);
+    headers.remove(axum::http::header::TRANSFER_ENCODING);
+
+    Ok(Bytes::from(decompressed))
 }
 
 // ============================================================================
@@ -599,13 +646,14 @@ pub async fn handle_chat_completions(
     let (parts, req_body) = request.into_parts();
     let method = parts.method.clone();
     let uri = parts.uri;
-    let headers = parts.headers;
+    let mut headers = parts.headers;
     let extensions = parts.extensions;
     let body_bytes = req_body
         .collect()
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
+    let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
@@ -664,13 +712,14 @@ pub async fn handle_responses(
     let (parts, req_body) = request.into_parts();
     let method = parts.method.clone();
     let uri = parts.uri;
-    let headers = parts.headers;
+    let mut headers = parts.headers;
     let extensions = parts.extensions;
     let body_bytes = req_body
         .collect()
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
+    let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
@@ -742,13 +791,14 @@ pub async fn handle_responses_compact(
     let (parts, req_body) = request.into_parts();
     let method = parts.method.clone();
     let uri = parts.uri;
-    let headers = parts.headers;
+    let mut headers = parts.headers;
     let extensions = parts.extensions;
     let body_bytes = req_body
         .collect()
         .await
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
+    let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
@@ -1951,14 +2001,20 @@ pub async fn handle_embeddings(
     // 解析请求参数用于日志
     let body_str = String::from_utf8_lossy(&body_bytes);
     let request_params: serde_json::Value = serde_json::from_str(&body_str).unwrap_or_default();
-    let request_model = request_params.get("model").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let input_texts = request_params.get("input").map(|v| {
-        if let Some(arr) = v.as_array() {
-            arr.len()
-        } else {
-            1
-        }
-    }).unwrap_or(0);
+    let request_model = request_params
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let input_texts = request_params
+        .get("input")
+        .map(|v| {
+            if let Some(arr) = v.as_array() {
+                arr.len()
+            } else {
+                1
+            }
+        })
+        .unwrap_or(0);
 
     // 从配置中获取 embedding provider
     let config = match MultiAppConfig::load() {
