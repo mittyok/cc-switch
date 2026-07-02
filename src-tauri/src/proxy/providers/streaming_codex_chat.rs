@@ -193,6 +193,13 @@ impl ChatToResponsesState {
     }
 
     fn push_content_delta(&mut self, delta: &str) -> Vec<Bytes> {
+        if matches!(self.inline_think.mode, InlineThinkMode::Detecting)
+            && self.inline_think.buffer.trim().is_empty()
+            && delta.trim().is_empty()
+        {
+            return Vec::new();
+        }
+
         match self.inline_think.mode {
             InlineThinkMode::Text => {
                 let mut events = self.finalize_reasoning();
@@ -1201,6 +1208,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ignores_leading_whitespace_only_chat_content_before_answer() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_spaces\",\"created\":123,\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"      \"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_spaces\",\"created\":123,\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"\\n\\n\\t\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_spaces\",\"created\":123,\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"Actual answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert!(output.contains("\"text\":\"Actual answer\""));
+        assert!(!output.contains("\"text\":\"      "));
+        assert!(!output.contains("\\n\\n\\tActual answer"));
+        assert!(output.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
     async fn converts_tool_call_chat_sse_to_responses_sse() {
         let output = collect(vec![
             "data: {\"id\":\"chatcmpl_2\",\"model\":\"gpt-5.4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\"}}]}}]}\n\n",
@@ -1485,14 +1508,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn eof_without_finish_reason_emits_failed_without_completed() {
+    async fn eof_with_output_without_finish_reason_emits_incomplete_without_failed() {
         let output = collect(vec![
             "data: {\"id\":\"chatcmpl_eof_no_finish\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"Still working.\"}}]}\n\n",
         ])
         .await;
 
-        assert!(output.contains("event: response.failed"));
-        assert!(output.contains("upstream_incomplete_stream"));
-        assert!(!output.contains("event: response.completed"));
+        assert!(output.contains("event: response.completed"));
+        assert!(output.contains("\"status\":\"incomplete\""));
+        assert!(output.contains("\"incomplete_details\":{\"reason\":\"max_output_tokens\"}"));
+        assert!(!output.contains("event: response.failed"));
     }
 }
