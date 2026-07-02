@@ -186,12 +186,18 @@ pub async fn handle_streaming(
     let timeout_config = ctx.streaming_timeout_config();
 
     // 创建带日志和超时的透传流
+    let passthrough_filter = if ctx.app_type_str == "codex" {
+        PassthroughSseFilter::CodexResponsesLeadingWhitespace
+    } else {
+        PassthroughSseFilter::None
+    };
     let logged_stream = create_logged_passthrough_stream(
         stream,
         ctx.tag,
         usage_collector,
         timeout_config,
         connection_guard,
+        passthrough_filter,
     );
 
     let body = axum::body::Body::from_stream(logged_stream);
@@ -423,6 +429,55 @@ impl SseUsageCollector {
 
 struct SseUsageFinishGuard {
     collector: Option<SseUsageCollector>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassthroughSseFilter {
+    None,
+    CodexResponsesLeadingWhitespace,
+}
+
+#[derive(Debug, Default)]
+struct CodexResponsesSseFilterState {
+    saw_substantive_output: bool,
+}
+
+impl CodexResponsesSseFilterState {
+    fn should_skip(&mut self, event_text: &str) -> bool {
+        let mut data_parts = Vec::new();
+        for line in event_text.lines() {
+            if let Some(data) = strip_sse_field(line, "data") {
+                data_parts.push(data.to_string());
+            }
+        }
+
+        if data_parts.is_empty() {
+            return false;
+        }
+
+        let data = data_parts.join("\n");
+        if data.trim() == "[DONE]" {
+            return false;
+        }
+
+        let Ok(value) = serde_json::from_str::<Value>(&data) else {
+            return false;
+        };
+
+        if value.get("type").and_then(|value| value.as_str()) == Some("response.output_text.delta")
+        {
+            if let Some(delta) = value.get("delta").and_then(|value| value.as_str()) {
+                if !self.saw_substantive_output && delta.trim().is_empty() {
+                    return true;
+                }
+                if !delta.trim().is_empty() {
+                    self.saw_substantive_output = true;
+                }
+            }
+        }
+
+        false
+    }
 }
 
 impl SseUsageFinishGuard {
@@ -680,15 +735,19 @@ pub fn create_logged_passthrough_stream(
     usage_collector: Option<SseUsageCollector>,
     timeout_config: StreamingTimeoutConfig,
     connection_guard: Option<ActiveConnectionGuard>,
+    sse_filter: PassthroughSseFilter,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
     async_stream::stream! {
         let _conn_guard = connection_guard;
         let mut buffer = String::new();
         let mut utf8_remainder: Vec<u8> = Vec::new();
+        let mut codex_responses_filter = CodexResponsesSseFilterState::default();
         let mut collector = usage_collector;
         let mut finish_guard = collector.clone().map(SseUsageFinishGuard::new);
         let inspect_sse_events =
-            collector.is_some() || log::log_enabled!(log::Level::Debug);
+            collector.is_some()
+                || log::log_enabled!(log::Level::Debug)
+                || sse_filter != PassthroughSseFilter::None;
         let mut is_first_chunk = true;
 
         // 超时配置
@@ -772,10 +831,23 @@ pub fn create_logged_passthrough_stream(
                                     }
                                 }
                             }
+
+                            if sse_filter == PassthroughSseFilter::CodexResponsesLeadingWhitespace
+                                && codex_responses_filter.should_skip(&event_text)
+                            {
+                                log::debug!("[{tag}] 丢弃 Codex Responses 前导空白 output_text.delta");
+                                continue;
+                            }
+
+                            if sse_filter != PassthroughSseFilter::None {
+                                yield Ok(Bytes::from(format!("{event_text}\n\n")));
+                            }
                         }
                     }
 
-                    yield Ok(bytes);
+                    if sse_filter == PassthroughSseFilter::None {
+                        yield Ok(bytes);
+                    }
                 }
                 Some(Err(e)) => {
                     log::error!("[{tag}] 流错误: {e}");
@@ -786,6 +858,14 @@ pub fn create_logged_passthrough_stream(
                     // 流正常结束
                     break;
                 }
+            }
+        }
+
+        if sse_filter != PassthroughSseFilter::None && !buffer.trim().is_empty() {
+            if !(sse_filter == PassthroughSseFilter::CodexResponsesLeadingWhitespace
+                && codex_responses_filter.should_skip(&buffer))
+            {
+                yield Ok(Bytes::from(format!("{buffer}\n\n")));
             }
         }
 
@@ -846,6 +926,45 @@ mod tests {
             Some("message_start")
         );
         assert_eq!(super::strip_sse_field("id:1", "data"), None);
+    }
+
+    #[tokio::test]
+    async fn codex_responses_passthrough_filters_leading_whitespace_text_delta() {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(
+                b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"      \"}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"\\n\\n\\t\"}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Actual answer\"}\n\n",
+            )),
+            Ok(Bytes::from_static(
+                b"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n",
+            )),
+        ];
+
+        let output: Vec<Bytes> = create_logged_passthrough_stream(
+            futures::stream::iter(chunks),
+            "Codex",
+            None,
+            StreamingTimeoutConfig {
+                first_byte_timeout: 0,
+                idle_timeout: 0,
+            },
+            None,
+            PassthroughSseFilter::CodexResponsesLeadingWhitespace,
+        )
+        .map(|item| item.expect("stream item"))
+        .collect()
+        .await;
+        let output = String::from_utf8(output.concat().to_vec()).expect("utf8 output");
+
+        assert!(output.contains("\"delta\":\"Actual answer\""));
+        assert!(output.contains("event: response.completed"));
+        assert!(!output.contains("\"delta\":\"      \""));
+        assert!(!output.contains("\"delta\":\"\\n\\n\\t\""));
     }
 
     #[test]

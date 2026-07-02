@@ -403,6 +403,7 @@ async fn handle_claude_transform(
             usage_collector,
             timeout_config,
             connection_guard,
+            super::response_processor::PassthroughSseFilter::None,
         );
 
         let mut headers = axum::http::HeaderMap::new();
@@ -954,6 +955,7 @@ async fn handle_codex_chat_to_responses_transform(
             usage_collector,
             ctx.streaming_timeout_config(),
             connection_guard,
+            super::response_processor::PassthroughSseFilter::None,
         );
 
         let mut headers = axum::http::HeaderMap::new();
