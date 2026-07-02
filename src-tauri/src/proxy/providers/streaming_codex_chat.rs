@@ -1239,6 +1239,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_like_text_is_not_converted_to_function_call() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_text_tool_like\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"tool: exec_command {\\\"cmd\\\":\\\"pwd\\\"}\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert!(output.contains("event: response.output_text.delta"));
+        assert!(output.contains("tool: exec_command"));
+        assert!(!output.contains("event: response.function_call_arguments.delta"));
+        assert!(!output.contains("event: response.function_call_arguments.done"));
+        assert!(!output.contains("\"type\":\"function_call\""));
+        assert!(output.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
     async fn finalizes_text_item_before_tool_call_item() {
         let output = collect(vec![
             "data: {\"id\":\"chatcmpl_text_tool\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"I will inspect the files.\"}}]}\n\n",
