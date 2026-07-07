@@ -26,7 +26,6 @@ const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
     "logprobs",
     "metadata",
     "n",
-    "parallel_tool_calls",
     "presence_penalty",
     "response_format",
     "seed",
@@ -302,7 +301,11 @@ pub fn responses_to_chat_completions_with_reasoning(
         }
     }
 
-    apply_reasoning_options(&mut result, &body, model, reasoning_config);
+    let has_tools = body
+        .get("tools")
+        .and_then(|value| value.as_array())
+        .is_some_and(|tools| !tools.is_empty());
+    apply_reasoning_options(&mut result, &body, model, reasoning_config, has_tools);
 
     let tools = tool_context.chat_tools();
     if !tools.is_empty() {
@@ -347,9 +350,10 @@ fn apply_reasoning_options(
     body: &Value,
     model: &str,
     config: Option<&CodexChatReasoningConfig>,
+    has_tools: bool,
 ) {
     let Some(config) = config else {
-        if super::transform::supports_reasoning_effort(model) {
+        if !has_tools && super::transform::supports_reasoning_effort(model) {
             if let Some(effort) = body.pointer("/reasoning/effort") {
                 result["reasoning_effort"] = effort.clone();
             }
@@ -1253,7 +1257,12 @@ pub(crate) fn chat_completion_to_response_with_context(
     let response_id = response_id_from_chat_id(body.get("id").and_then(|v| v.as_str()));
     let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
     let created_at = body.get("created").and_then(|v| v.as_u64()).unwrap_or(0);
-    let finish_reason = choice.get("finish_reason").and_then(|v| v.as_str());
+    let finish_reason = choice
+        .get("finish_reason")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            ProxyError::TransformError("Chat response choice missing finish_reason".to_string())
+        })?;
 
     let reasoning = chat_reasoning_text(message);
     let mut output = Vec::new();
@@ -1262,8 +1271,17 @@ pub(crate) fn chat_completion_to_response_with_context(
     {
         output.push(reasoning_item);
     }
-    if let Some(message_item) = chat_message_to_response_output_item(message, &response_id) {
+    let known_tool_names: std::collections::HashSet<String> =
+        tool_context.chat_name_to_spec.keys().cloned().collect();
+    let pseudo_tool_call = chat_pseudo_tool_call_text(message, &known_tool_names)
+        .and_then(|text| pseudo_tool_call_text_to_response_item(&text, 0));
+    if let Some(message_item) = chat_message_to_response_output_item(message, &response_id)
+        .filter(|_| pseudo_tool_call.is_none())
+    {
         output.push(message_item);
+    }
+    if let Some(tool_call) = pseudo_tool_call {
+        output.push(tool_call);
     }
     output.extend(chat_tool_calls_to_response_output_items(
         message,
@@ -1275,17 +1293,62 @@ pub(crate) fn chat_completion_to_response_with_context(
         "id": response_id,
         "object": "response",
         "created_at": created_at,
-        "status": response_status_from_finish_reason(finish_reason),
+        "status": response_status_from_finish_reason(Some(finish_reason)),
         "model": model,
         "output": output,
         "usage": chat_usage_to_responses_usage(body.get("usage"))
     });
 
-    if finish_reason == Some("length") {
+    if finish_reason == "length" {
         response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
     }
 
     Ok(response)
+}
+
+fn chat_pseudo_tool_call_text(
+    message: &Value,
+    known_tool_names: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if known_tool_names.is_empty() {
+        return None;
+    }
+
+    let text = message.get("content")?.as_str()?.trim();
+    let (name, _arguments) = text.split_once('\n')?;
+    let name = name.trim();
+    if !is_likely_tool_name(name) || !known_tool_names.contains(name) {
+        return None;
+    }
+
+    Some(text.to_string())
+}
+
+fn pseudo_tool_call_text_to_response_item(text: &str, index: usize) -> Option<Value> {
+    let (name, arguments) = text.split_once('\n')?;
+    let name = name.trim();
+    if !is_likely_tool_name(name) {
+        return None;
+    }
+
+    let call_id = format!("call_pseudo_{index}");
+    let item_id = format!("fc_pseudo_{index}");
+    Some(response_function_call_item(
+        &item_id,
+        "completed",
+        &call_id,
+        name,
+        &canonicalize_json_string_if_parseable(arguments.trim()),
+        None,
+    ))
+}
+
+pub(crate) fn is_likely_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
 fn chat_reasoning_to_response_output_item(
@@ -1942,6 +2005,7 @@ mod tests {
                 "strict": true
             }],
             "tool_choice": {"type": "function", "name": "get_weather"},
+            "parallel_tool_calls": false,
             "max_output_tokens": 100,
             "reasoning": {"effort": "high"},
             "stream": true
@@ -1961,8 +2025,44 @@ mod tests {
         assert_eq!(result["tools"][0]["function"]["name"], "get_weather");
         assert_eq!(result["tools"][0]["function"]["strict"], true);
         assert_eq!(result["tool_choice"]["function"]["name"], "get_weather");
+        assert_eq!(result["parallel_tool_calls"], false);
         assert_eq!(result["max_tokens"], 100);
-        assert_eq!(result["reasoning_effort"], "high");
+        assert!(result.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn responses_request_to_chat_drops_tool_choice_without_tools() {
+        let input = json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "tool_choice": "auto",
+            "parallel_tool_calls": true
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+
+        assert!(result.get("tools").is_none());
+        assert!(result.get("tool_choice").is_none());
+        assert!(result.get("parallel_tool_calls").is_none());
+    }
+
+    #[test]
+    fn responses_request_to_chat_drops_tool_options_when_tools_filter_empty() {
+        let input = json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "tools": [{
+                "type": "web_search_preview"
+            }],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+
+        assert!(result.get("tools").is_none());
+        assert!(result.get("tool_choice").is_none());
+        assert!(result.get("parallel_tool_calls").is_none());
     }
 
     #[test]
@@ -2180,6 +2280,31 @@ mod tests {
         // none 不是 OpenAI 顶层 reasoning_effort 的合法枚举，不写顶层别名；也不写 thinking。
         assert!(result.get("reasoning_effort").is_none());
         assert!(result.get("thinking").is_none());
+    }
+
+    #[test]
+    fn responses_request_to_chat_drops_default_reasoning_effort_for_gpt_with_tools() {
+        let input = json!({
+            "model": "gpt-5.5",
+            "input": "hello",
+            "reasoning": {"effort": "high"},
+            "tools": [{
+                "type": "function",
+                "name": "Bash",
+                "description": "Run a shell command",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "cmd": {"type": "string"}
+                    }
+                }
+            }]
+        });
+
+        let result = responses_to_chat_completions(input).unwrap();
+
+        assert!(result.get("tools").is_some());
+        assert!(result.get("reasoning_effort").is_none());
     }
 
     #[test]
@@ -2984,6 +3109,24 @@ mod tests {
 
         assert_eq!(result["status"], "incomplete");
         assert_eq!(result["incomplete_details"]["reason"], "max_output_tokens");
+    }
+
+    #[test]
+    fn chat_response_missing_finish_reason_returns_transform_error() {
+        let input = json!({
+            "id": "chatcmpl_missing_finish",
+            "model": "gpt-5.5",
+            "choices": [{
+                "message": {"role": "assistant", "content": "I will continue."}
+            }]
+        });
+
+        let error = chat_completion_to_response(input).unwrap_err();
+
+        assert!(matches!(error, ProxyError::TransformError(_)));
+        assert!(error
+            .to_string()
+            .contains("Chat response choice missing finish_reason"));
     }
 
     #[test]

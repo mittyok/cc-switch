@@ -150,6 +150,11 @@ const codexApiFormatFromWireApi = (
   }
 };
 
+const codexWireApiFromApiFormat = (
+  apiFormat: CodexApiFormat,
+): "responses" | "chat" =>
+  apiFormat === "openai_chat" ? "chat" : "responses";
+
 export const normalizeCodexCatalogModelsForSave = (
   models: CodexCatalogModel[],
 ): CodexCatalogModel[] => {
@@ -613,9 +618,8 @@ function ProviderFormFull({
   const handleCodexApiFormatChange = useCallback(
     (format: CodexApiFormat) => {
       setLocalCodexApiFormat(format);
-      // wire_api is always "responses" for Codex; format controls proxy-layer conversion
       setCodexConfig((prev) => {
-        const updated = setCodexWireApi(prev, "responses");
+        const updated = setCodexWireApi(prev, codexWireApiFromApiFormat(format));
         debouncedValidate(updated);
         return updated;
       });
@@ -1271,7 +1275,10 @@ function ProviderFormFull({
         const authJson = JSON.parse(codexAuth);
         let normalizedCodexConfig =
           category !== "official" && (codexConfig ?? "").trim()
-            ? setCodexWireApi(codexConfig ?? "", "responses")
+            ? setCodexWireApi(
+                codexConfig ?? "",
+                codexWireApiFromApiFormat(localCodexApiFormat),
+              )
             : (codexConfig ?? "");
         // 模型映射与「路由接管」解耦：对所有非官方供应商，填了就持久化
         //（Chat 生成兼容路由、原生 Responses 生成 model-catalogs.json），

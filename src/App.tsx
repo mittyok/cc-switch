@@ -25,6 +25,7 @@ import {
   Shield,
   Cpu,
   LayoutDashboard,
+  Box,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { Provider, VisibleApps } from "@/types";
@@ -82,6 +83,7 @@ import { DeepLinkImportDialog } from "@/components/DeepLinkImportDialog";
 import { FirstRunNoticeDialog } from "@/components/FirstRunNoticeDialog";
 import { AgentsPanel } from "@/components/agents/AgentsPanel";
 import { UniversalProviderPanel } from "@/components/universal";
+import { EmbeddingProviderPanel } from "@/components/embedding/EmbeddingProviderPanel";
 import { McpIcon } from "@/components/BrandIcons";
 import { Button } from "@/components/ui/button";
 import { SessionManagerPage } from "@/components/sessions/SessionManagerPage";
@@ -103,6 +105,7 @@ type View =
   | "skills"
   | "skillsDiscovery"
   | "mcp"
+  | "embedding"
   | "agents"
   | "universal"
   | "sessions"
@@ -936,6 +939,12 @@ function App() {
               onOpenChange={() => setCurrentView("providers")}
             />
           );
+        case "embedding":
+          return (
+            <div className="px-6 pt-4">
+              <EmbeddingProviderPanel />
+            </div>
+          );
         case "agents":
           return (
             <AgentsPanel onOpenChange={() => setCurrentView("providers")} />
@@ -1548,6 +1557,15 @@ function App() {
                                 title={t("mcp.title")}
                               >
                                 <McpIcon size={16} />
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => setCurrentView("embedding")}
+                                className="text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5 w-8 px-2"
+                                title={t("embedding.title")}
+                              >
+                                <Box className="w-4 h-4" />
                               </Button>
                             </>
                           )}

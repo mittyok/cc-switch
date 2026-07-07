@@ -5,6 +5,8 @@ export { backupsApi } from "./settings";
 export { mcpApi } from "./mcp";
 export { profilesApi } from "./profiles";
 export { promptsApi } from "./prompts";
+export { embeddingApi } from "./embedding";
+export type { EmbeddingConfig, EmbeddingProvider } from "./embedding";
 export { skillsApi } from "./skills";
 export { usageApi } from "./usage";
 export { subscriptionApi } from "./subscription";

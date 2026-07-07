@@ -77,6 +77,7 @@ struct ChatToResponsesState {
     output_items: Vec<(u32, Value)>,
     latest_usage: Option<Value>,
     finish_reason: Option<String>,
+    saw_tool_calls: bool,
     tool_context: CodexToolContext,
 }
 
@@ -96,6 +97,7 @@ impl Default for ChatToResponsesState {
             output_items: Vec::new(),
             latest_usage: None,
             finish_reason: None,
+            saw_tool_calls: false,
             tool_context: CodexToolContext::default(),
         }
     }
@@ -151,9 +153,21 @@ impl ChatToResponsesState {
             }
 
             if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                if !tool_calls.is_empty() {
+                    self.saw_tool_calls = true;
+                    if self.text.added && !self.text.done {
+                        log::info!(
+                            "[CodexChatSSE] finalizing_text_before_tool_call response_id={}, tool_delta_count={}, text_chars={}",
+                            self.response_id,
+                            tool_calls.len(),
+                            self.text.text.chars().count()
+                        );
+                    }
+                }
                 events.extend(self.flush_inline_think_at_boundary());
                 let reasoning_for_tool_call = self.current_reasoning_text();
                 events.extend(self.finalize_reasoning());
+                events.extend(self.finalize_text());
                 for tool_call in tool_calls {
                     events.extend(
                         self.push_tool_call_delta(tool_call, reasoning_for_tool_call.as_deref()),
@@ -164,12 +178,28 @@ impl ChatToResponsesState {
 
         if let Some(finish_reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
             self.finish_reason = Some(finish_reason.to_string());
+            log::info!(
+                "[CodexChatSSE] finish_reason={finish_reason}, response_id={}, model={}, saw_tool_calls={}, tool_count={}, text_chars={}, reasoning_chars={}",
+                self.response_id,
+                self.model,
+                self.saw_tool_calls,
+                self.tools.len(),
+                self.text.text.chars().count(),
+                self.reasoning.text.chars().count()
+            );
         }
 
         events
     }
 
     fn push_content_delta(&mut self, delta: &str) -> Vec<Bytes> {
+        if matches!(self.inline_think.mode, InlineThinkMode::Detecting)
+            && self.inline_think.buffer.trim().is_empty()
+            && delta.trim().is_empty()
+        {
+            return Vec::new();
+        }
+
         match self.inline_think.mode {
             InlineThinkMode::Text => {
                 let mut events = self.finalize_reasoning();
@@ -567,6 +597,17 @@ impl ChatToResponsesState {
             response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
         }
 
+        log::info!(
+            "[CodexChatSSE] finalize response_id={}, status={status}, finish_reason={}, saw_tool_calls={}, tool_count={}, output_items={}, text_done={}, reasoning_done={}",
+            self.response_id,
+            self.finish_reason.as_deref().unwrap_or("<none>"),
+            self.saw_tool_calls,
+            self.tools.len(),
+            self.output_items.len(),
+            self.text.done,
+            self.reasoning.done
+        );
+
         events.push(sse_event(
             "response.completed",
             json!({
@@ -576,6 +617,52 @@ impl ChatToResponsesState {
         ));
         self.completed = true;
         events
+    }
+
+    fn finalize_missing_finish_reason(&mut self) -> Vec<Bytes> {
+        if self.completed {
+            return Vec::new();
+        }
+
+        let mut events = self.ensure_response_started();
+        events.extend(self.flush_inline_think_at_boundary());
+        events.extend(self.finalize_reasoning());
+        events.extend(self.finalize_text());
+        events.extend(self.finalize_tools());
+
+        log::warn!(
+            "[CodexChatSSE] missing_finish_reason response_id={}, saw_tool_calls={}, tool_count={}, output_items={}, text_done={}, reasoning_done={}",
+            self.response_id,
+            self.saw_tool_calls,
+            self.tools.len(),
+            self.output_items.len(),
+            self.text.done,
+            self.reasoning.done
+        );
+
+        let mut response = self.base_response("failed", self.completed_output_items());
+        response["error"] = json!({
+            "message": "Upstream stream ended without a finish_reason",
+            "type": "upstream_incomplete_stream"
+        });
+
+        events.push(sse_event(
+            "response.failed",
+            json!({
+                "type": "response.failed",
+                "response": response
+            }),
+        ));
+        self.completed = true;
+        events
+    }
+
+    fn finalize_terminal(&mut self) -> Vec<Bytes> {
+        if self.finish_reason.is_none() {
+            self.finalize_missing_finish_reason()
+        } else {
+            self.finalize()
+        }
     }
 
     fn finalize_reasoning(&mut self) -> Vec<Bytes> {
@@ -909,8 +996,7 @@ pub fn create_responses_sse_stream_from_chat<E: std::error::Error + Send + 'stat
     create_responses_sse_stream_from_chat_with_context(stream, CodexToolContext::default())
 }
 
-/// Create a stream that converts Chat Completions SSE chunks into Responses SSE
-/// events while restoring Codex tool namespace/custom/tool_search metadata.
+/// Create a stream that converts Chat Completions SSE chunks into Responses SSE events while restoring Codex tool namespace/custom/tool_search metadata.
 pub fn create_responses_sse_stream_from_chat_with_context<E: std::error::Error + Send + 'static>(
     stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static,
     tool_context: CodexToolContext,
@@ -950,7 +1036,14 @@ pub fn create_responses_sse_stream_from_chat_with_context<E: std::error::Error +
 
                         let data = data_parts.join("\n");
                         if data.trim() == "[DONE]" {
-                            for event in state.finalize() {
+                            log::info!(
+                                "[CodexChatSSE] upstream_done response_id={}, finish_reason={}, saw_tool_calls={}, tool_count={}",
+                                state.response_id,
+                                state.finish_reason.as_deref().unwrap_or("<none>"),
+                                state.saw_tool_calls,
+                                state.tools.len()
+                            );
+                            for event in state.finalize_terminal() {
                                 yield Ok(event);
                             }
                             continue;
@@ -1115,6 +1208,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ignores_leading_whitespace_only_chat_content_before_answer() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_spaces\",\"created\":123,\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"      \"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_spaces\",\"created\":123,\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"\\n\\n\\t\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_spaces\",\"created\":123,\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"Actual answer\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert!(output.contains("\"text\":\"Actual answer\""));
+        assert!(!output.contains("\"text\":\"      "));
+        assert!(!output.contains("\\n\\n\\tActual answer"));
+        assert!(output.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
     async fn converts_tool_call_chat_sse_to_responses_sse() {
         let output = collect(vec![
             "data: {\"id\":\"chatcmpl_2\",\"model\":\"gpt-5.4\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\"}}]}}]}\n\n",
@@ -1127,6 +1236,75 @@ mod tests {
         assert!(output.contains("event: response.function_call_arguments.done"));
         assert!(output.contains("\"type\":\"function_call\""));
         assert!(output.contains("\"call_id\":\"call_1\""));
+    }
+
+    #[tokio::test]
+    async fn tool_like_text_is_not_converted_to_function_call() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_text_tool_like\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"tool: exec_command {\\\"cmd\\\":\\\"pwd\\\"}\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert!(output.contains("event: response.output_text.delta"));
+        assert!(output.contains("tool: exec_command"));
+        assert!(!output.contains("event: response.function_call_arguments.delta"));
+        assert!(!output.contains("event: response.function_call_arguments.done"));
+        assert!(!output.contains("\"type\":\"function_call\""));
+        assert!(output.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn finalizes_text_item_before_tool_call_item() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_text_tool\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"I will inspect the files.\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_text_tool\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"exec_command\",\"arguments\":\"{\\\"cmd\\\":\\\"ls\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        let text_done_pos = output
+            .find("event: response.output_text.done")
+            .expect("text should be finalized");
+        let message_done_pos = output[text_done_pos..]
+            .find("event: response.output_item.done")
+            .map(|offset| text_done_pos + offset)
+            .expect("message output item should be finalized");
+        let tool_added_pos = output
+            .find("\"type\":\"function_call\"")
+            .expect("tool call item should be added");
+
+        assert!(message_done_pos < tool_added_pos);
+        assert!(output.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn tool_call_turn_completes_after_all_output_items_are_done() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_order\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"Checking.\"}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_order\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"exec_command\"}}]}}]}\n\n",
+            "data: {\"id\":\"chatcmpl_order\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"cmd\\\":\\\"pwd\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        let first_done_pos = output
+            .find("event: response.output_item.done")
+            .expect("message item should be done");
+        let function_done_pos = output[first_done_pos + 1..]
+            .find("event: response.output_item.done")
+            .map(|offset| first_done_pos + 1 + offset)
+            .expect("function item should be done");
+        let completed_pos = output
+            .find("event: response.completed")
+            .expect("response should complete");
+
+        assert!(first_done_pos < function_done_pos);
+        assert!(function_done_pos < completed_pos);
+        assert!(output.contains(r#""type":"message""#));
+        assert!(output.contains(r#""type":"function_call""#));
+        assert!(output.contains(r#""arguments""#));
+        assert!(output.contains("pwd"));
     }
 
     #[tokio::test]
@@ -1328,5 +1506,33 @@ mod tests {
         assert!(output.contains("quota exceeded"));
         assert!(output.contains("rate_limit_exceeded"));
         assert!(!output.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn done_without_finish_reason_emits_failed_without_completed() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_no_finish\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"I will continue.\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        ])
+        .await;
+
+        assert!(output.contains("event: response.output_text.delta"));
+        assert!(output.contains("event: response.output_item.done"));
+        assert!(output.contains("event: response.failed"));
+        assert!(output.contains("upstream_incomplete_stream"));
+        assert!(!output.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn eof_with_output_without_finish_reason_emits_incomplete_without_failed() {
+        let output = collect(vec![
+            "data: {\"id\":\"chatcmpl_eof_no_finish\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{\"content\":\"Still working.\"}}]}\n\n",
+        ])
+        .await;
+
+        assert!(output.contains("event: response.completed"));
+        assert!(output.contains("\"status\":\"incomplete\""));
+        assert!(output.contains("\"incomplete_details\":{\"reason\":\"max_output_tokens\"}"));
+        assert!(!output.contains("event: response.failed"));
     }
 }

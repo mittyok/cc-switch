@@ -37,7 +37,7 @@ mod tray;
 mod usage_events;
 mod usage_script;
 
-pub use app_config::{AppType, InstalledSkill, McpApps, McpServer, MultiAppConfig, SkillApps};
+pub use app_config::{AppType, EmbeddingConfig, EmbeddingProvider, InstalledSkill, McpApps, McpServer, MultiAppConfig, SkillApps};
 pub use codex_config::{get_codex_auth_path, get_codex_config_path, write_codex_live_atomic};
 pub use commands::open_provider_terminal;
 pub use commands::*;
@@ -1506,6 +1506,11 @@ pub fn run() {
             commands::enter_lightweight_mode,
             commands::exit_lightweight_mode,
             commands::is_lightweight_mode,
+            // Embedding Provider management
+            commands::get_embedding_providers,
+            commands::upsert_embedding_provider,
+            commands::delete_embedding_provider,
+            commands::set_current_embedding_provider,
         ]);
 
     let app = builder
