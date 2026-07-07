@@ -793,7 +793,13 @@ fn convert_input_to_messages(items: &[Value]) -> Result<Vec<Value>, ProxyError> 
 
             "message" | "" => {
                 // Regular message item
-                let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                let raw_role = item.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                // Anthropic API only accepts "user" or "assistant".
+                // OpenAI's "developer" / "system" roles map to "user".
+                let role = match raw_role {
+                    "user" | "assistant" => raw_role,
+                    _ => "user",
+                };
                 if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
                     for block in content {
                         let block_type =
@@ -2281,5 +2287,56 @@ mod tests {
         });
         let result2 = responses_request_to_anthropic(input2).unwrap();
         assert_eq!(result2["tool_choice"]["type"], "auto");
+    }
+
+    #[test]
+    fn test_responses_to_anthropic_developer_role_mapped_to_user() {
+        let input = json!({
+            "model": "gpt-4o",
+            "max_output_tokens": 1024,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "You are a coding assistant"}]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Hello"}]
+                }
+            ]
+        });
+        let result = responses_request_to_anthropic(input).unwrap();
+
+        // "developer" must become "user" — Anthropic only accepts user/assistant
+        assert_eq!(result["messages"][0]["role"], "user");
+        assert_eq!(result["messages"][0]["content"][0]["text"], "You are a coding assistant");
+        // consecutive user messages should be merged
+        assert_eq!(result["messages"][0]["content"][1]["text"], "Hello");
+    }
+
+    #[test]
+    fn test_responses_to_anthropic_system_role_mapped_to_user() {
+        let input = json!({
+            "model": "gpt-4o",
+            "max_output_tokens": 1024,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": "System prompt"}]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Hello"}]
+                }
+            ]
+        });
+        let result = responses_request_to_anthropic(input).unwrap();
+
+        assert_eq!(result["messages"][0]["role"], "user");
+        assert_eq!(result["messages"][0]["content"][0]["text"], "System prompt");
     }
 }
