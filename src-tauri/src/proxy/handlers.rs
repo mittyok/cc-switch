@@ -895,18 +895,21 @@ async fn handle_responses_via_claude_pipeline(
         .unwrap_or(false);
 
     // 1. Convert Responses request to Anthropic Messages request
-    let anthropic_body = transform_responses::responses_request_to_anthropic(responses_body)
+    let anthropic_body = transform_responses::responses_request_to_anthropic(responses_body.clone())
         .map_err(|e| {
             log::error!("[Codex→Claude] Request conversion failed: {e}");
             e
         })?;
 
-    log::debug!(
-        "[Codex→Claude] Converted Responses request to Anthropic Messages format, model: {}",
-        anthropic_body
-            .get("model")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown")
+    log::info!(
+        "[Codex→Claude] Converted: original_model={}, anthropic_model={}, max_tokens={}, messages_count={}, has_system={}, has_tools={}, has_thinking={}",
+        responses_body.get("model").and_then(|m| m.as_str()).unwrap_or("(none)"),
+        anthropic_body.get("model").and_then(|m| m.as_str()).unwrap_or("(none)"),
+        anthropic_body.get("max_tokens").map(|v| v.to_string()).unwrap_or("MISSING".to_string()),
+        anthropic_body.get("messages").and_then(|m| m.as_array()).map(|a| a.len()).unwrap_or(0),
+        anthropic_body.get("system").is_some(),
+        anthropic_body.get("tools").is_some(),
+        anthropic_body.get("thinking").is_some(),
     );
 
     // 2. Create context with Claude pipeline (selects Claude providers with failover)
@@ -945,6 +948,10 @@ async fn handle_responses_via_claude_pipeline(
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
+            log::error!(
+                "[Codex→Claude] Upstream error: {:?}",
+                &err.error
+            );
             log_forward_error(&state, &ctx, is_stream, &err.error);
             return build_codex_proxy_error_response(&ctx, "/responses", &err.error);
         }
