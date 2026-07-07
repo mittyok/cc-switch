@@ -386,6 +386,11 @@ pub struct AppSettings {
     /// a failed migration retries at startup; cleared when the toggle turns off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unify_codex_migrate_existing: Option<bool>,
+    /// Route Codex /v1/responses traffic through Claude's provider pipeline
+    /// (failover queue, circuit breaker, format transforms) instead of using
+    /// Codex-specific providers.
+    #[serde(default)]
+    pub codex_use_claude_pipeline: bool,
     /// User has confirmed the failover toggle first-run notice
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failover_confirmed: Option<bool>,
@@ -506,6 +511,7 @@ impl Default for AppSettings {
             preserve_codex_official_auth_on_switch: false,
             unify_codex_session_history: false,
             unify_codex_migrate_existing: None,
+            codex_use_claude_pipeline: false,
             failover_confirmed: None,
             first_run_notice_confirmed: None,
             common_config_confirmed: None,
@@ -918,6 +924,13 @@ pub fn unify_codex_session_history() -> bool {
             e.into_inner()
         })
         .unify_codex_session_history
+}
+
+pub fn codex_uses_claude_pipeline() -> bool {
+    settings_store()
+        .read()
+        .map(|s| s.codex_use_claude_pipeline)
+        .unwrap_or(false)
 }
 
 // ===== 当前供应商管理函数 =====

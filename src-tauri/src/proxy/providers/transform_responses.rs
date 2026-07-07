@@ -623,6 +623,404 @@ pub fn responses_to_anthropic(body: Value) -> Result<Value, ProxyError> {
     Ok(result)
 }
 
+// ---------------------------------------------------------------------------
+// Reverse direction: Responses API → Anthropic Messages
+// Used when the "codex_use_claude_pipeline" toggle routes Codex traffic
+// through Claude's provider pipeline.
+// ---------------------------------------------------------------------------
+
+/// Responses API REQUEST → Anthropic Messages REQUEST
+///
+/// Inverse of [`anthropic_to_responses`]. Converts an incoming Codex
+/// Responses-format request body into Anthropic Messages format so it can be
+/// forwarded through the Claude provider pipeline.
+pub fn responses_request_to_anthropic(body: Value) -> Result<Value, ProxyError> {
+    let mut result = json!({});
+
+    if let Some(model) = body.get("model").and_then(|m| m.as_str()) {
+        result["model"] = json!(model);
+    }
+
+    // instructions → system
+    if let Some(instructions) = body.get("instructions").and_then(|i| i.as_str()) {
+        if !instructions.is_empty() {
+            result["system"] = json!(instructions);
+        }
+    }
+
+    // input → messages
+    if let Some(input) = body.get("input") {
+        let messages = match input {
+            Value::String(text) => {
+                vec![json!({"role": "user", "content": text})]
+            }
+            Value::Array(items) => convert_input_to_messages(items)?,
+            _ => Vec::new(),
+        };
+        if !messages.is_empty() {
+            result["messages"] = json!(messages);
+        }
+    }
+
+    // max_output_tokens → max_tokens
+    if let Some(v) = body.get("max_output_tokens") {
+        result["max_tokens"] = v.clone();
+    }
+
+    for key in ["temperature", "top_p", "stream"] {
+        if let Some(v) = body.get(key) {
+            result[key] = v.clone();
+        }
+    }
+
+    // reasoning.effort → thinking
+    if let Some(effort) = body.pointer("/reasoning/effort").and_then(|e| e.as_str()) {
+        let budget = match effort {
+            "low" => 1024,
+            "medium" => 10240,
+            _ => 32768, // high or any other value
+        };
+        result["thinking"] = json!({
+            "type": "enabled",
+            "budget_tokens": budget
+        });
+    }
+
+    // tools (function format → Anthropic format)
+    if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
+        let anthropic_tools: Vec<Value> = tools
+            .iter()
+            .filter(|t| {
+                t.get("type").and_then(|v| v.as_str()) == Some("function")
+                    || t.get("type").is_none()
+            })
+            .map(|t| {
+                json!({
+                    "name": t.get("name").and_then(|n| n.as_str()).unwrap_or(""),
+                    "description": t.get("description").cloned().unwrap_or(json!("")),
+                    "input_schema": t.get("parameters").cloned()
+                        .or_else(|| t.get("input_schema").cloned())
+                        .unwrap_or(json!({"type": "object"}))
+                })
+            })
+            .collect();
+
+        if !anthropic_tools.is_empty() {
+            result["tools"] = json!(anthropic_tools);
+        }
+    }
+
+    // tool_choice (reverse of map_tool_choice_to_responses)
+    if let Some(v) = body.get("tool_choice") {
+        result["tool_choice"] = map_tool_choice_to_anthropic(v);
+    }
+
+    Ok(result)
+}
+
+fn map_tool_choice_to_anthropic(tool_choice: &Value) -> Value {
+    match tool_choice {
+        Value::String(s) => match s.as_str() {
+            "required" => json!({"type": "any"}),
+            "auto" => json!({"type": "auto"}),
+            "none" => json!({"type": "none"}),
+            _ => tool_choice.clone(),
+        },
+        Value::Object(obj) => {
+            if obj.get("type").and_then(|t| t.as_str()) == Some("function") {
+                let name = obj.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                json!({"type": "tool", "name": name})
+            } else {
+                tool_choice.clone()
+            }
+        }
+        _ => tool_choice.clone(),
+    }
+}
+
+/// Convert Responses API `input` array to Anthropic `messages` array.
+///
+/// Inverse of [`convert_messages_to_input`]. The key difference is that
+/// Responses API "lifts" tool_use/tool_result to top-level items, while
+/// Anthropic nests them as content blocks inside messages. This function
+/// groups consecutive items by role and merges tool blocks accordingly.
+fn convert_input_to_messages(items: &[Value]) -> Result<Vec<Value>, ProxyError> {
+    let mut messages: Vec<Value> = Vec::new();
+
+    for item in items {
+        let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        match item_type {
+            "function_call" => {
+                let call_id = item.get("call_id").and_then(|i| i.as_str()).unwrap_or("");
+                let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let args_str = item
+                    .get("arguments")
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("{}");
+                let input: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
+
+                let block = json!({
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": name,
+                    "input": input
+                });
+                append_content_to_role(&mut messages, "assistant", block);
+            }
+
+            "function_call_output" => {
+                let call_id = item.get("call_id").and_then(|i| i.as_str()).unwrap_or("");
+                let output = item
+                    .get("output")
+                    .and_then(|o| o.as_str())
+                    .unwrap_or("");
+
+                let block = json!({
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": output
+                });
+                append_content_to_role(&mut messages, "user", block);
+            }
+
+            "message" | "" => {
+                // Regular message item
+                let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
+                    for block in content {
+                        let block_type =
+                            block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        match block_type {
+                            "input_text" => {
+                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                    let b = json!({"type": "text", "text": text});
+                                    append_content_to_role(&mut messages, role, b);
+                                }
+                            }
+                            "output_text" => {
+                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                    let b = json!({"type": "text", "text": text});
+                                    append_content_to_role(&mut messages, role, b);
+                                }
+                            }
+                            "input_image" => {
+                                let image_url = block
+                                    .get("image_url")
+                                    .and_then(|u| u.as_str())
+                                    .unwrap_or("");
+                                if let Some((media_type, data)) = parse_data_url(image_url) {
+                                    let b = json!({
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": media_type,
+                                            "data": data
+                                        }
+                                    });
+                                    append_content_to_role(&mut messages, role, b);
+                                }
+                            }
+                            _ => {
+                                // Pass through unknown content types as text if possible
+                                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                                    let b = json!({"type": "text", "text": text});
+                                    append_content_to_role(&mut messages, role, b);
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(text) = item.get("content").and_then(|c| c.as_str()) {
+                    // String content shorthand
+                    let b = json!({"type": "text", "text": text});
+                    append_content_to_role(&mut messages, role, b);
+                }
+            }
+
+            _ => {
+                log::debug!(
+                    "[Responses→Anthropic] Skipping unknown input item type: {}",
+                    item_type
+                );
+            }
+        }
+    }
+
+    Ok(messages)
+}
+
+/// Append a content block to the last message with the given role,
+/// or create a new message if the last message has a different role.
+fn append_content_to_role(messages: &mut Vec<Value>, role: &str, block: Value) {
+    let should_append = messages
+        .last()
+        .and_then(|m| m.get("role").and_then(|r| r.as_str()))
+        == Some(role);
+
+    if should_append {
+        if let Some(last) = messages.last_mut() {
+            if let Some(content) = last.get_mut("content").and_then(|c| c.as_array_mut()) {
+                content.push(block);
+                return;
+            }
+        }
+    }
+
+    messages.push(json!({
+        "role": role,
+        "content": [block]
+    }));
+}
+
+/// Parse a data URL like "data:image/png;base64,..." into (media_type, data).
+fn parse_data_url(url: &str) -> Option<(&str, &str)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    let media_type = meta.strip_suffix(";base64").unwrap_or(meta);
+    Some((media_type, data))
+}
+
+/// Anthropic Messages RESPONSE → Responses API RESPONSE
+///
+/// Inverse of [`responses_to_anthropic`]. Converts an Anthropic Messages
+/// response back to Responses API format for return to the Codex CLI.
+pub fn anthropic_response_to_responses(body: Value) -> Result<Value, ProxyError> {
+    let content = body
+        .get("content")
+        .and_then(|c| c.as_array())
+        .ok_or_else(|| ProxyError::TransformError("No content in Anthropic response".to_string()))?;
+
+    let mut output: Vec<Value> = Vec::new();
+    let mut message_content: Vec<Value> = Vec::new();
+
+    for block in content {
+        let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        match block_type {
+            "text" => {
+                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                    message_content.push(json!({
+                        "type": "output_text",
+                        "text": text
+                    }));
+                }
+            }
+
+            "tool_use" => {
+                // Flush accumulated text into a message item first
+                if !message_content.is_empty() {
+                    output.push(json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": message_content.clone()
+                    }));
+                    message_content.clear();
+                }
+
+                let id = block.get("id").and_then(|i| i.as_str()).unwrap_or("");
+                let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let input = block.get("input").cloned().unwrap_or(json!({}));
+
+                output.push(json!({
+                    "type": "function_call",
+                    "call_id": id,
+                    "name": name,
+                    "arguments": canonical_json_string(&input),
+                    "status": "completed"
+                }));
+            }
+
+            "thinking" => {
+                let thinking_text = block
+                    .get("thinking")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("");
+                if !thinking_text.is_empty() {
+                    output.push(json!({
+                        "type": "reasoning",
+                        "summary": [{
+                            "type": "summary_text",
+                            "text": thinking_text
+                        }]
+                    }));
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    // Flush remaining text content
+    if !message_content.is_empty() {
+        output.push(json!({
+            "type": "message",
+            "role": "assistant",
+            "content": message_content
+        }));
+    }
+
+    // stop_reason → status (reverse of map_responses_stop_reason)
+    let stop_reason = body
+        .get("stop_reason")
+        .and_then(|s| s.as_str())
+        .unwrap_or("end_turn");
+    let (status, incomplete_details) = match stop_reason {
+        "max_tokens" => (
+            "incomplete",
+            Some(json!({"reason": "max_output_tokens"})),
+        ),
+        _ => ("completed", None),
+    };
+
+    // Build usage (Anthropic → Responses field names)
+    let usage = if let Some(u) = body.get("usage") {
+        let input_tokens = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let output_tokens = u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let cache_read = u
+            .get("cache_read_input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let cache_creation = u
+            .get("cache_creation_input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        // Anthropic input_tokens excludes cache; Responses input_tokens includes it
+        let total_input = input_tokens + cache_read + cache_creation;
+        let mut usage_obj = json!({
+            "input_tokens": total_input,
+            "output_tokens": output_tokens,
+            "total_tokens": total_input + output_tokens
+        });
+        if cache_read > 0 {
+            usage_obj["input_tokens_details"] = json!({"cached_tokens": cache_read});
+        }
+        usage_obj
+    } else {
+        json!({"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+    };
+
+    let resp_id = body
+        .get("id")
+        .and_then(|i| i.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("resp_{}", uuid::Uuid::new_v4().simple()));
+
+    let mut result = json!({
+        "id": resp_id,
+        "object": "response",
+        "status": status,
+        "output": output,
+        "model": body.get("model").and_then(|m| m.as_str()).unwrap_or(""),
+        "usage": usage
+    });
+
+    if let Some(details) = incomplete_details {
+        result["incomplete_details"] = details;
+    }
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

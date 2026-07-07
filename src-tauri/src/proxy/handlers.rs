@@ -20,6 +20,7 @@ use super::{
         codex_chat_common::extract_reasoning_field_text,
         codex_chat_history::record_responses_sse_stream, get_adapter, get_claude_api_format,
         streaming::create_anthropic_sse_stream,
+        streaming_anthropic_to_responses::create_responses_sse_stream_from_anthropic,
         streaming_codex_chat::create_responses_sse_stream_from_chat_with_context,
         streaming_gemini::create_anthropic_sse_stream_from_gemini,
         streaming_responses::create_anthropic_sse_stream_from_responses, transform,
@@ -724,6 +725,13 @@ pub async fn handle_responses(
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
+    // When the "use Claude pipeline" toggle is on, route Codex traffic
+    // through Claude's entire provider pipeline (failover, circuit breaker, etc.)
+    if crate::settings::codex_uses_claude_pipeline() {
+        return handle_responses_via_claude_pipeline(state, body, headers, extensions, method, &uri)
+            .await;
+    }
+
     let mut ctx =
         RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
     let endpoint = endpoint_with_query(&uri, "/responses");
@@ -803,6 +811,11 @@ pub async fn handle_responses_compact(
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
+    if crate::settings::codex_uses_claude_pipeline() {
+        return handle_responses_via_claude_pipeline(state, body, headers, extensions, method, &uri)
+            .await;
+    }
+
     let mut ctx =
         RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
     let endpoint = endpoint_with_query(&uri, "/responses/compact");
@@ -861,6 +874,404 @@ pub async fn handle_responses_compact(
         connection_guard,
     )
     .await
+}
+
+/// Route Codex Responses traffic through Claude's full provider pipeline.
+///
+/// 1. Convert Responses request → Anthropic Messages request
+/// 2. Forward through Claude pipeline (provider selection, failover, circuit breaker)
+/// 3. Convert response back to Responses format
+async fn handle_responses_via_claude_pipeline(
+    state: ProxyState,
+    responses_body: Value,
+    headers: axum::http::HeaderMap,
+    extensions: http::Extensions,
+    method: http::Method,
+    uri: &axum::http::Uri,
+) -> Result<axum::response::Response, ProxyError> {
+    let is_stream = responses_body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // 1. Convert Responses request to Anthropic Messages request
+    let anthropic_body = transform_responses::responses_request_to_anthropic(responses_body)
+        .map_err(|e| {
+            log::error!("[Codex→Claude] Request conversion failed: {e}");
+            e
+        })?;
+
+    log::debug!(
+        "[Codex→Claude] Converted Responses request to Anthropic Messages format, model: {}",
+        anthropic_body
+            .get("model")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown")
+    );
+
+    // 2. Create context with Claude pipeline (selects Claude providers with failover)
+    let mut ctx = RequestContext::new(
+        &state,
+        &anthropic_body,
+        &headers,
+        AppType::Claude,
+        "Codex→Claude",
+        "claude",
+    )
+    .await
+    .map_err(|e| {
+        log::error!("[Codex→Claude] Failed to create Claude context: {e}");
+        e
+    })?;
+
+    let endpoint = endpoint_with_query(uri, "/v1/messages");
+
+    // 3. Forward through Claude pipeline
+    let forwarder = ctx.create_forwarder(&state);
+    let mut result = match forwarder
+        .forward_with_retry(
+            &AppType::Claude,
+            method,
+            &endpoint,
+            anthropic_body.clone(),
+            headers,
+            extensions,
+            ctx.get_providers(),
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(mut err) => {
+            if let Some(provider) = err.provider.take() {
+                ctx.provider = provider;
+            }
+            log_forward_error(&state, &ctx, is_stream, &err.error);
+            return build_codex_proxy_error_response(&ctx, "/responses", &err.error);
+        }
+    };
+
+    let connection_guard = result.connection_guard.take();
+    ctx.outbound_model = result.outbound_model.take();
+    ctx.provider = result.provider;
+    let api_format = result
+        .claude_api_format
+        .as_deref()
+        .unwrap_or_else(|| get_claude_api_format(&ctx.provider))
+        .to_string();
+    let response = result.response;
+
+    // Short-circuit: if the Claude provider uses openai_responses format,
+    // the upstream response is ALREADY in Responses format — passthrough directly
+    if api_format == "openai_responses" {
+        log::debug!("[Codex→Claude] Provider uses openai_responses, short-circuiting (passthrough)");
+        return process_response(
+            response,
+            &ctx,
+            &state,
+            &CODEX_PARSER_CONFIG,
+            connection_guard,
+        )
+        .await;
+    }
+
+    // 4. Convert response back to Responses format
+    let adapter = get_adapter(&AppType::Claude);
+    let needs_transform = adapter.needs_transform(&ctx.provider);
+
+    if needs_transform {
+        // Provider uses a non-Anthropic format (openai_chat, gemini_native).
+        // Claude's transform pipeline will convert to Anthropic first,
+        // then we convert to Responses.
+        return handle_claude_response_to_responses(
+            response,
+            &ctx,
+            &state,
+            &anthropic_body,
+            is_stream,
+            &api_format,
+            connection_guard,
+        )
+        .await;
+    }
+
+    // Provider is native Anthropic — response is already in Anthropic Messages format
+    convert_anthropic_response_to_responses(response, &ctx, &state, is_stream, connection_guard)
+        .await
+}
+
+/// Convert a native Anthropic response (streaming or not) to Responses format.
+async fn convert_anthropic_response_to_responses(
+    response: super::hyper_client::ProxyResponse,
+    ctx: &RequestContext,
+    _state: &ProxyState,
+    is_stream: bool,
+    connection_guard: Option<ActiveConnectionGuard>,
+) -> Result<axum::response::Response, ProxyError> {
+    let status = response.status();
+
+    if !status.is_success() {
+        return convert_anthropic_error_to_responses(response, ctx, status).await;
+    }
+
+    if is_stream || response.is_sse() {
+        let stream = response.bytes_stream();
+        let sse_stream = create_responses_sse_stream_from_anthropic(stream);
+
+        let timeout_config = ctx.streaming_timeout_config();
+        let logged_stream = create_logged_passthrough_stream(
+            sse_stream,
+            "Codex←Claude",
+            None, // Usage logging handled by Claude pipeline
+            timeout_config,
+            connection_guard,
+            super::response_processor::PassthroughSseFilter::None,
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "Content-Type",
+            axum::http::HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            "Cache-Control",
+            axum::http::HeaderValue::from_static("no-cache"),
+        );
+
+        let body = axum::body::Body::from_stream(logged_stream);
+        return Ok((headers, body).into_response());
+    }
+
+    // Non-streaming: read body and convert
+    let body_timeout =
+        if ctx.app_config.auto_failover_enabled && ctx.app_config.non_streaming_timeout > 0 {
+            std::time::Duration::from_secs(ctx.app_config.non_streaming_timeout as u64)
+        } else {
+            std::time::Duration::ZERO
+        };
+    let (mut response_headers, _status, body_bytes) =
+        read_decoded_body(response, ctx.tag, body_timeout).await?;
+
+    let anthropic_response: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
+        log::error!("[Codex←Claude] Failed to parse Anthropic response: {e}");
+        ProxyError::TransformError(format!("Failed to parse upstream response: {e}"))
+    })?;
+
+    let responses_body =
+        transform_responses::anthropic_response_to_responses(anthropic_response).map_err(|e| {
+            log::error!("[Codex←Claude] Response conversion failed: {e}");
+            e
+        })?;
+
+    strip_entity_headers_for_rebuilt_body(&mut response_headers);
+    strip_hop_by_hop_response_headers(&mut response_headers);
+    response_headers.remove(axum::http::header::CONTENT_TYPE);
+
+    let mut builder = axum::response::Response::builder().status(status);
+    for (key, value) in response_headers.iter() {
+        builder = builder.header(key, value);
+    }
+    builder = builder.header(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+
+    let body = serde_json::to_vec(&responses_body).map_err(|e| {
+        ProxyError::TransformError(format!("Failed to serialize Responses body: {e}"))
+    })?;
+
+    builder
+        .body(axum::body::Body::from(body))
+        .map_err(|e| ProxyError::Internal(format!("Failed to build response: {e}")))
+}
+
+/// Handle Claude provider with non-Anthropic format (openai_chat, gemini_native):
+/// use Claude's transform pipeline to convert to Anthropic, then to Responses.
+async fn handle_claude_response_to_responses(
+    response: super::hyper_client::ProxyResponse,
+    ctx: &RequestContext,
+    state: &ProxyState,
+    _original_body: &Value,
+    is_stream: bool,
+    api_format: &str,
+    connection_guard: Option<ActiveConnectionGuard>,
+) -> Result<axum::response::Response, ProxyError> {
+    let status = response.status();
+
+    if !status.is_success() {
+        return convert_anthropic_error_to_responses(response, ctx, status).await;
+    }
+
+    if is_stream || response.is_sse() {
+        let stream = response.bytes_stream();
+
+        // First convert upstream format → Anthropic SSE, then Anthropic SSE → Responses SSE
+        let anthropic_stream: Box<
+            dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin,
+        > = if api_format == "gemini_native" {
+            Box::new(Box::pin(create_anthropic_sse_stream_from_gemini(
+                stream,
+                Some(state.gemini_shadow.clone()),
+                Some(ctx.provider.id.clone()),
+                Some(ctx.session_id.clone()),
+                None,
+            )))
+        } else {
+            // openai_chat
+            Box::new(Box::pin(create_anthropic_sse_stream(stream)))
+        };
+
+        let responses_stream = create_responses_sse_stream_from_anthropic(anthropic_stream);
+
+        let timeout_config = ctx.streaming_timeout_config();
+        let logged_stream = create_logged_passthrough_stream(
+            responses_stream,
+            "Codex←Claude",
+            None,
+            timeout_config,
+            connection_guard,
+            super::response_processor::PassthroughSseFilter::None,
+        );
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "Content-Type",
+            axum::http::HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            "Cache-Control",
+            axum::http::HeaderValue::from_static("no-cache"),
+        );
+
+        let body = axum::body::Body::from_stream(logged_stream);
+        return Ok((headers, body).into_response());
+    }
+
+    // Non-streaming: let Claude's transform handle the format conversion to Anthropic,
+    // then convert Anthropic → Responses
+    let body_timeout =
+        if ctx.app_config.auto_failover_enabled && ctx.app_config.non_streaming_timeout > 0 {
+            std::time::Duration::from_secs(ctx.app_config.non_streaming_timeout as u64)
+        } else {
+            std::time::Duration::ZERO
+        };
+    let (mut response_headers, _status, body_bytes) =
+        read_decoded_body(response, ctx.tag, body_timeout).await?;
+
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    let upstream_response: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
+        log::error!("[Codex←Claude] Failed to parse upstream response: {e}, body: {body_str}");
+        ProxyError::TransformError(format!("Failed to parse upstream response: {e}"))
+    })?;
+
+    // Convert to Anthropic first
+    let anthropic_response = if api_format == "gemini_native" {
+        transform_gemini::gemini_to_anthropic_with_shadow_and_hints(
+            upstream_response,
+            Some(&state.gemini_shadow),
+            Some(&ctx.provider.id),
+            Some(&ctx.session_id),
+            None,
+        )
+    } else {
+        // openai_chat
+        transform::openai_to_anthropic(upstream_response)
+    }
+    .map_err(|e| {
+        log::error!("[Codex←Claude] Format conversion to Anthropic failed: {e}");
+        e
+    })?;
+
+    // Then convert Anthropic → Responses
+    let responses_body =
+        transform_responses::anthropic_response_to_responses(anthropic_response).map_err(|e| {
+            log::error!("[Codex←Claude] Anthropic→Responses conversion failed: {e}");
+            e
+        })?;
+
+    strip_entity_headers_for_rebuilt_body(&mut response_headers);
+    strip_hop_by_hop_response_headers(&mut response_headers);
+    response_headers.remove(axum::http::header::CONTENT_TYPE);
+
+    let mut builder = axum::response::Response::builder().status(status);
+    for (key, value) in response_headers.iter() {
+        builder = builder.header(key, value);
+    }
+    builder = builder.header(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+
+    let body = serde_json::to_vec(&responses_body).map_err(|e| {
+        ProxyError::TransformError(format!("Failed to serialize Responses body: {e}"))
+    })?;
+
+    builder
+        .body(axum::body::Body::from(body))
+        .map_err(|e| ProxyError::Internal(format!("Failed to build response: {e}")))
+}
+
+/// Convert an Anthropic error response to Responses-compatible error format.
+async fn convert_anthropic_error_to_responses(
+    response: super::hyper_client::ProxyResponse,
+    ctx: &RequestContext,
+    status: StatusCode,
+) -> Result<axum::response::Response, ProxyError> {
+    let body_timeout =
+        if ctx.app_config.auto_failover_enabled && ctx.app_config.non_streaming_timeout > 0 {
+            std::time::Duration::from_secs(ctx.app_config.non_streaming_timeout as u64)
+        } else {
+            std::time::Duration::ZERO
+        };
+    let (_headers, _status, body_bytes) =
+        read_decoded_body(response, ctx.tag, body_timeout).await?;
+
+    let error_body: Value = serde_json::from_slice(&body_bytes).unwrap_or_else(|_| {
+        json!({
+            "error": {
+                "message": String::from_utf8_lossy(&body_bytes).to_string(),
+                "type": "upstream_error"
+            }
+        })
+    });
+
+    // Convert Anthropic error shape to Responses error shape
+    let msg = error_body
+        .pointer("/error/message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown error");
+    let err_type = error_body
+        .pointer("/error/type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("api_error");
+
+    let responses_error = json!({
+        "error": {
+            "message": msg,
+            "type": err_type,
+            "code": null,
+            "param": null
+        }
+    });
+
+    log::warn!(
+        "[Codex←Claude] Upstream error ({}): {} - {}",
+        status.as_u16(),
+        err_type,
+        msg
+    );
+
+    let body = serde_json::to_vec(&responses_error).map_err(|e| {
+        ProxyError::TransformError(format!("Failed to serialize error body: {e}"))
+    })?;
+
+    axum::response::Response::builder()
+        .status(status)
+        .header(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        )
+        .body(axum::body::Body::from(body))
+        .map_err(|e| ProxyError::Internal(format!("Failed to build error response: {e}")))
 }
 
 async fn handle_codex_chat_to_responses_transform(
