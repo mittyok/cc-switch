@@ -662,9 +662,16 @@ pub fn responses_request_to_anthropic(body: Value) -> Result<Value, ProxyError> 
         }
     }
 
-    // max_output_tokens → max_tokens
+    // max_output_tokens → max_tokens (Anthropic API 必需字段)
     if let Some(v) = body.get("max_output_tokens") {
         result["max_tokens"] = v.clone();
+    } else if result.get("max_tokens").is_none() {
+        result["max_tokens"] = json!(16384);
+    }
+
+    // Anthropic API 必需字段：确保 messages 存在
+    if result.get("messages").is_none() {
+        result["messages"] = json!([{"role": "user", "content": ""}]);
     }
 
     for key in ["temperature", "top_p", "stream"] {
@@ -2107,5 +2114,172 @@ mod tests {
         assert_eq!(result["output_tokens"], json!(0));
         assert_eq!(result["cache_read_input_tokens"], json!(60));
         assert_eq!(result["cache_creation_input_tokens"], json!(20));
+    }
+
+    // ===== responses_request_to_anthropic tests =====
+
+    #[test]
+    fn test_responses_to_anthropic_simple_text() {
+        let input = json!({
+            "model": "gpt-4o",
+            "input": "Hello world",
+            "max_output_tokens": 1024,
+            "stream": true
+        });
+        let result = responses_request_to_anthropic(input).unwrap();
+
+        assert_eq!(result["model"], "gpt-4o");
+        assert_eq!(result["max_tokens"], 1024);
+        assert_eq!(result["stream"], true);
+        assert_eq!(result["messages"][0]["role"], "user");
+        // string input produces string content (valid for Anthropic API)
+        assert_eq!(result["messages"][0]["content"], "Hello world");
+    }
+
+    #[test]
+    fn test_responses_to_anthropic_missing_max_output_tokens() {
+        let input = json!({
+            "model": "gpt-4o",
+            "input": "Hello"
+        });
+        let result = responses_request_to_anthropic(input).unwrap();
+
+        // Anthropic API requires max_tokens — verify whether it's present
+        let has_max_tokens = result.get("max_tokens").is_some();
+        // If missing, this is a bug: upstream will reject the request
+        assert!(
+            has_max_tokens,
+            "max_tokens must be present for Anthropic API; got: {}",
+            serde_json::to_string_pretty(&result).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_responses_to_anthropic_missing_messages() {
+        let input = json!({
+            "model": "gpt-4o",
+            "max_output_tokens": 1024
+        });
+        let result = responses_request_to_anthropic(input).unwrap();
+
+        // Anthropic API requires messages — verify whether it's present
+        let has_messages = result.get("messages").is_some();
+        assert!(
+            has_messages,
+            "messages must be present for Anthropic API; got: {}",
+            serde_json::to_string_pretty(&result).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_responses_to_anthropic_instructions() {
+        let input = json!({
+            "model": "gpt-4o",
+            "input": "Hello",
+            "instructions": "You are a helpful assistant",
+            "max_output_tokens": 1024
+        });
+        let result = responses_request_to_anthropic(input).unwrap();
+
+        assert_eq!(result["system"], "You are a helpful assistant");
+    }
+
+    #[test]
+    fn test_responses_to_anthropic_reasoning_effort() {
+        let input = json!({
+            "model": "gpt-4o",
+            "input": "Hello",
+            "max_output_tokens": 1024,
+            "reasoning": { "effort": "high" }
+        });
+        let result = responses_request_to_anthropic(input).unwrap();
+
+        assert_eq!(result["thinking"]["type"], "enabled");
+        assert_eq!(result["thinking"]["budget_tokens"], 32768);
+    }
+
+    #[test]
+    fn test_responses_to_anthropic_tools() {
+        let input = json!({
+            "model": "gpt-4o",
+            "input": "Hello",
+            "max_output_tokens": 1024,
+            "tools": [{
+                "type": "function",
+                "name": "get_weather",
+                "description": "Get weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"}
+                    }
+                }
+            }]
+        });
+        let result = responses_request_to_anthropic(input).unwrap();
+
+        assert_eq!(result["tools"][0]["name"], "get_weather");
+        assert_eq!(result["tools"][0]["description"], "Get weather");
+        assert_eq!(result["tools"][0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn test_responses_to_anthropic_function_call_roundtrip() {
+        let input = json!({
+            "model": "gpt-4o",
+            "max_output_tokens": 1024,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "What's the weather?"}]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_123",
+                    "name": "get_weather",
+                    "arguments": "{\"location\":\"Tokyo\"}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_123",
+                    "output": "Sunny, 25°C"
+                }
+            ]
+        });
+        let result = responses_request_to_anthropic(input).unwrap();
+
+        // user message
+        assert_eq!(result["messages"][0]["role"], "user");
+        // assistant with tool_use
+        assert_eq!(result["messages"][1]["role"], "assistant");
+        assert_eq!(result["messages"][1]["content"][0]["type"], "tool_use");
+        assert_eq!(result["messages"][1]["content"][0]["id"], "call_123");
+        assert_eq!(result["messages"][1]["content"][0]["name"], "get_weather");
+        // user with tool_result
+        assert_eq!(result["messages"][2]["role"], "user");
+        assert_eq!(result["messages"][2]["content"][0]["type"], "tool_result");
+        assert_eq!(result["messages"][2]["content"][0]["tool_use_id"], "call_123");
+    }
+
+    #[test]
+    fn test_responses_to_anthropic_tool_choice() {
+        let input = json!({
+            "model": "gpt-4o",
+            "input": "Hello",
+            "max_output_tokens": 1024,
+            "tool_choice": "required"
+        });
+        let result = responses_request_to_anthropic(input).unwrap();
+        assert_eq!(result["tool_choice"]["type"], "any");
+
+        let input2 = json!({
+            "model": "gpt-4o",
+            "input": "Hello",
+            "max_output_tokens": 1024,
+            "tool_choice": "auto"
+        });
+        let result2 = responses_request_to_anthropic(input2).unwrap();
+        assert_eq!(result2["tool_choice"]["type"], "auto");
     }
 }
