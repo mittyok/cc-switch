@@ -23,12 +23,19 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 
 /// State for tracking an open content block in the Anthropic stream.
-#[derive(Debug)]
-#[allow(dead_code)]
+#[derive(Debug, Clone)]
 enum BlockKind {
-    Text,
-    ToolUse { call_id: String, name: String },
-    Thinking,
+    Text { accumulated: String },
+    ToolUse { call_id: String, name: String, accumulated_args: String },
+    Thinking { accumulated: String },
+}
+
+/// Accumulated output item for building the final `output` array in response.completed.
+#[derive(Debug, Clone)]
+enum OutputItem {
+    Message { content: Vec<Value> },
+    FunctionCall { call_id: String, name: String, arguments: String },
+    Reasoning { summary: Vec<Value> },
 }
 
 /// Create a Responses API SSE stream from an Anthropic Messages SSE stream.
@@ -48,6 +55,7 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
         let mut message_output_index: Option<u32> = None;
         let mut event_count: u32 = 0;
         let mut emitted_count: u32 = 0;
+        let mut output_items: HashMap<u32, OutputItem> = HashMap::new();
 
         log::info!("[Codex←Claude] ▶ Starting Anthropic→Responses SSE stream conversion");
 
@@ -184,7 +192,7 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                         };
 
                                         block_to_output.insert(index, msg_idx);
-                                        open_blocks.insert(index, BlockKind::Text);
+                                        open_blocks.insert(index, BlockKind::Text { accumulated: String::new() });
 
                                         let part_event = json!({
                                             "type": "response.content_part.added",
@@ -205,8 +213,26 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                     "tool_use" => {
                                         // Close current message item if any text was open
                                         // (tool calls are separate top-level output items)
-                                        if message_output_index.is_some() {
-                                            message_output_index = None;
+                                        if let Some(msg_idx) = message_output_index.take() {
+                                            let msg_content = match output_items.get(&msg_idx) {
+                                                Some(OutputItem::Message { content }) => content.clone(),
+                                                _ => vec![],
+                                            };
+                                            let done_event = json!({
+                                                "type": "response.output_item.done",
+                                                "output_index": msg_idx,
+                                                "item": {
+                                                    "type": "message",
+                                                    "role": "assistant",
+                                                    "content": msg_content,
+                                                    "status": "completed"
+                                                }
+                                            });
+                                            let done_sse = format!(
+                                                "event: response.output_item.done\ndata: {}\n\n",
+                                                serde_json::to_string(&done_event).unwrap_or_default()
+                                            );
+                                            yield Ok(Bytes::from(done_sse));
                                             text_content_index = 0;
                                         }
 
@@ -230,6 +256,7 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                             BlockKind::ToolUse {
                                                 call_id: call_id.clone(),
                                                 name: name.clone(),
+                                                accumulated_args: String::new(),
                                             },
                                         );
 
@@ -255,7 +282,7 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                         let idx = output_index;
                                         output_index += 1;
                                         block_to_output.insert(index, idx);
-                                        open_blocks.insert(index, BlockKind::Thinking);
+                                        open_blocks.insert(index, BlockKind::Thinking { accumulated: String::new() });
 
                                         let item_event = json!({
                                             "type": "response.output_item.added",
@@ -298,6 +325,9 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                         if let Some(text) =
                                             data.pointer("/delta/text").and_then(|t| t.as_str())
                                         {
+                                            if let Some(BlockKind::Text { accumulated }) = open_blocks.get_mut(&index) {
+                                                accumulated.push_str(text);
+                                            }
                                             let event = json!({
                                                 "type": "response.output_text.delta",
                                                 "output_index": out_idx,
@@ -317,6 +347,9 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                             .pointer("/delta/partial_json")
                                             .and_then(|j| j.as_str())
                                         {
+                                            if let Some(BlockKind::ToolUse { accumulated_args, .. }) = open_blocks.get_mut(&index) {
+                                                accumulated_args.push_str(json_str);
+                                            }
                                             let event = json!({
                                                 "type": "response.function_call_arguments.delta",
                                                 "output_index": out_idx,
@@ -335,6 +368,9 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                             .pointer("/delta/thinking")
                                             .and_then(|t| t.as_str())
                                         {
+                                            if let Some(BlockKind::Thinking { accumulated }) = open_blocks.get_mut(&index) {
+                                                accumulated.push_str(text);
+                                            }
                                             let event = json!({
                                                 "type": "response.reasoning_summary_text.delta",
                                                 "output_index": out_idx,
@@ -364,23 +400,46 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
 
                                 if let Some(kind) = open_blocks.remove(&index) {
                                     match kind {
-                                        BlockKind::Text => {
+                                        BlockKind::Text { accumulated } => {
                                             let event = json!({
                                                 "type": "response.content_part.done",
                                                 "output_index": out_idx,
-                                                "content_index": text_content_index
+                                                "content_index": text_content_index,
+                                                "part": {
+                                                    "type": "output_text",
+                                                    "text": accumulated
+                                                }
                                             });
                                             let sse = format!(
                                                 "event: response.content_part.done\ndata: {}\n\n",
                                                 serde_json::to_string(&event).unwrap_or_default()
                                             );
                                             yield Ok(Bytes::from(sse));
+
+                                            // Track for final output
+                                            let content_part = json!({
+                                                "type": "output_text",
+                                                "text": accumulated
+                                            });
+                                            match output_items.entry(out_idx) {
+                                                std::collections::hash_map::Entry::Occupied(mut e) => {
+                                                    if let OutputItem::Message { content } = e.get_mut() {
+                                                        content.push(content_part);
+                                                    }
+                                                }
+                                                std::collections::hash_map::Entry::Vacant(e) => {
+                                                    e.insert(OutputItem::Message { content: vec![content_part] });
+                                                }
+                                            }
+
                                             text_content_index += 1;
                                         }
-                                        BlockKind::ToolUse { .. } => {
+                                        BlockKind::ToolUse { call_id, name, accumulated_args } => {
                                             let event = json!({
                                                 "type": "response.function_call_arguments.done",
-                                                "output_index": out_idx
+                                                "output_index": out_idx,
+                                                "name": name,
+                                                "arguments": accumulated_args
                                             });
                                             let sse = format!(
                                                 "event: response.function_call_arguments.done\ndata: {}\n\n",
@@ -388,9 +447,23 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                             );
                                             yield Ok(Bytes::from(sse));
 
+                                            // Track for final output
+                                            output_items.insert(out_idx, OutputItem::FunctionCall {
+                                                call_id: call_id.clone(),
+                                                name: name.clone(),
+                                                arguments: accumulated_args.clone(),
+                                            });
+
                                             let done_event = json!({
                                                 "type": "response.output_item.done",
-                                                "output_index": out_idx
+                                                "output_index": out_idx,
+                                                "item": {
+                                                    "type": "function_call",
+                                                    "call_id": call_id,
+                                                    "name": name,
+                                                    "arguments": accumulated_args,
+                                                    "status": "completed"
+                                                }
                                             });
                                             let done_sse = format!(
                                                 "event: response.output_item.done\ndata: {}\n\n",
@@ -398,16 +471,33 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                             );
                                             yield Ok(Bytes::from(done_sse));
                                         }
-                                        BlockKind::Thinking => {
+                                        BlockKind::Thinking { accumulated } => {
                                             let event = json!({
                                                 "type": "response.reasoning_summary_text.done",
-                                                "output_index": out_idx
+                                                "output_index": out_idx,
+                                                "text": accumulated
                                             });
                                             let sse = format!(
                                                 "event: response.reasoning_summary_text.done\ndata: {}\n\n",
                                                 serde_json::to_string(&event).unwrap_or_default()
                                             );
                                             yield Ok(Bytes::from(sse));
+
+                                            // Track for final output
+                                            let summary_part = json!({
+                                                "type": "summary_text",
+                                                "text": accumulated
+                                            });
+                                            match output_items.entry(out_idx) {
+                                                std::collections::hash_map::Entry::Occupied(mut e) => {
+                                                    if let OutputItem::Reasoning { summary } = e.get_mut() {
+                                                        summary.push(summary_part);
+                                                    }
+                                                }
+                                                std::collections::hash_map::Entry::Vacant(e) => {
+                                                    e.insert(OutputItem::Reasoning { summary: vec![summary_part] });
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -417,11 +507,21 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                             // message_delta → (accumulate stop_reason / usage)
                             // ================================================
                             "message_delta" => {
-                                // Close any open message output item
+                                // Close any open message output item with accumulated content
                                 if let Some(msg_idx) = message_output_index.take() {
+                                    let msg_content = match output_items.get(&msg_idx) {
+                                        Some(OutputItem::Message { content }) => content.clone(),
+                                        _ => vec![],
+                                    };
                                     let event = json!({
                                         "type": "response.output_item.done",
-                                        "output_index": msg_idx
+                                        "output_index": msg_idx,
+                                        "item": {
+                                            "type": "message",
+                                            "role": "assistant",
+                                            "content": msg_content,
+                                            "status": "completed"
+                                        }
                                     });
                                     let sse = format!(
                                         "event: response.output_item.done\ndata: {}\n\n",
@@ -449,6 +549,40 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                 let output_tokens =
                                     usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
 
+                                // Build the final output array from accumulated items
+                                let mut final_output: Vec<Value> = Vec::new();
+                                let mut sorted_keys: Vec<u32> = output_items.keys().copied().collect();
+                                sorted_keys.sort();
+                                for key in sorted_keys {
+                                    if let Some(item) = output_items.get(&key) {
+                                        match item {
+                                            OutputItem::Message { content } => {
+                                                final_output.push(json!({
+                                                    "type": "message",
+                                                    "role": "assistant",
+                                                    "content": content,
+                                                    "status": "completed"
+                                                }));
+                                            }
+                                            OutputItem::FunctionCall { call_id, name, arguments } => {
+                                                final_output.push(json!({
+                                                    "type": "function_call",
+                                                    "call_id": call_id,
+                                                    "name": name,
+                                                    "arguments": arguments,
+                                                    "status": "completed"
+                                                }));
+                                            }
+                                            OutputItem::Reasoning { summary } => {
+                                                final_output.push(json!({
+                                                    "type": "reasoning",
+                                                    "summary": summary
+                                                }));
+                                            }
+                                        }
+                                    }
+                                }
+
                                 let mut completed = json!({
                                     "type": "response.completed",
                                     "response": {
@@ -456,6 +590,7 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                         "object": "response",
                                         "status": status,
                                         "model": model,
+                                        "output": final_output,
                                         "usage": {
                                             "input_tokens": input_tokens,
                                             "output_tokens": output_tokens,
@@ -697,5 +832,96 @@ mod tests {
                 "Event 'type' field must match SSE event name"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_accumulated_data_in_done_events() {
+        let events = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_acc\",\"model\":\"claude-sonnet-4-6\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+            // Text block
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            // Tool use block
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_01\",\"name\":\"exec_command\",\"input\":{}}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"cmd\\\":\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\\\"ls\\\"}\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":25}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ];
+
+        let result = collect_responses_sse(events).await;
+
+        // content_part.done must include accumulated text
+        let part_done = result.iter().find(|(n, _)| n == "response.content_part.done").unwrap();
+        assert_eq!(part_done.1["part"]["text"], "Hello world", "content_part.done must include accumulated text");
+        assert_eq!(part_done.1["part"]["type"], "output_text");
+
+        // function_call_arguments.done must include accumulated arguments and name
+        let args_done = result.iter().find(|(n, _)| n == "response.function_call_arguments.done").unwrap();
+        assert_eq!(args_done.1["arguments"], "{\"cmd\":\"ls\"}");
+        assert_eq!(args_done.1["name"], "exec_command");
+
+        // output_item.done for tool must include full item with status
+        let item_done_events: Vec<_> = result.iter().filter(|(n, _)| n == "response.output_item.done").collect();
+        let tool_item_done = item_done_events.iter().find(|(_, d)| d["item"]["type"] == "function_call").unwrap();
+        assert_eq!(tool_item_done.1["item"]["name"], "exec_command");
+        assert_eq!(tool_item_done.1["item"]["arguments"], "{\"cmd\":\"ls\"}");
+        assert_eq!(tool_item_done.1["item"]["call_id"], "toolu_01");
+        assert_eq!(tool_item_done.1["item"]["status"], "completed");
+
+        // output_item.done for message must include content array
+        let msg_item_done = item_done_events.iter().find(|(_, d)| d["item"]["type"] == "message").unwrap();
+        let content = msg_item_done.1["item"]["content"].as_array().unwrap();
+        assert!(!content.is_empty(), "message output_item.done must have content");
+        assert_eq!(content[0]["text"], "Hello world");
+
+        // response.completed must include full output array
+        let completed = result.iter().find(|(n, _)| n == "response.completed").unwrap();
+        let output = completed.1["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2, "output should have message + function_call");
+
+        let msg_output = &output[0];
+        assert_eq!(msg_output["type"], "message");
+        assert_eq!(msg_output["content"][0]["text"], "Hello world");
+
+        let fc_output = &output[1];
+        assert_eq!(fc_output["type"], "function_call");
+        assert_eq!(fc_output["name"], "exec_command");
+        assert_eq!(fc_output["arguments"], "{\"cmd\":\"ls\"}");
+        assert_eq!(fc_output["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn test_thinking_accumulated_in_completed() {
+        let events = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_think\",\"model\":\"claude-opus-4-6\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Step 1. \"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Step 2.\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Answer.\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":30}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ];
+
+        let result = collect_responses_sse(events).await;
+
+        // reasoning_summary_text.done must include accumulated text
+        let reasoning_done = result.iter().find(|(n, _)| n == "response.reasoning_summary_text.done").unwrap();
+        assert_eq!(reasoning_done.1["text"], "Step 1. Step 2.");
+
+        // response.completed output must include reasoning and message
+        let completed = result.iter().find(|(n, _)| n == "response.completed").unwrap();
+        let output = completed.1["response"]["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["summary"][0]["text"], "Step 1. Step 2.");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "Answer.");
     }
 }
