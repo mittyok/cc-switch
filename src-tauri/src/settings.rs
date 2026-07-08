@@ -331,6 +331,47 @@ pub struct CodexOfficialHistoryUnifyMigration {
     pub codex_config_dir: Option<String>,
 }
 
+/// Codex→Claude 管道模式
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexClaudePipelineMode {
+    /// 关闭 — 仅使用 Codex 自身供应商
+    #[default]
+    Off,
+    /// 降级兜底 — 先走 Codex 供应商，全部不可用时自动走 Claude 管道
+    Fallback,
+    /// 始终使用 Claude 管道
+    Always,
+}
+
+impl<'de> serde::Deserialize<'de> for CodexClaudePipelineMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de;
+        struct ModeVisitor;
+        impl de::Visitor<'_> for ModeVisitor {
+            type Value = CodexClaudePipelineMode;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(r#""off", "fallback", "always", or a boolean"#)
+            }
+            fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(if v { CodexClaudePipelineMode::Always } else { CodexClaudePipelineMode::Off })
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                match v {
+                    "off" => Ok(CodexClaudePipelineMode::Off),
+                    "fallback" => Ok(CodexClaudePipelineMode::Fallback),
+                    "always" => Ok(CodexClaudePipelineMode::Always),
+                    _ => Err(de::Error::unknown_variant(v, &["off", "fallback", "always"])),
+                }
+            }
+        }
+        deserializer.deserialize_any(ModeVisitor)
+    }
+}
+
 /// 应用设置结构
 ///
 /// 存储设备级别设置，保存在本地 `~/.cc-switch/settings.json`，不随数据库同步。
@@ -390,7 +431,7 @@ pub struct AppSettings {
     /// (failover queue, circuit breaker, format transforms) instead of using
     /// Codex-specific providers.
     #[serde(default)]
-    pub codex_use_claude_pipeline: bool,
+    pub codex_use_claude_pipeline: CodexClaudePipelineMode,
     /// User has confirmed the failover toggle first-run notice
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failover_confirmed: Option<bool>,
@@ -511,7 +552,7 @@ impl Default for AppSettings {
             preserve_codex_official_auth_on_switch: false,
             unify_codex_session_history: false,
             unify_codex_migrate_existing: None,
-            codex_use_claude_pipeline: false,
+            codex_use_claude_pipeline: CodexClaudePipelineMode::Off,
             failover_confirmed: None,
             first_run_notice_confirmed: None,
             common_config_confirmed: None,
@@ -926,11 +967,11 @@ pub fn unify_codex_session_history() -> bool {
         .unify_codex_session_history
 }
 
-pub fn codex_uses_claude_pipeline() -> bool {
+pub fn codex_claude_pipeline_mode() -> CodexClaudePipelineMode {
     settings_store()
         .read()
         .map(|s| s.codex_use_claude_pipeline)
-        .unwrap_or(false)
+        .unwrap_or(CodexClaudePipelineMode::Off)
 }
 
 // ===== 当前供应商管理函数 =====

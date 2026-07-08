@@ -6,6 +6,15 @@ import type { SettingsFormState } from "@/hooks/useSettings";
 import { ToggleRow } from "@/components/ui/toggle-row";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { settingsApi } from "@/lib/api";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+
+const PIPELINE_MODES = ["off", "fallback", "always"] as const;
 
 interface CodexAuthSettingsProps {
   settings: SettingsFormState;
@@ -105,15 +114,42 @@ export function CodexAuthSettings({
         }
       />
 
-      <ToggleRow
-        icon={<ArrowRightLeft className="h-4 w-4 text-violet-500" />}
-        title={t("settings.codexUseClaudePipeline")}
-        description={t("settings.codexUseClaudePipelineDescription")}
-        checked={settings.codexUseClaudePipeline ?? false}
-        onCheckedChange={(value) =>
-          onChange({ codexUseClaudePipeline: value })
-        }
-      />
+      <div className="flex items-center justify-between gap-4 rounded-xl border border-border bg-card/50 p-4 transition-colors hover:bg-muted/50">
+        <div className="flex items-center gap-3">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-background ring-1 ring-border">
+            <ArrowRightLeft className="h-4 w-4 text-violet-500" />
+          </div>
+          <div className="space-y-1">
+            <p className="text-sm font-medium leading-none">
+              {t("settings.codexUseClaudePipeline")}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {t("settings.codexUseClaudePipelineDescription")}
+            </p>
+          </div>
+        </div>
+        <Select
+          value={settings.codexUseClaudePipeline ?? "off"}
+          onValueChange={(value) =>
+            onChange({
+              codexUseClaudePipeline: value as "off" | "fallback" | "always",
+            })
+          }
+        >
+          <SelectTrigger className="w-[120px]">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {PIPELINE_MODES.map((mode) => (
+              <SelectItem key={mode} value={mode}>
+                {t(
+                  `settings.codexClaudePipelineMode${mode.charAt(0).toUpperCase() + mode.slice(1)}`,
+                )}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
 
       <ToggleRow
         icon={<History className="h-4 w-4 text-sky-500" />}
