@@ -26,14 +26,14 @@ pub mod provider_router;
 pub mod providers;
 pub mod response_handler;
 pub mod response_processor;
-pub(crate) mod server;
+pub mod server;
 pub mod session;
 pub(crate) mod sse;
 pub(crate) mod switch_lock;
 pub mod thinking_budget_rectifier;
 pub mod thinking_optimizer;
 pub mod thinking_rectifier;
-pub(crate) mod types;
+pub mod types;
 pub mod usage;
 
 // 公开导出给外部使用（commands, services等模块需要）
