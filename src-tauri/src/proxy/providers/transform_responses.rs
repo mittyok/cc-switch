@@ -2339,4 +2339,216 @@ mod tests {
         assert_eq!(result["messages"][0]["role"], "user");
         assert_eq!(result["messages"][0]["content"][0]["text"], "System prompt");
     }
+
+    // ── Integration tests ──
+    // Env vars: ANTHROPIC_TEST_API_KEY or JDCLOUD_API_KEY
+    //           ANTHROPIC_TEST_BASE_URL (optional, default: https://api.anthropic.com)
+    //           ANTHROPIC_TEST_MODEL (optional, default: claude-sonnet-4-20250514)
+    //           ANTHROPIC_TEST_AUTH_HEADER (optional: "x-api-key" or "bearer", default: x-api-key)
+
+    fn integration_config() -> (String, String, String, String) {
+        let api_key = std::env::var("ANTHROPIC_TEST_API_KEY")
+            .or_else(|_| std::env::var("JDCLOUD_API_KEY"))
+            .expect("ANTHROPIC_TEST_API_KEY or JDCLOUD_API_KEY env var required");
+        let base_url = std::env::var("ANTHROPIC_TEST_BASE_URL")
+            .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+        let model = std::env::var("ANTHROPIC_TEST_MODEL")
+            .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+        let auth_header = std::env::var("ANTHROPIC_TEST_AUTH_HEADER")
+            .unwrap_or_else(|_| "x-api-key".to_string());
+        (api_key, base_url, model, auth_header)
+    }
+
+    fn build_anthropic_request(
+        client: &reqwest::Client,
+        base_url: &str,
+        api_key: &str,
+        auth_header: &str,
+    ) -> reqwest::RequestBuilder {
+        let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
+        let builder = client
+            .post(&url)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json");
+        if auth_header == "bearer" {
+            builder.header("Authorization", format!("Bearer {}", api_key))
+        } else {
+            builder.header("x-api-key", api_key)
+        }
+    }
+
+    async fn send_and_parse(
+        client: &reqwest::Client,
+        base_url: &str,
+        api_key: &str,
+        auth_header: &str,
+        body: &Value,
+    ) -> Value {
+        let resp = build_anthropic_request(client, base_url, api_key, auth_header)
+            .json(body)
+            .send()
+            .await
+            .expect("HTTP request failed");
+
+        let status = resp.status();
+        let raw = resp.text().await.expect("failed to read response body");
+        assert!(
+            status.is_success(),
+            "HTTP {status}, body: {}",
+            &raw[..raw.len().min(500)]
+        );
+        serde_json::from_str(&raw).expect("response is not valid JSON")
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn integration_simple_text_roundtrip() {
+        let (api_key, base_url, model, auth_header) = integration_config();
+
+        let codex_request = json!({
+            "model": model,
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Reply with exactly: hello world"}]}
+            ],
+            "max_output_tokens": 256
+        });
+
+        let anthropic_req = responses_request_to_anthropic(codex_request).unwrap();
+        assert!(anthropic_req.get("max_tokens").is_some());
+        assert!(anthropic_req.get("messages").is_some());
+
+        let client = reqwest::Client::new();
+        let body = send_and_parse(&client, &base_url, &api_key, &auth_header, &anthropic_req).await;
+
+        let responses_result = anthropic_response_to_responses(body).unwrap();
+        assert_eq!(responses_result["status"], "completed");
+        assert!(!responses_result["output"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn integration_developer_role_roundtrip() {
+        let (api_key, base_url, model, auth_header) = integration_config();
+
+        let codex_request = json!({
+            "model": model,
+            "input": [
+                {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "You are a helpful assistant."}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Say hi"}]}
+            ],
+            "max_output_tokens": 256
+        });
+
+        let anthropic_req = responses_request_to_anthropic(codex_request).unwrap();
+        for msg in anthropic_req["messages"].as_array().unwrap() {
+            let role = msg["role"].as_str().unwrap();
+            assert!(role == "user" || role == "assistant", "bad role: {role}");
+        }
+
+        let client = reqwest::Client::new();
+        let body = send_and_parse(&client, &base_url, &api_key, &auth_header, &anthropic_req).await;
+
+        let responses_result = anthropic_response_to_responses(body).unwrap();
+        assert_eq!(responses_result["status"], "completed");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn integration_no_max_output_tokens() {
+        let (api_key, base_url, model, auth_header) = integration_config();
+
+        let codex_request = json!({
+            "model": model,
+            "input": "Say ok"
+        });
+
+        let anthropic_req = responses_request_to_anthropic(codex_request).unwrap();
+        assert_eq!(anthropic_req["max_tokens"], 16384);
+
+        let client = reqwest::Client::new();
+        let body = send_and_parse(&client, &base_url, &api_key, &auth_header, &anthropic_req).await;
+        assert!(body.get("content").is_some(), "missing content in response");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn integration_tool_use_roundtrip() {
+        let (api_key, base_url, model, auth_header) = integration_config();
+
+        let codex_request = json!({
+            "model": model,
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "What is the weather in Beijing? Use the get_weather tool."}]}
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "description": "Get weather for a city",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"}
+                        },
+                        "required": ["city"]
+                    }
+                }
+            ],
+            "tool_choice": "required",
+            "max_output_tokens": 1024
+        });
+
+        let anthropic_req = responses_request_to_anthropic(codex_request).unwrap();
+        assert!(anthropic_req.get("tools").is_some());
+
+        let client = reqwest::Client::new();
+        let body = send_and_parse(&client, &base_url, &api_key, &auth_header, &anthropic_req).await;
+
+        let responses_result = anthropic_response_to_responses(body).unwrap();
+        let output = responses_result["output"].as_array().unwrap();
+        let has_function_call = output.iter().any(|item| item["type"] == "function_call");
+        assert!(has_function_call, "Expected function_call in output: {output:?}");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn integration_streaming_roundtrip() {
+        use futures::StreamExt;
+
+        let (api_key, base_url, model, auth_header) = integration_config();
+
+        let codex_request = json!({
+            "model": model,
+            "input": "Reply with exactly: streaming works",
+            "max_output_tokens": 256,
+            "stream": true
+        });
+
+        let anthropic_req = responses_request_to_anthropic(codex_request).unwrap();
+        assert_eq!(anthropic_req["stream"], true);
+
+        let client = reqwest::Client::new();
+        let resp = build_anthropic_request(&client, &base_url, &api_key, &auth_header)
+            .json(&anthropic_req)
+            .send()
+            .await
+            .expect("HTTP request failed");
+
+        let status_code = resp.status();
+        if !status_code.is_success() {
+            let err_body = resp.text().await.unwrap_or_default();
+            panic!("HTTP {status_code}, body: {}", &err_body[..err_body.len().min(500)]);
+        }
+
+        let mut stream = resp.bytes_stream();
+        let mut full_sse = String::new();
+        while let Some(chunk) = stream.next().await {
+            let bytes = chunk.expect("stream chunk error");
+            full_sse.push_str(&String::from_utf8_lossy(&bytes));
+        }
+
+        assert!(full_sse.contains("event: message_start"), "missing message_start in SSE");
+        assert!(full_sse.contains("event: content_block_delta"), "missing content_block_delta");
+        assert!(full_sse.contains("event: message_stop"), "missing message_stop");
+    }
 }

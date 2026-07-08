@@ -61,6 +61,28 @@ pub use services::{
 };
 pub use settings::{update_settings, AppSettings};
 pub use store::AppState;
+
+pub use proxy::server::ProxyServer;
+pub use proxy::types::ProxyConfig;
+
+/// Start a proxy server for integration testing on a random port.
+/// Returns `(port, server)`. Drop `server` when done.
+#[doc(hidden)]
+pub async fn start_test_proxy(
+    db: Arc<Database>,
+) -> Result<(u16, ProxyServer), AppError> {
+    let config = ProxyConfig {
+        listen_address: "127.0.0.1".to_string(),
+        listen_port: 0,
+        ..Default::default()
+    };
+    let server = ProxyServer::new(config, db, None);
+    let info = server
+        .start()
+        .await
+        .map_err(|e| AppError::Message(format!("proxy start failed: {e}")))?;
+    Ok((info.port, server))
+}
 use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 

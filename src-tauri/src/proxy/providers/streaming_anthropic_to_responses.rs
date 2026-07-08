@@ -114,6 +114,7 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                         usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
 
                                     let event = json!({
+                                        "type": "response.created",
                                         "response": {
                                             "id": response_id,
                                             "object": "response",
@@ -160,6 +161,7 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
 
                                             // Emit output_item.added for the message
                                             let item_event = json!({
+                                                "type": "response.output_item.added",
                                                 "output_index": idx,
                                                 "item": {
                                                     "type": "message",
@@ -179,6 +181,7 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                         open_blocks.insert(index, BlockKind::Text);
 
                                         let part_event = json!({
+                                            "type": "response.content_part.added",
                                             "output_index": msg_idx,
                                             "content_index": text_content_index,
                                             "part": {
@@ -225,6 +228,7 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                         );
 
                                         let item_event = json!({
+                                            "type": "response.output_item.added",
                                             "output_index": idx,
                                             "item": {
                                                 "type": "function_call",
@@ -248,6 +252,7 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                         open_blocks.insert(index, BlockKind::Thinking);
 
                                         let item_event = json!({
+                                            "type": "response.output_item.added",
                                             "output_index": idx,
                                             "item": {
                                                 "type": "reasoning",
@@ -288,6 +293,7 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                             data.pointer("/delta/text").and_then(|t| t.as_str())
                                         {
                                             let event = json!({
+                                                "type": "response.output_text.delta",
                                                 "output_index": out_idx,
                                                 "content_index": text_content_index,
                                                 "delta": text
@@ -306,6 +312,7 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                             .and_then(|j| j.as_str())
                                         {
                                             let event = json!({
+                                                "type": "response.function_call_arguments.delta",
                                                 "output_index": out_idx,
                                                 "delta": json_str
                                             });
@@ -323,6 +330,7 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                             .and_then(|t| t.as_str())
                                         {
                                             let event = json!({
+                                                "type": "response.reasoning_summary_text.delta",
                                                 "output_index": out_idx,
                                                 "delta": text
                                             });
@@ -352,6 +360,7 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                     match kind {
                                         BlockKind::Text => {
                                             let event = json!({
+                                                "type": "response.content_part.done",
                                                 "output_index": out_idx,
                                                 "content_index": text_content_index
                                             });
@@ -364,6 +373,7 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                         }
                                         BlockKind::ToolUse { .. } => {
                                             let event = json!({
+                                                "type": "response.function_call_arguments.done",
                                                 "output_index": out_idx
                                             });
                                             let sse = format!(
@@ -373,6 +383,7 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                             yield Ok(Bytes::from(sse));
 
                                             let done_event = json!({
+                                                "type": "response.output_item.done",
                                                 "output_index": out_idx
                                             });
                                             let done_sse = format!(
@@ -383,6 +394,7 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                         }
                                         BlockKind::Thinking => {
                                             let event = json!({
+                                                "type": "response.reasoning_summary_text.done",
                                                 "output_index": out_idx
                                             });
                                             let sse = format!(
@@ -402,6 +414,7 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                 // Close any open message output item
                                 if let Some(msg_idx) = message_output_index.take() {
                                     let event = json!({
+                                        "type": "response.output_item.done",
                                         "output_index": msg_idx
                                     });
                                     let sse = format!(
@@ -431,6 +444,7 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                     usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
 
                                 let mut completed = json!({
+                                    "type": "response.completed",
                                     "response": {
                                         "id": response_id,
                                         "object": "response",
@@ -470,6 +484,7 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                 Err(e) => {
                     log::error!("[Codex←Claude] Anthropic stream error: {e}");
                     let error_event = json!({
+                        "type": "error",
                         "error": {
                             "message": format!("Stream error: {e}"),
                             "type": "stream_error",
@@ -485,6 +500,187 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                     break;
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+
+    fn anthropic_sse_stream(
+        events: Vec<&str>,
+    ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send {
+        let data: Vec<Result<Bytes, std::io::Error>> = events
+            .into_iter()
+            .map(|e| Ok(Bytes::from(e.to_string())))
+            .collect();
+        stream::iter(data)
+    }
+
+    async fn collect_responses_sse(events: Vec<&str>) -> Vec<(String, Value)> {
+        let input = anthropic_sse_stream(events);
+        let output = create_responses_sse_stream_from_anthropic(input);
+        tokio::pin!(output);
+
+        let mut result = Vec::new();
+        let mut buffer = String::new();
+
+        while let Some(chunk) = output.next().await {
+            match chunk {
+                Ok(bytes) => buffer.push_str(&String::from_utf8_lossy(&bytes)),
+                Err(e) => panic!("Stream error: {e}"),
+            }
+        }
+
+        for block in buffer.split("\n\n") {
+            let block = block.trim();
+            if block.is_empty() {
+                continue;
+            }
+            let mut event_name = String::new();
+            let mut data = String::new();
+            for line in block.lines() {
+                if let Some(evt) = line.strip_prefix("event: ") {
+                    event_name = evt.to_string();
+                } else if let Some(d) = line.strip_prefix("data: ") {
+                    data = d.to_string();
+                }
+            }
+            if !event_name.is_empty() && !data.is_empty() {
+                if let Ok(json) = serde_json::from_str::<Value>(&data) {
+                    result.push((event_name, json));
+                }
+            }
+        }
+        result
+    }
+
+    #[tokio::test]
+    async fn test_simple_text_stream() {
+        let events = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"model\":\"claude-sonnet-4-6\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" world\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ];
+
+        let result = collect_responses_sse(events).await;
+        let event_names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
+
+        assert!(event_names.contains(&"response.created"), "Missing response.created, got: {event_names:?}");
+        assert!(event_names.contains(&"response.output_item.added"), "Missing response.output_item.added");
+        assert!(event_names.contains(&"response.content_part.added"), "Missing response.content_part.added");
+        assert!(event_names.contains(&"response.output_text.delta"), "Missing response.output_text.delta");
+        assert!(event_names.contains(&"response.content_part.done"), "Missing response.content_part.done");
+        assert!(event_names.contains(&"response.output_item.done"), "Missing response.output_item.done");
+        assert!(event_names.contains(&"response.completed"), "Missing response.completed, got: {event_names:?}");
+
+        let completed = result.iter().find(|(n, _)| n == "response.completed").unwrap();
+        assert_eq!(completed.1["response"]["status"], "completed");
+        assert_eq!(completed.1["response"]["id"], "msg_123");
+    }
+
+    #[tokio::test]
+    async fn test_tool_use_stream() {
+        let events = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_456\",\"model\":\"claude-sonnet-4-6\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_01\",\"name\":\"read_file\",\"input\":{}}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"/tmp\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":20}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ];
+
+        let result = collect_responses_sse(events).await;
+        let event_names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
+
+        assert!(event_names.contains(&"response.completed"), "Missing response.completed for tool_use, got: {event_names:?}");
+    }
+
+    #[tokio::test]
+    async fn test_thinking_then_text_stream() {
+        let events = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_789\",\"model\":\"claude-opus-4-6\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"Let me think...\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"The answer is 42.\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":30}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ];
+
+        let result = collect_responses_sse(events).await;
+        let event_names: Vec<&str> = result.iter().map(|(n, _)| n.as_str()).collect();
+
+        assert!(event_names.contains(&"response.reasoning_summary_text.delta"));
+        assert!(event_names.contains(&"response.output_text.delta"));
+        assert!(event_names.contains(&"response.completed"), "Missing response.completed, got: {event_names:?}");
+
+        let completed = result.iter().find(|(n, _)| n == "response.completed").unwrap();
+        assert_eq!(completed.1["response"]["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn test_max_tokens_produces_incomplete() {
+        let events = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_max\",\"model\":\"claude-sonnet-4-6\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"input_tokens\":10,\"output_tokens\":4096}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ];
+
+        let result = collect_responses_sse(events).await;
+        let completed = result.iter().find(|(n, _)| n == "response.completed").unwrap();
+        assert_eq!(completed.1["response"]["status"], "incomplete");
+        assert_eq!(completed.1["response"]["incomplete_details"]["reason"], "max_output_tokens");
+    }
+
+    #[tokio::test]
+    async fn test_response_completed_is_last_event() {
+        let events = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_last\",\"model\":\"claude-sonnet-4-6\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ];
+
+        let result = collect_responses_sse(events).await;
+        let last = result.last().expect("should have events");
+        assert_eq!(last.0, "response.completed", "response.completed must be last, got: {}", last.0);
+    }
+
+    #[tokio::test]
+    async fn test_all_events_have_type_field() {
+        let events = vec![
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_t\",\"model\":\"claude-sonnet-4-6\",\"role\":\"assistant\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ];
+
+        let result = collect_responses_sse(events).await;
+        for (event_name, data) in &result {
+            assert!(
+                data.get("type").is_some(),
+                "Event '{event_name}' is missing 'type' field in data payload. Codex CLI requires this for dispatch. Data: {data}"
+            );
+            assert_eq!(
+                data["type"].as_str().unwrap(),
+                event_name.as_str(),
+                "Event 'type' field must match SSE event name"
+            );
         }
     }
 }
