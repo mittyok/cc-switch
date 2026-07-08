@@ -650,13 +650,29 @@ pub fn responses_request_to_anthropic(body: Value) -> Result<Value, ProxyError> 
 
     // input → messages
     if let Some(input) = body.get("input") {
-        let messages = match input {
+        let mut messages = match input {
             Value::String(text) => {
                 vec![json!({"role": "user", "content": text})]
             }
             Value::Array(items) => convert_input_to_messages(items)?,
             _ => Vec::new(),
         };
+
+        // Strip trailing assistant message to avoid unintentional prefill.
+        // Some providers/accounts reject prefill; the trailing assistant
+        // message here is just conversation history, not an intentional prefill.
+        if messages
+            .last()
+            .and_then(|m| m.get("role").and_then(|r| r.as_str()))
+            == Some("assistant")
+        {
+            log::warn!(
+                "[Responses→Anthropic] Stripped trailing assistant message to avoid prefill (messages_count={})",
+                messages.len()
+            );
+            messages.pop();
+        }
+
         if !messages.is_empty() {
             result["messages"] = json!(messages);
         }
@@ -2550,5 +2566,48 @@ mod tests {
         assert!(full_sse.contains("event: message_start"), "missing message_start in SSE");
         assert!(full_sse.contains("event: content_block_delta"), "missing content_block_delta");
         assert!(full_sse.contains("event: message_stop"), "missing message_stop");
+    }
+
+    #[test]
+    fn test_responses_request_to_anthropic_strips_trailing_assistant_prefill() {
+        let input = json!({
+            "model": "claude-opus-4-6",
+            "max_output_tokens": 16384,
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Hello"}]},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Hi there"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "get_weather", "arguments": "{\"location\":\"Tokyo\"}"}
+            ]
+        });
+
+        let result = responses_request_to_anthropic(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+        let last = messages.last().unwrap();
+        assert_ne!(
+            last["role"], "assistant",
+            "trailing assistant message should be stripped to avoid prefill"
+        );
+    }
+
+    #[test]
+    fn test_responses_request_to_anthropic_keeps_trailing_user() {
+        let input = json!({
+            "model": "claude-opus-4-6",
+            "max_output_tokens": 16384,
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Hello"}]},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Hi"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "tool", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "result"}
+            ]
+        });
+
+        let result = responses_request_to_anthropic(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+        let last = messages.last().unwrap();
+        assert_eq!(
+            last["role"], "user",
+            "trailing user message (tool_result) should be preserved"
+        );
     }
 }

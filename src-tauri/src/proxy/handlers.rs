@@ -725,11 +725,11 @@ pub async fn handle_responses(
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    // When the "use Claude pipeline" toggle is on, route Codex traffic
-    // through Claude's entire provider pipeline (failover, circuit breaker, etc.)
-    if crate::settings::codex_uses_claude_pipeline() {
+    // Route Codex traffic based on Claude pipeline mode setting
+    let pipeline_mode = crate::settings::codex_claude_pipeline_mode();
+    if pipeline_mode == crate::settings::CodexClaudePipelineMode::Always {
         log::info!(
-            "[Codex→Claude] ▶ Incoming Responses request: model={}, stream={}, input_items={}, has_instructions={}",
+            "[Codex→Claude] ▶ Incoming Responses request (mode=always): model={}, stream={}, input_items={}, has_instructions={}",
             body.get("model").and_then(|m| m.as_str()).unwrap_or("(none)"),
             body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
             body.get("input").and_then(|i| i.as_array()).map(|a| a.len()).unwrap_or(0),
@@ -743,8 +743,34 @@ pub async fn handle_responses(
             .await;
     }
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
+    let is_fallback = pipeline_mode == crate::settings::CodexClaudePipelineMode::Fallback;
+
+    // In fallback mode, save copies before they're consumed by forward_with_retry
+    let fallback_snapshot = if is_fallback {
+        Some((body.clone(), headers.clone(), extensions.clone(), method.clone()))
+    } else {
+        None
+    };
+
+    // Try Codex providers first; in fallback mode, provider-down errors redirect to Claude
+    let ctx_result =
+        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await;
+
+    let mut ctx = match ctx_result {
+        Ok(ctx) => ctx,
+        Err(ref e) if is_fallback && is_provider_down_error(e) => {
+            let (fb_body, fb_headers, fb_extensions, fb_method) = fallback_snapshot.unwrap();
+            log::info!(
+                "[Codex→Claude] ▶ Codex providers unavailable ({}), falling back to Claude pipeline",
+                e
+            );
+            return handle_responses_via_claude_pipeline(
+                state, fb_body, fb_headers, fb_extensions, fb_method, &uri,
+            )
+            .await;
+        }
+        Err(e) => return Err(e),
+    };
     let endpoint = endpoint_with_query(&uri, "/responses");
 
     let is_stream = body
@@ -768,6 +794,17 @@ pub async fn handle_responses(
     {
         Ok(result) => result,
         Err(mut err) => {
+            if is_fallback && is_provider_down_error(&err.error) {
+                let (fb_body, fb_headers, fb_extensions, fb_method) = fallback_snapshot.unwrap();
+                log::info!(
+                    "[Codex→Claude] ▶ Codex forward failed ({}), falling back to Claude pipeline",
+                    &err.error
+                );
+                return handle_responses_via_claude_pipeline(
+                    state, fb_body, fb_headers, fb_extensions, fb_method, &uri,
+                )
+                .await;
+            }
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
@@ -822,9 +859,9 @@ pub async fn handle_responses_compact(
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    if crate::settings::codex_uses_claude_pipeline() {
+    if crate::settings::codex_claude_pipeline_mode() == crate::settings::CodexClaudePipelineMode::Always {
         log::info!(
-            "[Codex→Claude] ▶ Incoming Responses/compact request: model={}, stream={}",
+            "[Codex→Claude] ▶ Incoming Responses/compact request (mode=always): model={}, stream={}",
             body.get("model").and_then(|m| m.as_str()).unwrap_or("(none)"),
             body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
         );
@@ -832,8 +869,32 @@ pub async fn handle_responses_compact(
             .await;
     }
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
+    let is_fallback = crate::settings::codex_claude_pipeline_mode() == crate::settings::CodexClaudePipelineMode::Fallback;
+
+    let fallback_snapshot = if is_fallback {
+        Some((body.clone(), headers.clone(), extensions.clone(), method.clone()))
+    } else {
+        None
+    };
+
+    let ctx_result =
+        RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await;
+
+    let mut ctx = match ctx_result {
+        Ok(ctx) => ctx,
+        Err(ref e) if is_fallback && is_provider_down_error(e) => {
+            let (fb_body, fb_headers, fb_extensions, fb_method) = fallback_snapshot.unwrap();
+            log::info!(
+                "[Codex→Claude] ▶ Codex providers unavailable ({}), falling back to Claude pipeline (compact)",
+                e
+            );
+            return handle_responses_via_claude_pipeline(
+                state, fb_body, fb_headers, fb_extensions, fb_method, &uri,
+            )
+            .await;
+        }
+        Err(e) => return Err(e),
+    };
     let endpoint = endpoint_with_query(&uri, "/responses/compact");
 
     let is_stream = body
@@ -857,6 +918,17 @@ pub async fn handle_responses_compact(
     {
         Ok(result) => result,
         Err(mut err) => {
+            if is_fallback && is_provider_down_error(&err.error) {
+                let (fb_body, fb_headers, fb_extensions, fb_method) = fallback_snapshot.unwrap();
+                log::info!(
+                    "[Codex→Claude] ▶ Codex forward failed ({}), falling back to Claude pipeline (compact)",
+                    &err.error
+                );
+                return handle_responses_via_claude_pipeline(
+                    state, fb_body, fb_headers, fb_extensions, fb_method, &uri,
+                )
+                .await;
+            }
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
             }
@@ -1769,6 +1841,16 @@ fn codex_proxy_error_json(
     }
 
     body
+}
+
+fn is_provider_down_error(error: &ProxyError) -> bool {
+    matches!(
+        error,
+        ProxyError::AllProvidersCircuitOpen
+            | ProxyError::NoProvidersConfigured
+            | ProxyError::NoAvailableProvider
+            | ProxyError::MaxRetriesExceeded
+    )
 }
 
 fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
