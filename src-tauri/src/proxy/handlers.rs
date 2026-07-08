@@ -728,6 +728,17 @@ pub async fn handle_responses(
     // When the "use Claude pipeline" toggle is on, route Codex traffic
     // through Claude's entire provider pipeline (failover, circuit breaker, etc.)
     if crate::settings::codex_uses_claude_pipeline() {
+        log::info!(
+            "[Codex→Claude] ▶ Incoming Responses request: model={}, stream={}, input_items={}, has_instructions={}",
+            body.get("model").and_then(|m| m.as_str()).unwrap_or("(none)"),
+            body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
+            body.get("input").and_then(|i| i.as_array()).map(|a| a.len()).unwrap_or(0),
+            body.get("instructions").is_some(),
+        );
+        log::debug!(
+            "[Codex→Claude] ▶ Responses request body: {}",
+            truncate_json_for_log(&body, 2000),
+        );
         return handle_responses_via_claude_pipeline(state, body, headers, extensions, method, &uri)
             .await;
     }
@@ -812,6 +823,11 @@ pub async fn handle_responses_compact(
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
     if crate::settings::codex_uses_claude_pipeline() {
+        log::info!(
+            "[Codex→Claude] ▶ Incoming Responses/compact request: model={}, stream={}",
+            body.get("model").and_then(|m| m.as_str()).unwrap_or("(none)"),
+            body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
+        );
         return handle_responses_via_claude_pipeline(state, body, headers, extensions, method, &uri)
             .await;
     }
@@ -910,6 +926,10 @@ async fn handle_responses_via_claude_pipeline(
         anthropic_body.get("system").is_some(),
         anthropic_body.get("tools").is_some(),
         anthropic_body.get("thinking").is_some(),
+    );
+    log::debug!(
+        "[Codex→Claude] ▶ Anthropic request body: {}",
+        truncate_json_for_log(&anthropic_body, 2000),
     );
 
     // 2. Create context with Claude pipeline (selects Claude providers with failover)
@@ -1016,6 +1036,11 @@ async fn convert_anthropic_response_to_responses(
 ) -> Result<axum::response::Response, ProxyError> {
     let status = response.status();
 
+    log::info!(
+        "[Codex←Claude] ◀ Anthropic response received: http_status={}, is_stream={}, is_sse={}",
+        status.as_u16(), is_stream, response.is_sse(),
+    );
+
     if !status.is_success() {
         return convert_anthropic_error_to_responses(response, ctx, status).await;
     }
@@ -1063,11 +1088,32 @@ async fn convert_anthropic_response_to_responses(
         ProxyError::TransformError(format!("Failed to parse upstream response: {e}"))
     })?;
 
+    log::debug!(
+        "[Codex←Claude] ◀ Anthropic response: status={}, stop_reason={}, content_blocks={}",
+        anthropic_response.get("stop_reason").and_then(|s| s.as_str()).unwrap_or("(none)"),
+        anthropic_response.get("stop_reason").and_then(|s| s.as_str()).unwrap_or("(none)"),
+        anthropic_response.get("content").and_then(|c| c.as_array()).map(|a| a.len()).unwrap_or(0),
+    );
+    log::trace!(
+        "[Codex←Claude] ◀ Anthropic response body: {}",
+        truncate_json_for_log(&anthropic_response, 3000),
+    );
+
     let responses_body =
         transform_responses::anthropic_response_to_responses(anthropic_response).map_err(|e| {
             log::error!("[Codex←Claude] Response conversion failed: {e}");
             e
         })?;
+
+    log::debug!(
+        "[Codex←Claude] ◀ Responses output: status={}, output_items={}",
+        responses_body.get("status").and_then(|s| s.as_str()).unwrap_or("(none)"),
+        responses_body.get("output").and_then(|o| o.as_array()).map(|a| a.len()).unwrap_or(0),
+    );
+    log::trace!(
+        "[Codex←Claude] ◀ Responses output body: {}",
+        truncate_json_for_log(&responses_body, 3000),
+    );
 
     strip_entity_headers_for_rebuilt_body(&mut response_headers);
     strip_hop_by_hop_response_headers(&mut response_headers);
@@ -2038,6 +2084,15 @@ fn body_snippet(body: &str, max_chars: usize) -> String {
         snippet.push('…');
     }
     snippet
+}
+
+fn truncate_json_for_log(value: &Value, max_chars: usize) -> String {
+    let s = serde_json::to_string(value).unwrap_or_else(|_| format!("{value:?}"));
+    if s.len() <= max_chars {
+        s
+    } else {
+        format!("{}…(truncated, total {} bytes)", &s[..max_chars], s.len())
+    }
 }
 
 /// 解析单个 SSE 块的 event 名与 data 负载（多行 data 按规范以 \n 连接）。

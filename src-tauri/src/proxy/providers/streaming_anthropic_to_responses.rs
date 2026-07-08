@@ -42,14 +42,14 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
         let mut model = String::new();
         let mut output_index: u32 = 0;
         let mut _has_function_call = false;
-        // Track open blocks by their Anthropic index
         let mut open_blocks: HashMap<u32, BlockKind> = HashMap::new();
-        // Map Anthropic content block index → Responses output_index
         let mut block_to_output: HashMap<u32, u32> = HashMap::new();
-        // Track text content_index within current message output item
         let mut text_content_index: u32 = 0;
-        // Output index of the current message item (for text content)
         let mut message_output_index: Option<u32> = None;
+        let mut event_count: u32 = 0;
+        let mut emitted_count: u32 = 0;
+
+        log::info!("[Codex←Claude] ▶ Starting Anthropic→Responses SSE stream conversion");
 
         tokio::pin!(stream);
 
@@ -86,7 +86,8 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                             Err(_) => continue,
                         };
 
-                        log::debug!("[Codex←Claude] <<< Anthropic SSE: {event_name}");
+                        log::debug!("[Codex←Claude] <<< Anthropic SSE #{event_count}: {event_name}");
+                        event_count += 1;
 
                         match event_name {
                             // ================================================
@@ -131,6 +132,11 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                     let sse = format!(
                                         "event: response.created\ndata: {}\n\n",
                                         serde_json::to_string(&event).unwrap_or_default()
+                                    );
+                                    emitted_count += 1;
+                                    log::info!(
+                                        "[Codex←Claude] >>> Responses SSE: response.created (id={}, model={})",
+                                        &response_id, &model,
                                     );
                                     yield Ok(Bytes::from(sse));
                                 }
@@ -466,6 +472,11 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                                     "event: response.completed\ndata: {}\n\n",
                                     serde_json::to_string(&completed).unwrap_or_default()
                                 );
+                                emitted_count += 1;
+                                log::info!(
+                                    "[Codex←Claude] >>> Responses SSE: response.completed (status={}, anthropic_events={}, responses_events={}, usage={}in/{}out)",
+                                    status, event_count, emitted_count, input_tokens, output_tokens,
+                                );
                                 yield Ok(Bytes::from(sse));
                             }
 
@@ -501,6 +512,10 @@ pub fn create_responses_sse_stream_from_anthropic<E: std::error::Error + Send + 
                 }
             }
         }
+
+        log::info!(
+            "[Codex←Claude] ◀ Stream ended: anthropic_events={event_count}, responses_events={emitted_count}, response_id={response_id}",
+        );
     }
 }
 
