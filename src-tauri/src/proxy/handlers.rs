@@ -794,7 +794,7 @@ pub async fn handle_responses(
     {
         Ok(result) => result,
         Err(mut err) => {
-            if is_fallback && is_provider_down_error(&err.error) {
+            if is_fallback {
                 let (fb_body, fb_headers, fb_extensions, fb_method) = fallback_snapshot.unwrap();
                 log::info!(
                     "[Codex→Claude] ▶ Codex forward failed ({}), falling back to Claude pipeline",
@@ -918,7 +918,7 @@ pub async fn handle_responses_compact(
     {
         Ok(result) => result,
         Err(mut err) => {
-            if is_fallback && is_provider_down_error(&err.error) {
+            if is_fallback {
                 let (fb_body, fb_headers, fb_extensions, fb_method) = fallback_snapshot.unwrap();
                 log::info!(
                     "[Codex→Claude] ▶ Codex forward failed ({}), falling back to Claude pipeline (compact)",
