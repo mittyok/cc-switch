@@ -1850,7 +1850,11 @@ fn is_provider_down_error(error: &ProxyError) -> bool {
             | ProxyError::NoProvidersConfigured
             | ProxyError::NoAvailableProvider
             | ProxyError::MaxRetriesExceeded
-    )
+            | ProxyError::ForwardFailed(_)
+            | ProxyError::Timeout(_)
+            | ProxyError::StreamIdleTimeout(_)
+            | ProxyError::ProviderUnhealthy(_)
+    ) || matches!(error, ProxyError::UpstreamError { status, .. } if *status == 429 || *status >= 500)
 }
 
 fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
