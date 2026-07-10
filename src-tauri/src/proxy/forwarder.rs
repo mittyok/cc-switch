@@ -1880,7 +1880,7 @@ impl RequestForwarder {
             .get("model")
             .and_then(|v| v.as_str())
             .unwrap_or("<none>");
-        log::info!("[{tag}] >>> 请求 URL: {url} (model={request_model})");
+        log::info!("[{tag}] >>> 请求 URL: {url} (provider={}, model={request_model})", provider.name);
         if log::log_enabled!(log::Level::Debug) {
             if let Ok(body_str) = serde_json::to_string(&filtered_body) {
                 log::debug!(
