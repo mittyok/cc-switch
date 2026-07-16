@@ -10,7 +10,7 @@
 use super::{
     content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
     error_mapper::{get_error_message, map_proxy_error_to_status},
-    forwarder::ActiveConnectionGuard,
+    forwarder::{ActiveConnectionGuard, ForwardResult},
     handler_config::{
         claude_stream_usage_event_filter, codex_stream_usage_event_filter, CLAUDE_PARSER_CONFIG,
         CODEX_PARSER_CONFIG, GEMINI_PARSER_CONFIG, OPENAI_PARSER_CONFIG,
@@ -780,7 +780,7 @@ pub async fn handle_responses(
     let codex_tool_context = transform_codex_chat::build_codex_tool_context_from_request(&body);
 
     let forwarder = ctx.create_forwarder(&state);
-    let mut result = match forwarder
+    let result = match forwarder
         .forward_with_retry(
             &AppType::Codex,
             method,
@@ -800,10 +800,92 @@ pub async fn handle_responses(
                     "[Codex→Claude] ▶ Codex forward failed ({}), falling back to Claude pipeline",
                     &err.error
                 );
-                return handle_responses_via_claude_pipeline(
-                    state, fb_body, fb_headers, fb_extensions, fb_method, &uri,
+
+                // Clone snapshot for potential Codex retry after Claude fails
+                let retry_snapshot = (
+                    fb_body.clone(),
+                    fb_headers.clone(),
+                    fb_extensions.clone(),
+                    fb_method.clone(),
+                );
+
+                let claude_result = handle_responses_via_claude_pipeline(
+                    state.clone(),
+                    fb_body,
+                    fb_headers,
+                    fb_extensions,
+                    fb_method,
+                    &uri,
                 )
                 .await;
+
+                let should_retry_codex = match &claude_result {
+                    Ok(response) => is_retryable_response_status(response.status()),
+                    Err(e) => is_provider_down_error(e),
+                };
+
+                if !should_retry_codex {
+                    return claude_result;
+                }
+
+                log::info!(
+                    "[Codex→Claude→Codex] Claude pipeline also failed with retryable error, retrying Codex"
+                );
+                let (retry_body, retry_headers, retry_extensions, retry_method) = retry_snapshot;
+
+                let mut retry_ctx = match RequestContext::new(
+                    &state,
+                    &retry_body,
+                    &retry_headers,
+                    AppType::Codex,
+                    "Codex",
+                    "codex",
+                )
+                .await
+                {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        log::warn!(
+                            "[Codex→Claude→Codex] Codex providers still unavailable: {}",
+                            e
+                        );
+                        return claude_result;
+                    }
+                };
+
+                let retry_endpoint = endpoint_with_query(&uri, "/responses");
+                let retry_forwarder = retry_ctx.create_forwarder(&state);
+                return match retry_forwarder
+                    .forward_with_retry(
+                        &AppType::Codex,
+                        retry_method,
+                        &retry_endpoint,
+                        retry_body,
+                        retry_headers,
+                        retry_extensions,
+                        retry_ctx.get_providers(),
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        finalize_codex_forward_result(
+                            result,
+                            &mut retry_ctx,
+                            &state,
+                            &retry_endpoint,
+                            is_stream,
+                            codex_tool_context,
+                        )
+                        .await
+                    }
+                    Err(retry_err) => {
+                        log::warn!(
+                            "[Codex→Claude→Codex] Codex retry also failed: {}",
+                            &retry_err.error
+                        );
+                        claude_result
+                    }
+                };
             }
             if let Some(provider) = err.provider.take() {
                 ctx.provider = provider;
@@ -813,16 +895,27 @@ pub async fn handle_responses(
         }
     };
 
+    finalize_codex_forward_result(result, &mut ctx, &state, &endpoint, is_stream, codex_tool_context).await
+}
+
+async fn finalize_codex_forward_result(
+    mut result: ForwardResult,
+    ctx: &mut RequestContext,
+    state: &ProxyState,
+    endpoint: &str,
+    is_stream: bool,
+    codex_tool_context: transform_codex_chat::CodexToolContext,
+) -> Result<axum::response::Response, ProxyError> {
     let connection_guard = result.connection_guard.take();
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
     let response = result.response;
 
-    if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, &endpoint) {
+    if super::providers::should_convert_codex_responses_to_chat(&ctx.provider, endpoint) {
         return handle_codex_chat_to_responses_transform(
             response,
-            &ctx,
-            &state,
+            ctx,
+            state,
             is_stream,
             connection_guard,
             codex_tool_context,
@@ -832,8 +925,8 @@ pub async fn handle_responses(
 
     process_response(
         response,
-        &ctx,
-        &state,
+        ctx,
+        state,
         &CODEX_PARSER_CONFIG,
         connection_guard,
     )
@@ -1855,6 +1948,10 @@ fn is_provider_down_error(error: &ProxyError) -> bool {
             | ProxyError::StreamIdleTimeout(_)
             | ProxyError::ProviderUnhealthy(_)
     ) || matches!(error, ProxyError::UpstreamError { status, .. } if *status == 429 || *status >= 500)
+}
+
+fn is_retryable_response_status(status: axum::http::StatusCode) -> bool {
+    status == axum::http::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
 fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
