@@ -813,6 +813,29 @@ fn parent_signatures_before(
     }
 
     if max_timestamp.is_none_or(|timestamp| timestamp < cutoff) {
+        // 父文件 mtime 超过 5 分钟未变化 → 视为静态文件，不再增长。
+        // 接受已收集的 signatures（可能不完整），避免无限重试。
+        let parent_is_static = fs::metadata(parent_path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|mtime| SystemTime::now().duration_since(mtime).ok())
+            .is_some_and(|age| age.as_secs() >= 300);
+
+        if parent_is_static {
+            log::info!(
+                "[CODEX-SYNC] 父 rollout {} max_ts < cutoff 但文件已静止, \
+                 以 best-effort 模式继续 (收集到 {} 条 signature)",
+                parent_path.display(),
+                signatures.len()
+            );
+            if let Ok(mut caches) = replay_caches().lock() {
+                caches
+                    .parent_signatures
+                    .insert(cache_key, signatures.clone());
+            }
+            return Ok(signatures);
+        }
+
         return Err(format!(
             "父 rollout {} 尚未写到 child fork 时刻",
             parent_path.display()
@@ -1994,6 +2017,58 @@ mod tests {
         );
         // prefix + compact date
         assert_eq!(normalize_codex_model("openai/gpt-5.4-20260305"), "gpt-5.4");
+    }
+
+    #[test]
+    fn test_static_parent_incomplete_timestamp_uses_best_effort() -> Result<(), AppError> {
+        // 父文件 max_timestamp < child cutoff，但父文件已经是静态的（mtime 远在过去），
+        // 应走 best-effort 路径而非无限 defer。
+        clear_codex_replay_caches();
+        let db = Database::memory()?;
+        let temp = tempdir().unwrap();
+        let parent = rollout_path(temp.path(), PARENT_ID);
+        let child = rollout_path(temp.path(), CHILD_A_ID);
+
+        // 父文件只有 03:00:01 的事件，没有覆盖到 child fork 时刻 03:00:05
+        write_jsonl(
+            &parent,
+            &[
+                session_meta(PARENT_ID),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:01Z"),
+            ],
+        );
+        write_jsonl(
+            &child,
+            &[
+                session_meta_at(CHILD_A_ID, Some(PARENT_ID), None, "2026-07-10T03:00:05Z"),
+                token_count_at(100, 50, 10, "2026-07-10T03:00:06Z"),
+                token_count_at(200, 100, 20, "2026-07-10T03:00:07Z"),
+            ],
+        );
+
+        // 第一次 sync：父文件 mtime 是刚写入的（age < 300s），应 defer
+        let result = sync_test_file(&db, &child, &[&parent, &child])?;
+        assert!(result.deferred, "fresh parent should defer");
+
+        // 将父文件 mtime 设为 10 分钟前，模拟静态归档文件
+        let old_time = SystemTime::now() - std::time::Duration::from_secs(600);
+        fs::File::options()
+            .write(true)
+            .open(&parent)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+
+        // 清除 replay cache 中的 pending entry（模拟下一个 sync 周期）
+        clear_codex_replay_caches();
+
+        // 第二次 sync：父文件已静态，应 best-effort 成功
+        let result = sync_test_file(&db, &child, &[&parent, &child])?;
+        assert!(!result.deferred, "static parent should succeed via best-effort");
+        // child 的 token_count 签名与 parent 的第一条匹配 → replay_prefix=1
+        // 所以只导入第二条 (delta: 200-100=100, 100-50=50, 20-10=10)
+        assert_eq!(result.imported, 1);
+        Ok(())
     }
 
     #[test]
