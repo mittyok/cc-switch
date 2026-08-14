@@ -1415,7 +1415,12 @@ async fn handle_responses_via_claude_pipeline(
     }
 
     // 4. Convert response back to Responses format
-    let adapter = get_adapter(&AppType::Claude);
+    let adapter = get_adapter(&AppType::Claude).ok_or_else(|| {
+        ProxyError::ConfigError(format!(
+            "{} does not support proxy routing",
+            AppType::Claude.as_str()
+        ))
+    })?;
     let needs_transform = adapter.needs_transform(&ctx.provider);
 
     if needs_transform {
