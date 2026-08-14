@@ -87,6 +87,17 @@ impl Provider {
             || self.claude_base_url_contains("chatgpt.com/backend-api/codex")
     }
 
+    /// Whether the provider form's "auth field" was explicitly set to
+    /// ANTHROPIC_API_KEY. The form only persists `meta.apiKeyField` for the
+    /// non-default choice, so `None` means the default ANTHROPIC_AUTH_TOKEN.
+    pub fn claude_uses_api_key_field(&self) -> bool {
+        self.meta
+            .as_ref()
+            .and_then(|m| m.api_key_field.as_deref())
+            .map(|field| field.eq_ignore_ascii_case("ANTHROPIC_API_KEY"))
+            .unwrap_or(false)
+    }
+
     fn provider_type(&self) -> Option<&str> {
         self.meta.as_ref().and_then(|m| m.provider_type.as_deref())
     }
@@ -194,6 +205,11 @@ impl Provider {
             // OpenClaw (openclaw.json) flattens credentials at the top level, camelCase.
             AppType::OpenClaw => (
                 str_at(settings.get("baseUrl")),
+                str_at(settings.get("apiKey")),
+            ),
+            // Pi custom providers use the native models.json field names.
+            AppType::Pi => (
+                crate::pi_config::provider_base_url(settings).unwrap_or_default(),
                 str_at(settings.get("apiKey")),
             ),
             // OpenCode (OMO) nests credentials under `options` (the SDK options object).
@@ -1514,6 +1530,25 @@ mod tests {
             (
                 "https://api.deepseek.com".to_string(),
                 "sk-openclaw".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn resolve_credentials_pi_uses_native_model_level_base_url() {
+        let p = provider_with(json!({
+            "apiKey": "sk-pi",
+            "models": [{
+                "id": "model-a",
+                "api": "openai-completions",
+                "baseUrl": "https://api.example.com/v1/"
+            }]
+        }));
+        assert_eq!(
+            p.resolve_usage_credentials(&AppType::Pi),
+            (
+                "https://api.example.com/v1".to_string(),
+                "sk-pi".to_string()
             )
         );
     }
