@@ -142,7 +142,10 @@ export type CodexChatEffortValueMode =
   | "low_high"
   | "deepseek"
   // OpenRouter effort 枚举 xhigh|high|medium|low|minimal（无 max，max 钳到 xhigh）
-  | "openrouter";
+  | "openrouter"
+  // OpenCode Zen 网关：合法档位逐模型，见 modelCatalog 各条目 reasoningLevels
+  // （镜像 models.dev）；代理转换层按请求模型查表钳制，无表不发 effort 字段
+  | "zen";
 
 export type CodexChatReasoningOutputFormat =
   | "auto"
@@ -271,6 +274,14 @@ export interface CodexCatalogModel {
   // Codex requires this field in every catalog entry; when omitted the backend
   // falls back to a neutral default. e.g. MiMo "developed by Xiaomi".
   baseInstructions?: string;
+  // Per-model reasoning effort levels exposed in the generated Codex catalog
+  // (e.g. ["none", "low", "medium", "high", "xhigh", "max"]). When omitted the
+  // backend keeps the template's conservative none/high default.
+  reasoningLevels?: string[];
+  // Per-model default reasoning effort. Only meaningful together with
+  // reasoningLevels; when omitted the backend keeps the template default if it
+  // is still in the list, otherwise the highest declared level.
+  defaultReasoningLevel?: string;
 }
 
 // Claude 认证字段类型
