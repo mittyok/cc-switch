@@ -26,6 +26,11 @@ const ANTHROPIC_REDACTED_THINKING_PLACEHOLDER: &str = "[redacted thinking]";
 // require thinking replay on tool-call turns, and injected placeholders
 // disrupt the model's chain of thought. Do not re-add without re-confirming.
 const REASONING_VENDOR_HINTS: &[&str] = &["deepseek", "mimo", "xiaomimimo"];
+// Bedrock-compatible Anthropic gateways reject Anthropic first-party beta-only
+// request fields (for example `context_management`) and mid-conversation
+// `role=system` messages. Keep this list conservative: an over-broad match would
+// silently weaken requests for gateways that intentionally support those fields.
+const BEDROCK_COMPAT_ANTHROPIC_HOST_HINTS: &[&str] = &["ai-api.jdcloud.com"];
 
 // ChatGPT Codex 后端按 originator+version 组合做模型 cohort 路由：非官方身份会把
 // gpt-5.6-luna 解析到未部署的内部引擎（HTTP 404 Model not found，openai/codex#31967，
@@ -243,7 +248,142 @@ pub fn normalize_anthropic_messages_for_provider(
     let mut changed =
         normalize_anthropic_tool_thinking_history_for_provider(body, provider, api_format);
     changed |= normalize_deepseek_thinking_disabled_strip_effort(body, provider);
+    changed |= normalize_bedrock_compatible_anthropic_request(body, provider);
     changed
+}
+
+fn normalize_bedrock_compatible_anthropic_request(body: &mut Value, provider: &Provider) -> bool {
+    if !is_bedrock_compatible_anthropic_provider(provider) {
+        return false;
+    }
+
+    let Some(body_obj) = body.as_object_mut() else {
+        return false;
+    };
+
+    let removed_context_management = body_obj.remove("context_management").is_some();
+    let mut hoisted_system_messages = 0usize;
+    let mut unsupported_system_messages = 0usize;
+    let mut system_texts = Vec::new();
+
+    if let Some(messages) = body_obj.get_mut("messages").and_then(Value::as_array_mut) {
+        let mut retained_messages = Vec::with_capacity(messages.len());
+        for message in std::mem::take(messages) {
+            if message.get("role").and_then(Value::as_str) == Some("system") {
+                let before = system_texts.len();
+                if let Some(content) = message.get("content") {
+                    collect_anthropic_system_texts(content, &mut system_texts);
+                }
+                if system_texts.len() == before {
+                    unsupported_system_messages += 1;
+                }
+                hoisted_system_messages += 1;
+            } else {
+                retained_messages.push(message);
+            }
+        }
+        *messages = retained_messages;
+    }
+
+    if !system_texts.is_empty() {
+        let mut merged_system_texts = Vec::new();
+        if let Some(existing_system) = body_obj.get("system") {
+            collect_anthropic_system_texts(existing_system, &mut merged_system_texts);
+            if merged_system_texts.is_empty() && !existing_system.is_null() {
+                log::debug!(
+                    "[Claude] Bedrock-compatible sanitizer could not preserve unsupported top-level system shape: provider={}",
+                    provider.id
+                );
+            }
+        }
+        merged_system_texts.extend(system_texts);
+        body_obj.insert(
+            "system".to_string(),
+            Value::String(merged_system_texts.join("\n\n")),
+        );
+    }
+
+    let changed = removed_context_management || hoisted_system_messages > 0;
+    if changed {
+        log::info!(
+            "[Claude] Applied Bedrock-compatible Anthropic request sanitization: provider={} name={} removed_context_management={} hoisted_system_messages={} unsupported_system_messages={}",
+            provider.id,
+            provider.name,
+            removed_context_management,
+            hoisted_system_messages,
+            unsupported_system_messages
+        );
+    }
+    changed
+}
+
+fn is_bedrock_compatible_anthropic_provider(provider: &Provider) -> bool {
+    let settings = &provider.settings_config;
+    let base_urls = [
+        settings
+            .get("env")
+            .and_then(|env| env.get("ANTHROPIC_BASE_URL"))
+            .and_then(Value::as_str),
+        settings.get("base_url").and_then(Value::as_str),
+        settings.get("baseURL").and_then(Value::as_str),
+        settings.get("apiEndpoint").and_then(Value::as_str),
+    ];
+
+    if base_urls
+        .iter()
+        .flatten()
+        .any(|url| url.to_ascii_lowercase().contains("api.anthropic.com"))
+    {
+        return false;
+    }
+
+    if settings
+        .get("env")
+        .and_then(|env| env.get("CLAUDE_CODE_USE_BEDROCK"))
+        .is_some_and(is_truthy_bedrock_flag)
+    {
+        return true;
+    }
+
+    base_urls.iter().flatten().any(|url| {
+        let url = url.to_ascii_lowercase();
+        BEDROCK_COMPAT_ANTHROPIC_HOST_HINTS
+            .iter()
+            .any(|host| url.contains(host))
+    })
+}
+
+fn is_truthy_bedrock_flag(value: &Value) -> bool {
+    match value {
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_i64() == Some(1),
+        Value::String(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        _ => false,
+    }
+}
+
+fn collect_anthropic_system_texts(value: &Value, texts: &mut Vec<String>) {
+    if let Some(text) = value.as_str() {
+        if !text.trim().is_empty() {
+            texts.push(text.to_string());
+        }
+        return;
+    }
+
+    let Some(blocks) = value.as_array() else {
+        return;
+    };
+
+    texts.extend(
+        blocks
+            .iter()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .filter(|text| !text.trim().is_empty())
+            .map(ToString::to_string),
+    );
 }
 
 fn normalize_anthropic_tool_thinking_history(body: &mut Value) -> bool {
@@ -2314,6 +2454,98 @@ mod tests {
         assert!(!changed);
         assert!(body.get("system").is_none());
         assert_eq!(body["messages"][0]["role"], "system");
+    }
+
+    #[test]
+    fn test_jdcloud_bedrock_sanitizes_context_management_and_system_role_messages() {
+        let provider = create_provider(json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "http://ai-api.jdcloud.com/anthropic/v1/messages",
+                "ANTHROPIC_AUTH_TOKEN": "test-key"
+            }
+        }));
+        let mut body = json!({
+            "system": "Existing top-level system.",
+            "context_management": {
+                "edits": [{ "type": "compact_20260112" }]
+            },
+            "model": "Claude-Opus-4.6",
+            "messages": [
+                { "role": "system", "content": "Message system one." },
+                { "role": "user", "content": "hello" },
+                {
+                    "role": "system",
+                    "content": [{ "type": "text", "text": "Message system two." }]
+                },
+                { "role": "assistant", "content": "hi" }
+            ]
+        });
+
+        let changed = normalize_anthropic_messages_for_provider(&mut body, &provider, "anthropic");
+
+        assert!(changed);
+        assert!(body.get("context_management").is_none());
+        assert_eq!(
+            body["system"],
+            "Existing top-level system.\n\nMessage system one.\n\nMessage system two."
+        );
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "hello");
+        assert_eq!(messages[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn test_first_party_anthropic_keeps_context_management_and_system_role_messages() {
+        let provider = create_provider(json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+                "ANTHROPIC_API_KEY": "test-key"
+            }
+        }));
+        let mut body = json!({
+            "context_management": {
+                "edits": [{ "type": "compact_20260112" }]
+            },
+            "model": "claude-opus-4-8",
+            "messages": [
+                { "role": "system", "content": "Keep in messages." },
+                { "role": "user", "content": "hello" }
+            ]
+        });
+        let original = body.clone();
+
+        let changed = normalize_anthropic_messages_for_provider(&mut body, &provider, "anthropic");
+
+        assert!(!changed);
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn test_explicit_bedrock_flag_sanitizes_anthropic_request() {
+        let provider = create_provider(json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://example.com/anthropic/v1/messages",
+                "ANTHROPIC_API_KEY": "test-key",
+                "CLAUDE_CODE_USE_BEDROCK": "1"
+            }
+        }));
+        let mut body = json!({
+            "context_management": { "edits": [] },
+            "messages": [
+                { "role": "system", "content": "System from history." },
+                { "role": "user", "content": "hello" }
+            ]
+        });
+
+        let changed = normalize_anthropic_messages_for_provider(&mut body, &provider, "anthropic");
+
+        assert!(changed);
+        assert!(body.get("context_management").is_none());
+        assert_eq!(body["system"], "System from history.");
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(body["messages"][0]["role"], "user");
     }
 
     #[test]
