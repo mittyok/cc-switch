@@ -619,6 +619,67 @@ pub(crate) fn synthesize_missing_chat_tool_results(messages: &mut Vec<Value>) {
 
         i = insert_at;
     }
+
+    // Second pass: drop orphan tool messages whose tool_call_id is not claimed
+    // by the immediately preceding assistant's tool_calls. This happens when
+    // the first pass synthesized a placeholder and the original (real) tool
+    // result remains elsewhere in the array — the upstream rejects the stray
+    // tool message with "must be a response to a preceding message with
+    // 'tool_calls'".
+    drop_orphan_chat_tool_messages(messages);
+}
+
+/// Remove `role: "tool"` messages whose `tool_call_id` does not appear in the
+/// `tool_calls` array of the nearest preceding `role: "assistant"` message.
+fn drop_orphan_chat_tool_messages(messages: &mut Vec<Value>) {
+    // Collect the set of tool_call IDs claimed by each assistant turn. A tool
+    // message is "claimed" if the nearest preceding assistant turn contains its
+    // tool_call_id.
+    let mut current_assistant_ids: HashSet<String> = HashSet::new();
+    let mut to_remove = Vec::new();
+
+    for (idx, message) in messages.iter().enumerate() {
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+        match role {
+            "assistant" => {
+                current_assistant_ids.clear();
+                if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+                    for tc in tool_calls {
+                        if let Some(id) = tc.get("id").and_then(Value::as_str) {
+                            current_assistant_ids.insert(id.to_string());
+                        }
+                    }
+                }
+            }
+            "tool" => {
+                let tool_call_id = message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if !current_assistant_ids.contains(tool_call_id) {
+                    to_remove.push(idx);
+                } else {
+                    // Consumed — remove from set so duplicates are also caught
+                    current_assistant_ids.remove(tool_call_id);
+                }
+            }
+            _ => {
+                // Non-assistant, non-tool message resets the pairing context
+                current_assistant_ids.clear();
+            }
+        }
+    }
+
+    if !to_remove.is_empty() {
+        log::warn!(
+            "[Responses→Chat] Dropping {} orphan tool message(s) with no matching assistant tool_call",
+            to_remove.len()
+        );
+        // Remove in reverse order to preserve indices
+        for idx in to_remove.into_iter().rev() {
+            messages.remove(idx);
+        }
+    }
 }
 
 /// MiniMax 严格要求 messages 中只能首条出现 `role=system`，
@@ -4207,23 +4268,40 @@ mod tests {
             assert_eq!(result["messages"][1]["content"], expected);
         }
 
-        for item in [
-            json!({
-                "type": "custom_tool_call_output",
-                "call_id": "call_custom",
-                "status": "completed",
-                "output": {"text": "unchanged"}
-            }),
-            json!({
-                "type": "tool_search_output",
-                "call_id": "call_search",
-                "status": "completed",
-                "output": []
-            }),
+        for (call_item, output_item) in [
+            (
+                json!({
+                    "type": "custom_tool_call",
+                    "call_id": "call_custom",
+                    "name": "custom_tool",
+                    "status": "completed"
+                }),
+                json!({
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_custom",
+                    "status": "completed",
+                    "output": {"text": "unchanged"}
+                }),
+            ),
+            (
+                json!({
+                    "type": "tool_search_call",
+                    "call_id": "call_search",
+                    "name": "tool_search",
+                    "status": "completed",
+                    "arguments": "{}"
+                }),
+                json!({
+                    "type": "tool_search_output",
+                    "call_id": "call_search",
+                    "status": "completed",
+                    "output": []
+                }),
+            ),
         ] {
-            let expected = canonical_json_string(&item);
-            let result = convert_test_input(vec![item]);
-            assert_eq!(result["messages"][0]["content"], expected);
+            let expected = canonical_json_string(&output_item);
+            let result = convert_test_input(vec![call_item, output_item]);
+            assert_eq!(result["messages"][1]["content"], expected);
         }
     }
 
@@ -4244,22 +4322,25 @@ mod tests {
 
         // The unknown `future_metadata` item triggers a batch flush, splitting
         // call_1 and call_2 into separate assistant messages. The post-conversion
-        // `synthesize_missing_chat_tool_results` pass then inserts a synthetic
-        // tool result for call_1 (whose real output appears later, after the
-        // call_2 assistant turn) to satisfy the OpenAI requirement that every
-        // assistant tool_call is immediately followed by its tool response.
+        // sanitization pass then:
+        //   1. Synthesizes a tool result for call_1 (whose real output appeared
+        //      after the call_2 assistant turn).
+        //   2. Drops the original orphan tool(call_1) that followed assistant(call_2)
+        //      since it's no longer paired with any assistant tool_call.
         assert_eq!(
             message_roles(&result),
-            vec!["assistant", "tool", "assistant", "tool", "tool"]
+            vec!["assistant", "tool", "assistant", "tool"]
         );
         assert_eq!(messages[0]["tool_calls"].as_array().unwrap().len(), 1);
         assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
         assert_eq!(messages[0]["reasoning_content"], "tool call");
-        // Synthetic tool result for call_1 inserted by synthesize
+        // Synthetic tool result for call_1
         assert_eq!(messages[1]["tool_call_id"], "call_1");
         assert_eq!(messages[2]["tool_calls"].as_array().unwrap().len(), 1);
         assert_eq!(messages[2]["tool_calls"][0]["id"], "call_2");
         assert_eq!(messages[2]["reasoning_content"], "second batch reasoning");
+        // Real tool result for call_2
+        assert_eq!(messages[3]["tool_call_id"], "call_2");
     }
 
     #[test]
