@@ -154,10 +154,16 @@ impl ProxyServer {
 
                         let app = app.clone();
                         tokio::spawn(async move {
+                            // 禁用 Nagle 算法：SSE 流式响应的小 chunk（单个 token ~10-50 bytes）
+                            // 会被 Nagle 缓冲 0-40ms 才发出，导致感知"卡顿"。
+                            if let Err(e) = stream.set_nodelay(true) {
+                                log::debug!("[ProxyServer] set_nodelay failed (non-fatal): {e}");
+                            }
+
                             // Peek raw TCP bytes to capture original header casing
                             // before hyper parses (and lowercases) the header names.
                             let original_cases = {
-                                let mut peek_buf = vec![0u8; 8192];
+                                let mut peek_buf = [0u8; 8192]; // 栈分配避免每连接堆分配
                                 match stream.peek(&mut peek_buf).await {
                                     Ok(n) => {
                                         let cases = super::hyper_client::OriginalHeaderCases::from_raw_bytes(&peek_buf[..n]);

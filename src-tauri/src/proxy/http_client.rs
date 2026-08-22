@@ -219,6 +219,8 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
         .connect_timeout(Duration::from_secs(30))
         .pool_max_idle_per_host(10)
         .tcp_keepalive(Duration::from_secs(60))
+        // TCP_NODELAY: 禁用 Nagle 算法，避免 SSE 小 chunk 被缓冲导致流式延迟
+        .tcp_nodelay(true)
         // 禁用 reqwest 自动解压：防止 reqwest 覆盖客户端原始 accept-encoding header。
         // 响应解压由 response_processor 根据 content-encoding 手动处理。
         .no_gzip()
