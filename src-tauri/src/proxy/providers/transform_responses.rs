@@ -2819,6 +2819,7 @@ pub fn responses_request_to_anthropic(body: Value) -> Result<Value, ProxyError> 
             Value::Array(items) => convert_input_to_messages(items)?,
             _ => Vec::new(),
         };
+        synthesize_missing_anthropic_tool_results(&mut messages);
 
         // Strip trailing assistant message to avoid unintentional prefill.
         // Some providers/accounts reject prefill; the trailing assistant
@@ -2923,6 +2924,135 @@ fn map_tool_choice_to_anthropic(tool_choice: &Value) -> Value {
     }
 }
 
+const SYNTHETIC_TOOL_RESULT_UNAVAILABLE: &str =
+    "Tool result unavailable: the original tool output is missing from the recovered Codex history.";
+
+fn synthesize_missing_anthropic_tool_results(messages: &mut Vec<Value>) {
+    let mut i = 0;
+    while i < messages.len() {
+        if messages[i].get("role").and_then(Value::as_str) != Some("assistant") {
+            i += 1;
+            continue;
+        }
+
+        let expected: Vec<String> = messages[i]
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+            .filter_map(|block| block.get("id").and_then(Value::as_str))
+            .filter(|id| !id.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        if expected.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        let next_is_user = messages
+            .get(i + 1)
+            .and_then(|message| message.get("role"))
+            .and_then(Value::as_str)
+            == Some("user");
+
+        let mut present = HashSet::new();
+        if next_is_user {
+            collect_anthropic_tool_result_ids(&messages[i + 1]["content"], &mut present);
+        }
+
+        let missing: Vec<String> = expected
+            .into_iter()
+            .filter(|id| !present.contains(id))
+            .collect();
+
+        if missing.is_empty() {
+            i += 2;
+            continue;
+        }
+
+        log::warn!(
+            "[Responses→Anthropic] Synthesizing missing tool_results for orphan tool_use ids: {}",
+            missing.join(", ")
+        );
+
+        let mut synthetic_blocks: Vec<Value> = missing
+            .into_iter()
+            .map(|id| {
+                json!({
+                    "type": "tool_result",
+                    "tool_use_id": id,
+                    "content": SYNTHETIC_TOOL_RESULT_UNAVAILABLE
+                })
+            })
+            .collect();
+
+        if next_is_user {
+            let original_content = messages[i + 1].get_mut("content");
+            match original_content {
+                Some(Value::Array(blocks)) => {
+                    synthetic_blocks.append(blocks);
+                    *blocks = synthetic_blocks;
+                }
+                Some(Value::String(text)) => {
+                    let text = std::mem::take(text);
+                    synthetic_blocks.push(json!({"type": "text", "text": text}));
+                    messages[i + 1]["content"] = Value::Array(synthetic_blocks);
+                }
+                Some(Value::Null) | None => {
+                    messages[i + 1]["content"] = Value::Array(synthetic_blocks);
+                }
+                Some(other) => {
+                    let original = other.take();
+                    synthetic_blocks
+                        .push(json!({"type": "text", "text": canonical_json_string(&original)}));
+                    messages[i + 1]["content"] = Value::Array(synthetic_blocks);
+                }
+            }
+            i += 2;
+        } else {
+            messages.insert(
+                i + 1,
+                json!({
+                    "role": "user",
+                    "content": synthetic_blocks
+                }),
+            );
+            i += 2;
+        }
+    }
+}
+
+fn collect_anthropic_tool_result_ids(content: &Value, ids: &mut HashSet<String>) {
+    match content {
+        Value::Array(blocks) => {
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+                    if let Some(id) = block
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                    {
+                        ids.insert(id.to_string());
+                    }
+                }
+            }
+        }
+        Value::Object(object)
+            if object.get("type").and_then(Value::as_str) == Some("tool_result") =>
+        {
+            if let Some(id) = object
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
+                ids.insert(id.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Convert Responses API `input` array to Anthropic `messages` array.
 ///
 /// Inverse of [`convert_messages_to_input`]. The key difference is that
@@ -2934,6 +3064,24 @@ fn convert_input_to_messages(items: &[Value]) -> Result<Vec<Value>, ProxyError> 
 
     for item in items {
         let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        // Drop incomplete tool calls — they have no corresponding output and
+        // would produce orphan tool_use blocks. Mirrors the filter in
+        // transform_codex_anthropic::convert_input_to_messages.
+        if matches!(
+            item_type,
+            "function_call" | "custom_tool_call" | "tool_search_call"
+        ) && item.get("status").and_then(Value::as_str) == Some("incomplete")
+        {
+            log::debug!(
+                "[Responses→Anthropic] Skipping incomplete tool call: type={}, call_id={}",
+                item_type,
+                item.get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            );
+            continue;
+        }
 
         match item_type {
             "function_call" => {
@@ -2956,10 +3104,7 @@ fn convert_input_to_messages(items: &[Value]) -> Result<Vec<Value>, ProxyError> 
 
             "function_call_output" => {
                 let call_id = item.get("call_id").and_then(|i| i.as_str()).unwrap_or("");
-                let output = item
-                    .get("output")
-                    .and_then(|o| o.as_str())
-                    .unwrap_or("");
+                let output = item.get("output").and_then(|o| o.as_str()).unwrap_or("");
 
                 let block = json!({
                     "type": "tool_result",
@@ -2980,8 +3125,7 @@ fn convert_input_to_messages(items: &[Value]) -> Result<Vec<Value>, ProxyError> 
                 };
                 if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
                     for block in content {
-                        let block_type =
-                            block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
                         match block_type {
                             "input_text" => {
                                 if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
@@ -3079,7 +3223,9 @@ pub fn anthropic_response_to_responses(body: Value) -> Result<Value, ProxyError>
     let content = body
         .get("content")
         .and_then(|c| c.as_array())
-        .ok_or_else(|| ProxyError::TransformError("No content in Anthropic response".to_string()))?;
+        .ok_or_else(|| {
+            ProxyError::TransformError("No content in Anthropic response".to_string())
+        })?;
 
     let mut output: Vec<Value> = Vec::new();
     let mut message_content: Vec<Value> = Vec::new();
@@ -3122,10 +3268,7 @@ pub fn anthropic_response_to_responses(body: Value) -> Result<Value, ProxyError>
             }
 
             "thinking" => {
-                let thinking_text = block
-                    .get("thinking")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or("");
+                let thinking_text = block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
                 if !thinking_text.is_empty() {
                     output.push(json!({
                         "type": "reasoning",
@@ -3156,10 +3299,7 @@ pub fn anthropic_response_to_responses(body: Value) -> Result<Value, ProxyError>
         .and_then(|s| s.as_str())
         .unwrap_or("end_turn");
     let (status, incomplete_details) = match stop_reason {
-        "max_tokens" => (
-            "incomplete",
-            Some(json!({"reason": "max_output_tokens"})),
-        ),
+        "max_tokens" => ("incomplete", Some(json!({"reason": "max_output_tokens"}))),
         _ => ("completed", None),
     };
 
@@ -5876,7 +6016,10 @@ mod tests {
         // user with tool_result
         assert_eq!(result["messages"][2]["role"], "user");
         assert_eq!(result["messages"][2]["content"][0]["type"], "tool_result");
-        assert_eq!(result["messages"][2]["content"][0]["tool_use_id"], "call_123");
+        assert_eq!(
+            result["messages"][2]["content"][0]["tool_use_id"],
+            "call_123"
+        );
     }
 
     #[test]
@@ -5922,7 +6065,10 @@ mod tests {
 
         // "developer" must become "user" — Anthropic only accepts user/assistant
         assert_eq!(result["messages"][0]["role"], "user");
-        assert_eq!(result["messages"][0]["content"][0]["text"], "You are a coding assistant");
+        assert_eq!(
+            result["messages"][0]["content"][0]["text"],
+            "You are a coding assistant"
+        );
         // consecutive user messages should be merged
         assert_eq!(result["messages"][0]["content"][1]["text"], "Hello");
     }
@@ -5965,8 +6111,8 @@ mod tests {
             .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
         let model = std::env::var("ANTHROPIC_TEST_MODEL")
             .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
-        let auth_header = std::env::var("ANTHROPIC_TEST_AUTH_HEADER")
-            .unwrap_or_else(|_| "x-api-key".to_string());
+        let auth_header =
+            std::env::var("ANTHROPIC_TEST_AUTH_HEADER").unwrap_or_else(|_| "x-api-key".to_string());
         (api_key, base_url, model, auth_header)
     }
 
@@ -6118,7 +6264,10 @@ mod tests {
         let responses_result = anthropic_response_to_responses(body).unwrap();
         let output = responses_result["output"].as_array().unwrap();
         let has_function_call = output.iter().any(|item| item["type"] == "function_call");
-        assert!(has_function_call, "Expected function_call in output: {output:?}");
+        assert!(
+            has_function_call,
+            "Expected function_call in output: {output:?}"
+        );
     }
 
     #[tokio::test]
@@ -6148,7 +6297,10 @@ mod tests {
         let status_code = resp.status();
         if !status_code.is_success() {
             let err_body = resp.text().await.unwrap_or_default();
-            panic!("HTTP {status_code}, body: {}", &err_body[..err_body.len().min(500)]);
+            panic!(
+                "HTTP {status_code}, body: {}",
+                &err_body[..err_body.len().min(500)]
+            );
         }
 
         let mut stream = resp.bytes_stream();
@@ -6158,9 +6310,50 @@ mod tests {
             full_sse.push_str(&String::from_utf8_lossy(&bytes));
         }
 
-        assert!(full_sse.contains("event: message_start"), "missing message_start in SSE");
-        assert!(full_sse.contains("event: content_block_delta"), "missing content_block_delta");
-        assert!(full_sse.contains("event: message_stop"), "missing message_stop");
+        assert!(
+            full_sse.contains("event: message_start"),
+            "missing message_start in SSE"
+        );
+        assert!(
+            full_sse.contains("event: content_block_delta"),
+            "missing content_block_delta"
+        );
+        assert!(
+            full_sse.contains("event: message_stop"),
+            "missing message_stop"
+        );
+    }
+
+    #[test]
+    fn test_responses_request_to_anthropic_synthesizes_missing_tool_result_before_user_text() {
+        let input = json!({
+            "model": "gpt-5",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_missing",
+                    "name": "shell",
+                    "arguments": "{}"
+                },
+                {"role":"user","content":"continue"}
+            ]
+        });
+
+        let result = responses_request_to_anthropic(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"][0]["type"], "tool_use");
+        assert_eq!(messages[0]["content"][0]["id"], "call_missing");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[1]["content"][0]["tool_use_id"], "call_missing");
+        assert_eq!(
+            messages[1]["content"][0]["content"],
+            SYNTHETIC_TOOL_RESULT_UNAVAILABLE
+        );
+        assert_eq!(messages[1]["content"][1]["type"], "text");
+        assert_eq!(messages[1]["content"][1]["text"], "continue");
     }
 
     #[test]

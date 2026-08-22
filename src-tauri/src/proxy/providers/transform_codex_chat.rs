@@ -285,7 +285,8 @@ pub fn responses_to_chat_completions_with_reasoning(
     if let Some(input) = body.get("input") {
         append_responses_input_as_chat_messages(input, &mut messages, &tool_context)?;
     }
-    let messages = collapse_system_messages_to_head(messages);
+    let mut messages = collapse_system_messages_to_head(messages);
+    synthesize_missing_chat_tool_results(&mut messages);
     result["messages"] = json!(messages);
 
     let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
@@ -551,6 +552,75 @@ fn zen_effort_rank(effort: &str) -> Option<u8> {
     }
 }
 
+const SYNTHETIC_TOOL_RESULT_UNAVAILABLE: &str =
+    "Tool result unavailable: the original tool output is missing from the recovered Codex history.";
+
+pub(crate) fn synthesize_missing_chat_tool_results(messages: &mut Vec<Value>) {
+    let mut i = 0;
+    while i < messages.len() {
+        let Some(tool_calls) = messages[i].get("tool_calls").and_then(Value::as_array) else {
+            i += 1;
+            continue;
+        };
+        if tool_calls.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        let expected: Vec<String> = tool_calls
+            .iter()
+            .filter_map(|tool_call| tool_call.get("id").and_then(Value::as_str))
+            .filter(|id| !id.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        if expected.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        let mut present = HashSet::new();
+        let mut insert_at = i + 1;
+        while insert_at < messages.len()
+            && messages[insert_at].get("role").and_then(Value::as_str) == Some("tool")
+        {
+            if let Some(id) = messages[insert_at]
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
+                present.insert(id.to_string());
+            }
+            insert_at += 1;
+        }
+
+        let missing: Vec<String> = expected
+            .into_iter()
+            .filter(|id| !present.contains(id))
+            .collect();
+
+        if !missing.is_empty() {
+            log::warn!(
+                "[Responses→Chat] Synthesizing missing tool results for orphan tool_calls: {}",
+                missing.join(", ")
+            );
+        }
+
+        for id in missing {
+            messages.insert(
+                insert_at,
+                json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "content": SYNTHETIC_TOOL_RESULT_UNAVAILABLE
+                }),
+            );
+            insert_at += 1;
+        }
+
+        i = insert_at;
+    }
+}
+
 /// MiniMax 严格要求 messages 中只能首条出现 `role=system`，
 /// 否则返回 `invalid params, chat content has invalid message role: system (2013)`。
 /// 把所有 system 消息合并到首位，避免中间 system（如 Codex 的 `developer` 指令）触发该约束；
@@ -678,6 +748,26 @@ fn append_responses_item_as_chat_message(
     tool_context: &CodexToolContext,
 ) -> Result<(), ProxyError> {
     let item_type = item.get("type").and_then(|v| v.as_str());
+
+    // Drop incomplete tool calls — they have no corresponding output and would
+    // produce orphan tool_calls in the assistant message. Mirrors the filter in
+    // transform_codex_anthropic::convert_input_to_messages.
+    if matches!(
+        item_type,
+        Some("function_call" | "custom_tool_call" | "tool_search_call")
+    ) && item.get("status").and_then(Value::as_str) == Some("incomplete")
+    {
+        log::warn!(
+            "[Responses→Chat] Dropping incomplete historical tool call: type={}, call_id={}",
+            item_type.unwrap_or("unknown"),
+            item.get("call_id")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("id").and_then(Value::as_str))
+                .unwrap_or("")
+        );
+        return Ok(());
+    }
+
     match item_type {
         Some("function_call") => {
             append_unique_pending_reasoning(pending_reasoning, responses_item_reasoning_text(item));
@@ -3607,6 +3697,44 @@ mod tests {
     }
 
     #[test]
+    fn test_missing_function_call_output_synthesizes_tool_message_before_user() {
+        let result = convert_test_input(vec![
+            test_function_call("call_missing"),
+            json!({"role":"user","content":"continue"}),
+        ]);
+        let messages = result_messages(&result);
+
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_missing");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call_missing");
+        assert_eq!(messages[1]["content"], SYNTHETIC_TOOL_RESULT_UNAVAILABLE);
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"], "continue");
+    }
+
+    #[test]
+    fn test_partial_parallel_function_outputs_synthesize_only_missing_tool_message() {
+        let result = convert_test_input(vec![
+            test_function_call("call_1"),
+            test_function_call("call_2"),
+            test_function_output("call_1", json!("ok")),
+            json!({"role":"user","content":"next"}),
+        ]);
+        let messages = result_messages(&result);
+
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call_1");
+        assert_eq!(messages[1]["content"], "ok");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_2");
+        assert_eq!(messages[2]["content"], SYNTHETIC_TOOL_RESULT_UNAVAILABLE);
+        assert_eq!(messages[3]["role"], "user");
+    }
+
+    #[test]
     fn responses_request_to_chat_moves_tool_image_to_synthetic_user_message() {
         let data_url = large_test_image_data_url();
         let result = convert_test_input(vec![
@@ -4114,16 +4242,24 @@ mod tests {
         ]);
         let messages = result_messages(&result);
 
+        // The unknown `future_metadata` item triggers a batch flush, splitting
+        // call_1 and call_2 into separate assistant messages. The post-conversion
+        // `synthesize_missing_chat_tool_results` pass then inserts a synthetic
+        // tool result for call_1 (whose real output appears later, after the
+        // call_2 assistant turn) to satisfy the OpenAI requirement that every
+        // assistant tool_call is immediately followed by its tool response.
         assert_eq!(
             message_roles(&result),
-            vec!["assistant", "assistant", "tool", "tool"]
+            vec!["assistant", "tool", "assistant", "tool", "tool"]
         );
         assert_eq!(messages[0]["tool_calls"].as_array().unwrap().len(), 1);
         assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
         assert_eq!(messages[0]["reasoning_content"], "tool call");
-        assert_eq!(messages[1]["tool_calls"].as_array().unwrap().len(), 1);
-        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_2");
-        assert_eq!(messages[1]["reasoning_content"], "second batch reasoning");
+        // Synthetic tool result for call_1 inserted by synthesize
+        assert_eq!(messages[1]["tool_call_id"], "call_1");
+        assert_eq!(messages[2]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(messages[2]["tool_calls"][0]["id"], "call_2");
+        assert_eq!(messages[2]["reasoning_content"], "second batch reasoning");
     }
 
     #[test]

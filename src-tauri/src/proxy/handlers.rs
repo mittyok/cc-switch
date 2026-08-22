@@ -797,8 +797,15 @@ pub async fn handle_chat_completions(
         .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
         .to_bytes();
     let body_bytes = decode_codex_request_body(&mut headers, body_bytes)?;
-    let body: Value = serde_json::from_slice(&body_bytes)
+    let mut body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
+
+    // Sanitize orphan tool_calls in chat completions requests.
+    // Codex CLI may send messages where an assistant's tool_calls lack
+    // corresponding tool-role responses — upstream APIs reject these with 400.
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        transform_codex_chat::synthesize_missing_chat_tool_results(messages);
+    }
 
     let mut ctx =
         RequestContext::new(&state, &body, &headers, AppType::Codex, "Codex", "codex").await?;
