@@ -31,6 +31,10 @@ const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
     "logprobs",
     "metadata",
     "n",
+    // Preserve explicit parallel-tool policy when tools survive conversion;
+    // strict upstreams only reject this field when tools is absent/empty, which
+    // is handled by the guard below.
+    "parallel_tool_calls",
     "presence_penalty",
     "response_format",
     "seed",

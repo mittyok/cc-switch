@@ -35,11 +35,17 @@ use std::os::unix::fs::MetadataExt;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
     FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
 };
+
+// Treat old, unchanged parent rollout files as archived: if their token timeline
+// ends before a child fork timestamp, waiting longer will not produce more
+// parent events, so replay alignment should proceed best-effort instead of
+// deferring forever.
+const STATIC_PARENT_ROLLOUT_AGE: Duration = Duration::from_secs(300);
 
 const CODEX_THREAD_REQUEST_ID_PREFIX: &str = "codex_session:thread-v1";
 
@@ -151,6 +157,7 @@ impl ParentTokenTimeline {
         &self,
         parent_path: &Path,
         cutoff: DateTime<Utc>,
+        allow_incomplete_static_parent: bool,
     ) -> Result<Vec<TokenUsageSignature>, String> {
         if self.has_token_without_timestamp {
             return Err(format!(
@@ -162,10 +169,16 @@ impl ParentTokenTimeline {
             .max_timestamp
             .is_none_or(|timestamp| timestamp < cutoff)
         {
-            return Err(format!(
-                "父 rollout {} 尚未写到 child fork 时刻",
+            if !allow_incomplete_static_parent {
+                return Err(format!(
+                    "父 rollout {} 尚未写到 child fork 时刻",
+                    parent_path.display()
+                ));
+            }
+            log::warn!(
+                "[CODEX-SYNC] 父 rollout {} 未覆盖 child fork 时刻，文件已静态，按 best-effort 处理",
                 parent_path.display()
-            ));
+            );
         }
         Ok(self
             .events
@@ -972,6 +985,12 @@ fn parent_signatures_before(
 ) -> Result<Vec<TokenUsageSignature>, String> {
     let file = fs::File::open(parent_path)
         .map_err(|error| format!("无法打开父 rollout {}: {error}", parent_path.display()))?;
+    let parent_is_static = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age >= STATIC_PARENT_ROLLOUT_AGE);
     let stamp = ParentFileStamp::from_file(&file);
     let cached_timeline = stamp.and_then(|stamp| {
         replay_caches().lock().ok().and_then(|caches| {
@@ -983,7 +1002,7 @@ fn parent_signatures_before(
         })
     });
     if let Some(timeline) = cached_timeline {
-        return timeline.signatures_before(parent_path, cutoff);
+        return timeline.signatures_before(parent_path, cutoff, parent_is_static);
     }
 
     let mut events = Vec::new();
@@ -1037,7 +1056,7 @@ fn parent_signatures_before(
         max_timestamp,
         has_token_without_timestamp,
     });
-    let result = timeline.signatures_before(parent_path, cutoff);
+    let result = timeline.signatures_before(parent_path, cutoff, parent_is_static);
     if let (Some(stamp), Ok(mut caches)) = (stamp, replay_caches().lock()) {
         caches.parent_timelines.insert(
             parent_path.to_path_buf(),
@@ -2994,7 +3013,10 @@ mod tests {
 
         // 第二次 sync：父文件已静态，应 best-effort 成功
         let result = sync_test_file(&db, &child, &[&parent, &child])?;
-        assert!(!result.deferred, "static parent should succeed via best-effort");
+        assert!(
+            !result.deferred,
+            "static parent should succeed via best-effort"
+        );
         // child 的 token_count 签名与 parent 的第一条匹配 → replay_prefix=1
         // 所以只导入第二条 (delta: 200-100=100, 100-50=50, 20-10=10)
         assert_eq!(result.imported, 1);

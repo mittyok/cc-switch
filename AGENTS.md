@@ -14,6 +14,12 @@
 - 测试用密钥只通过 `std::env::var` 运行时读取，不硬编码。
 - 不得将 `.env.local` 内容传递给子 agent 或写入任何文件。
 
+## Change Rationale
+
+- All behavior-changing code edits must include the reason for the change near the change site, either as a focused code comment, a clear test name/assertion message, or adjacent documentation.
+- Comments should explain intent, constraints, or failure mode being prevented; do not add comments that merely restate what the code does.
+- When updating proxy/session routing, conversion, usage-sync, or fallback behavior, include the concrete upstream/client symptom or invariant that motivated the change.
+
 ## Empty-Promise Diagnostics
 
 - Use `python3 scripts/detect_empty_promise_turns.py` to scan Codex session logs for suspicious turns where a promise-like assistant message is followed by `task_complete` without a tool/function call.
