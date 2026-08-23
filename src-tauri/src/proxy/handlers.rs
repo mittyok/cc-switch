@@ -1448,8 +1448,14 @@ async fn handle_responses_via_claude_pipeline(
         .unwrap_or(false);
 
     // 1. Convert Responses request to Anthropic Messages request
-    let anthropic_body = transform_responses::responses_request_to_anthropic(
+    // Use the full Codex→Anthropic converter (same as the normal forwarding path)
+    // which handles incomplete tool turns, custom_tool_call types, thinking
+    // history, etc. The simplified transform_responses variant lacks these and
+    // can produce orphan tool_use blocks that upstream Anthropic APIs reject.
+    const FALLBACK_DEFAULT_MAX_TOKENS: u64 = 16384;
+    let anthropic_body = transform_codex_anthropic::responses_request_to_anthropic(
         responses_body.clone(),
+        FALLBACK_DEFAULT_MAX_TOKENS,
     )
     .map_err(|e| {
         log::error!("[Codex→Claude] Request conversion failed: {e}");
