@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use cc_switch_lib::{
-    start_test_proxy, update_settings, AppSettings, Database, Provider,
+    start_test_proxy, update_settings, AppSettings, CodexClaudePipelineMode, Database, Provider,
 };
 use serde_json::{json, Value};
 
@@ -38,8 +38,8 @@ fn integration_config() -> (String, String, String) {
 }
 
 fn create_claude_provider(api_key: &str, base_url: &str) -> Provider {
-    let auth_header = std::env::var("ANTHROPIC_TEST_AUTH_HEADER")
-        .unwrap_or_else(|_| "x-api-key".to_string());
+    let auth_header =
+        std::env::var("ANTHROPIC_TEST_AUTH_HEADER").unwrap_or_else(|_| "x-api-key".to_string());
 
     let env = if auth_header == "bearer" {
         json!({
@@ -81,13 +81,11 @@ async fn setup_proxy() -> (u16, Arc<Database>) {
 
     // Mark it as current
     let mut settings = AppSettings::default();
-    settings.codex_use_claude_pipeline = true;
+    settings.codex_use_claude_pipeline = CodexClaudePipelineMode::Always;
     settings.current_provider_claude = Some(provider.id.clone());
     update_settings(settings).expect("update settings");
 
-    let (port, _server) = start_test_proxy(db.clone())
-        .await
-        .expect("start proxy");
+    let (port, _server) = start_test_proxy(db.clone()).await.expect("start proxy");
 
     // Keep server alive by leaking it (tests are short-lived)
     std::mem::forget(_server);
@@ -118,7 +116,11 @@ async fn e2e_simple_text() {
     reset_test_fs();
     let _home = ensure_test_home();
 
-    let (_model_name, _, model) = (integration_config().0, integration_config().1, integration_config().2);
+    let (_model_name, _, model) = (
+        integration_config().0,
+        integration_config().1,
+        integration_config().2,
+    );
     let (port, _db) = setup_proxy().await;
 
     let body = json!({

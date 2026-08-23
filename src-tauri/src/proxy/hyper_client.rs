@@ -331,7 +331,9 @@ pub async fn send_request(
         match result {
             Ok(resp) => return Ok(resp),
             Err(e) => {
-                log::warn!("[HyperClient] Raw write via proxy failed, falling back to pooled client: {e}");
+                log::warn!(
+                    "[HyperClient] Raw write via proxy failed, falling back to pooled client: {e}"
+                );
                 // Fall through to pooled client
             }
         }

@@ -39,7 +39,10 @@ mod tray;
 mod usage_events;
 mod usage_script;
 
-pub use app_config::{AppType, EmbeddingConfig, EmbeddingProvider, InstalledSkill, McpApps, McpServer, MultiAppConfig, SkillApps};
+pub use app_config::{
+    AppType, EmbeddingConfig, EmbeddingProvider, InstalledSkill, McpApps, McpServer,
+    MultiAppConfig, SkillApps,
+};
 pub use codex_config::{
     get_codex_auth_path, get_codex_config_path, read_codex_live_settings, write_codex_live_atomic,
 };
@@ -66,7 +69,7 @@ pub use services::{
     ConfigService, EndpointLatency, McpService, PromptService, ProviderService, ProxyService,
     SkillService, SpeedtestService,
 };
-pub use settings::{update_settings, AppSettings};
+pub use settings::{update_settings, AppSettings, CodexClaudePipelineMode};
 pub use store::AppState;
 
 pub use proxy::server::ProxyServer;
@@ -75,9 +78,7 @@ pub use proxy::types::ProxyConfig;
 /// Start a proxy server for integration testing on a random port.
 /// Returns `(port, server)`. Drop `server` when done.
 #[doc(hidden)]
-pub async fn start_test_proxy(
-    db: Arc<Database>,
-) -> Result<(u16, ProxyServer), AppError> {
+pub async fn start_test_proxy(db: Arc<Database>) -> Result<(u16, ProxyServer), AppError> {
     let config = ProxyConfig {
         listen_address: "127.0.0.1".to_string(),
         listen_port: 0,

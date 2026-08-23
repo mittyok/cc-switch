@@ -26,6 +26,12 @@ pub struct CodexAdapter;
 /// OpenAI Chat Completions, even if the local Codex client is talking to CC
 /// Switch through the Responses API.
 pub fn codex_provider_uses_chat_completions(provider: &Provider) -> bool {
+    let toml_wire_api = provider
+        .settings_config
+        .get("config")
+        .and_then(|v| v.as_str())
+        .and_then(extract_codex_wire_api_from_toml);
+
     if let Some(api_format) = provider
         .meta
         .as_ref()
@@ -43,15 +49,21 @@ pub fn codex_provider_uses_chat_completions(provider: &Provider) -> bool {
                 .and_then(|v| v.as_str())
         })
     {
+        // MiniMax's official Codex preset was migrated from Chat routing to its
+        // native `/v1/responses` endpoint. Old saved providers can still carry
+        // stale `openai_chat` metadata; if honored, Codex requests hit
+        // `/chat/completions` and MiniMax rejects Codex's `gpt-*` alias as an
+        // unknown model instead of using the configured MiniMax model path.
+        if is_chat_wire_api(api_format)
+            && toml_wire_api.as_deref().is_some_and(is_responses_wire_api)
+            && is_minimax_native_responses_provider(provider)
+        {
+            return false;
+        }
         return is_chat_wire_api(api_format);
     }
 
-    if let Some(wire_api) = provider
-        .settings_config
-        .get("config")
-        .and_then(|v| v.as_str())
-        .and_then(extract_codex_wire_api_from_toml)
-    {
+    if let Some(wire_api) = toml_wire_api {
         return is_chat_wire_api(&wire_api);
     }
 
@@ -204,6 +216,24 @@ pub fn should_convert_codex_responses_to_anthropic(provider: &Provider, endpoint
         path,
         "/responses" | "/v1/responses" | "/responses/compact" | "/v1/responses/compact"
     ) && codex_provider_uses_anthropic(provider)
+}
+
+pub fn should_apply_codex_passthrough_upstream_model(provider: &Provider, endpoint: &str) -> bool {
+    let path = endpoint
+        .split_once('?')
+        .map_or(endpoint, |(path, _query)| path)
+        .trim_end_matches('/');
+    let is_codex_openai_endpoint = matches!(
+        path,
+        "/chat/completions"
+            | "/v1/chat/completions"
+            | "/responses"
+            | "/v1/responses"
+            | "/responses/compact"
+            | "/v1/responses/compact"
+    );
+
+    is_codex_openai_endpoint && codex_provider_upstream_model(provider).is_some()
 }
 
 /// Whether a native-Responses Codex upstream needs Codex `namespace`/plugin
@@ -707,6 +737,41 @@ fn is_anthropic_wire_api(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "anthropic" | "anthropic_messages" | "anthropic-messages" | "claude" | "messages"
     )
+}
+
+fn is_responses_wire_api(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "responses" | "openai_responses" | "openai-responses" | "response"
+    )
+}
+
+fn is_minimax_native_responses_provider(provider: &Provider) -> bool {
+    let model_is_minimax = codex_provider_upstream_model(provider).is_some_and(|model| {
+        let model = model.trim().to_ascii_lowercase();
+        let model = model.rsplit('/').next().unwrap_or(model.as_str());
+        model.starts_with("minimax-")
+    });
+    if !model_is_minimax {
+        return false;
+    }
+
+    provider
+        .settings_config
+        .get("base_url")
+        .or_else(|| provider.settings_config.get("baseURL"))
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+        .or_else(|| {
+            provider
+                .settings_config
+                .get("config")
+                .and_then(|v| v.as_str())
+                .and_then(extract_codex_base_url_from_toml)
+        })
+        .and_then(|base_url| url::Url::parse(base_url.trim()).ok())
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "api.minimaxi.com" || host == "api.minimax.io")
 }
 
 fn is_chat_completions_url(value: &str) -> bool {
@@ -1629,6 +1694,47 @@ wire_api = "chat"
             &provider,
             "/v1/responses"
         ));
+    }
+
+    #[test]
+    fn test_minimax_native_responses_ignores_stale_chat_meta() {
+        let mut provider = create_provider(json!({
+            "config": r#"
+model_provider = "custom"
+model = "MiniMax-M2.7-highspeed"
+
+[model_providers.custom]
+name = "minimax"
+base_url = "https://api.minimaxi.com/v1"
+wire_api = "responses"
+"#
+        }));
+        provider.meta = Some(crate::provider::ProviderMeta {
+            api_format: Some("openai_chat".to_string()),
+            ..Default::default()
+        });
+
+        // Regression for MiniMax coding-plan failures: stale Chat metadata must
+        // not route Codex `/responses` traffic to `/chat/completions`, where the
+        // upstream returns 400 `unknown model 'gpt-*'` for Codex catalog aliases.
+        assert!(!codex_provider_uses_chat_completions(&provider));
+        assert!(!should_convert_codex_responses_to_chat(
+            &provider,
+            "/v1/responses"
+        ));
+
+        assert!(should_apply_codex_passthrough_upstream_model(
+            &provider,
+            "/chat/completions"
+        ));
+        let mut body =
+            json!({ "model": "gpt-5.5", "messages": [{"role": "user", "content": "ping"}] });
+        let upstream_model = apply_codex_upstream_model(&provider, &mut body);
+        assert_eq!(upstream_model.as_deref(), Some("MiniMax-M2.7-highspeed"));
+        assert_eq!(
+            body.get("model").and_then(|v| v.as_str()),
+            Some("MiniMax-M2.7-highspeed")
+        );
     }
 
     #[test]

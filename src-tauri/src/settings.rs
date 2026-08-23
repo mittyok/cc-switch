@@ -364,14 +364,21 @@ impl<'de> serde::Deserialize<'de> for CodexClaudePipelineMode {
                 f.write_str(r#""off", "fallback", "always", or a boolean"#)
             }
             fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
-                Ok(if v { CodexClaudePipelineMode::Always } else { CodexClaudePipelineMode::Off })
+                Ok(if v {
+                    CodexClaudePipelineMode::Always
+                } else {
+                    CodexClaudePipelineMode::Off
+                })
             }
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
                 match v {
                     "off" => Ok(CodexClaudePipelineMode::Off),
                     "fallback" => Ok(CodexClaudePipelineMode::Fallback),
                     "always" => Ok(CodexClaudePipelineMode::Always),
-                    _ => Err(de::Error::unknown_variant(v, &["off", "fallback", "always"])),
+                    _ => Err(de::Error::unknown_variant(
+                        v,
+                        &["off", "fallback", "always"],
+                    )),
                 }
             }
         }

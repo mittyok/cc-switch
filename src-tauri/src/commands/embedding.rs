@@ -16,15 +16,16 @@ pub async fn get_embedding_providers() -> Result<EmbeddingConfig, String> {
 
 /// 添加或更新一个 Embedding Provider
 #[tauri::command]
-pub async fn upsert_embedding_provider(
-    provider: EmbeddingProvider,
-) -> Result<(), String> {
+pub async fn upsert_embedding_provider(provider: EmbeddingProvider) -> Result<(), String> {
     log::info!("upsert_embedding_provider called: {:?}", provider);
     let mut config = MultiAppConfig::load().map_err(|e| {
         log::error!("Failed to load config: {}", e);
         e.to_string()
     })?;
-    config.embedding.providers.insert(provider.id.clone(), provider);
+    config
+        .embedding
+        .providers
+        .insert(provider.id.clone(), provider);
     config.save().map_err(|e| {
         log::error!("Failed to save config: {}", e);
         e.to_string()

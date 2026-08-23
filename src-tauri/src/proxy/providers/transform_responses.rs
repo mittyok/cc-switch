@@ -3076,9 +3076,7 @@ fn convert_input_to_messages(items: &[Value]) -> Result<Vec<Value>, ProxyError> 
             log::debug!(
                 "[Responses→Anthropic] Skipping incomplete tool call: type={}, call_id={}",
                 item_type,
-                item.get("call_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
+                item.get("call_id").and_then(Value::as_str).unwrap_or("")
             );
             continue;
         }

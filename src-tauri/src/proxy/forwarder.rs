@@ -1213,10 +1213,15 @@ impl RequestForwarder {
         // 与 CCH 对齐：请求前不做 thinking 主动改写（仅保留兼容入口）
         let mut mapped_body = normalize_thinking_type(mapped_body);
 
-        // Grok Build exposes a stable client-side model profile in config.toml.
-        // Route requests to the provider's real upstream model before applying
-        // the optional Responses -> Chat/Anthropic bridge.
-        if matches!(app_type, AppType::GrokBuild) {
+        // Native Codex passthrough still needs the configured provider model.
+        // Some clients can call `/chat/completions` with their local catalog alias
+        // (for example `gpt-5.5`); strict vendor endpoints like MiniMax reject that
+        // alias unless cc-switch rewrites it to the provider's real model first.
+        if matches!(app_type, AppType::Codex | AppType::GrokBuild)
+            && !codex_responses_to_chat
+            && !codex_responses_to_anthropic
+            && super::providers::should_apply_codex_passthrough_upstream_model(provider, endpoint)
+        {
             super::providers::apply_codex_upstream_model(provider, &mut mapped_body);
         }
 
