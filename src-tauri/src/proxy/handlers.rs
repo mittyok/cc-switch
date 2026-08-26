@@ -1453,7 +1453,7 @@ async fn handle_responses_via_claude_pipeline(
     // history, etc. The simplified transform_responses variant lacks these and
     // can produce orphan tool_use blocks that upstream Anthropic APIs reject.
     const FALLBACK_DEFAULT_MAX_TOKENS: u64 = 16384;
-    let anthropic_body = transform_codex_anthropic::responses_request_to_anthropic(
+    let mut anthropic_body = transform_codex_anthropic::responses_request_to_anthropic(
         responses_body.clone(),
         FALLBACK_DEFAULT_MAX_TOKENS,
     )
@@ -1491,6 +1491,12 @@ async fn handle_responses_via_claude_pipeline(
         log::error!("[Codex→Claude] Failed to create Claude context: {e}");
         e
     })?;
+
+    super::providers::normalize_anthropic_messages_for_provider(
+        &mut anthropic_body,
+        &ctx.provider,
+        "anthropic",
+    );
 
     let endpoint = endpoint_with_query(uri, "/v1/messages");
 

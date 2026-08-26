@@ -252,6 +252,26 @@ pub fn normalize_anthropic_messages_for_provider(
     changed
 }
 
+pub fn normalize_bedrock_compatible_chat_request(body: &mut Value, provider: &Provider) -> bool {
+    if !is_bedrock_compatible_anthropic_provider(provider) {
+        return false;
+    }
+
+    let mut changed = false;
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            if message.get("content").is_some_and(Value::is_null) {
+                // JDCloud's OpenAI-compatible Chat endpoint rejects assistant tool-call
+                // messages with `content: null` (`expected a string, got null`).
+                message["content"] = Value::String(String::new());
+                changed = true;
+            }
+        }
+    }
+    changed |= normalize_bedrock_compatible_chat_tool_schemas(body);
+    changed
+}
+
 fn normalize_bedrock_compatible_anthropic_request(body: &mut Value, provider: &Provider) -> bool {
     if !is_bedrock_compatible_anthropic_provider(provider) {
         return false;
@@ -262,6 +282,7 @@ fn normalize_bedrock_compatible_anthropic_request(body: &mut Value, provider: &P
     };
 
     let removed_context_management = body_obj.remove("context_management").is_some();
+    let sanitized_tool_schemas = normalize_bedrock_compatible_anthropic_tool_schemas(body_obj);
     let mut hoisted_system_messages = 0usize;
     let mut unsupported_system_messages = 0usize;
     let mut system_texts = Vec::new();
@@ -303,16 +324,79 @@ fn normalize_bedrock_compatible_anthropic_request(body: &mut Value, provider: &P
         );
     }
 
-    let changed = removed_context_management || hoisted_system_messages > 0;
+    let changed =
+        removed_context_management || sanitized_tool_schemas > 0 || hoisted_system_messages > 0;
     if changed {
         log::info!(
-            "[Claude] Applied Bedrock-compatible Anthropic request sanitization: provider={} name={} removed_context_management={} hoisted_system_messages={} unsupported_system_messages={}",
+            "[Claude] Applied Bedrock-compatible Anthropic request sanitization: provider={} name={} removed_context_management={} sanitized_tool_schemas={} hoisted_system_messages={} unsupported_system_messages={}",
             provider.id,
             provider.name,
             removed_context_management,
+            sanitized_tool_schemas,
             hoisted_system_messages,
             unsupported_system_messages
         );
+    }
+    changed
+}
+
+fn normalize_bedrock_compatible_anthropic_tool_schemas(
+    body_obj: &mut serde_json::Map<String, Value>,
+) -> usize {
+    let Some(tools) = body_obj.get_mut("tools").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+
+    let mut changed = 0usize;
+    for tool in tools {
+        let Some(schema) = tool.get_mut("input_schema") else {
+            continue;
+        };
+        if strip_bedrock_unsupported_top_level_schema_keywords(schema) {
+            changed += 1;
+        }
+    }
+    changed
+}
+
+fn normalize_bedrock_compatible_chat_tool_schemas(body: &mut Value) -> bool {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return false;
+    };
+
+    let mut changed = false;
+    for tool in tools {
+        let Some(parameters) = tool
+            .get_mut("function")
+            .and_then(|function| function.get_mut("parameters"))
+        else {
+            continue;
+        };
+        changed |= strip_bedrock_unsupported_top_level_schema_keywords(parameters);
+    }
+    changed
+}
+
+fn strip_bedrock_unsupported_top_level_schema_keywords(schema: &mut Value) -> bool {
+    let Some(obj) = schema.as_object_mut() else {
+        return false;
+    };
+
+    // JDCloud routes Claude through Bedrock, whose tool schema validator rejects
+    // top-level composition/enum keywords (`oneOf`/`anyOf`/`allOf`/`enum`/`const`/`not`).
+    // Dropping only the top-level unsupported constraints preserves nested property
+    // validation while avoiding non-retryable HTTP 400s from Codex MCP tools.
+    let mut changed = false;
+    for key in ["oneOf", "anyOf", "allOf", "enum", "const", "not"] {
+        changed |= obj.remove(key).is_some();
+    }
+    if obj.get("type").and_then(Value::as_str) != Some("object") {
+        obj.insert("type".to_string(), json!("object"));
+        changed = true;
+    }
+    if !obj.contains_key("properties") {
+        obj.insert("properties".to_string(), json!({}));
+        changed = true;
     }
     changed
 }
@@ -2494,6 +2578,83 @@ mod tests {
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[0]["content"], "hello");
         assert_eq!(messages[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn test_jdcloud_bedrock_sanitizes_top_level_tool_schema_keywords() {
+        let provider = create_provider(json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "http://ai-api.jdcloud.com/anthropic/v1/messages",
+                "ANTHROPIC_AUTH_TOKEN": "test-key"
+            }
+        }));
+        let mut body = json!({
+            "model": "Claude-Opus-4.6",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "tools": [{
+                "name": "mcp__codex_app__automation_update",
+                "input_schema": {
+                    "type": "object",
+                    "anyOf": [{ "required": ["id"] }],
+                    "properties": {
+                        "status": { "enum": ["todo", "done"], "type": "string" }
+                    }
+                }
+            }]
+        });
+
+        let changed = normalize_anthropic_messages_for_provider(&mut body, &provider, "anthropic");
+
+        assert!(
+            changed,
+            "JDCloud Bedrock-compatible Claude rejects top-level anyOf in tool input_schema"
+        );
+        let schema = &body["tools"][0]["input_schema"];
+        assert!(schema.get("anyOf").is_none());
+        assert_eq!(
+            schema["properties"]["status"]["enum"],
+            json!(["todo", "done"])
+        );
+    }
+
+    #[test]
+    fn test_jdcloud_chat_sanitizes_null_content_and_top_level_tool_schema_keywords() {
+        let provider = create_provider(json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "http://ai-api.jdcloud.com/anthropic/v1/messages",
+                "ANTHROPIC_AUTH_TOKEN": "test-key"
+            }
+        }));
+        let mut body = json!({
+            "model": "GPT-5.5",
+            "messages": [{
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{ "id": "call_1", "type": "function", "function": { "name": "do_it", "arguments": "{}" } }]
+            }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "mcp__codex_app__automation_update",
+                    "parameters": {
+                        "type": "object",
+                        "oneOf": [{ "required": ["id"] }],
+                        "properties": { "id": { "type": "string" } }
+                    }
+                }
+            }]
+        });
+
+        let changed = normalize_bedrock_compatible_chat_request(&mut body, &provider);
+
+        assert!(
+            changed,
+            "JDCloud Chat endpoint rejects content:null and top-level oneOf in function parameters"
+        );
+        assert_eq!(body["messages"][0]["content"], "");
+        assert!(body["tools"][0]["function"]["parameters"]
+            .get("oneOf")
+            .is_none());
     }
 
     #[test]

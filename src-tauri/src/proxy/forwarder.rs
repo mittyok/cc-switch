@@ -1498,6 +1498,7 @@ impl RequestForwarder {
                 mapped_body,
                 reasoning_config.as_ref(),
             )?;
+            super::providers::normalize_bedrock_compatible_chat_request(&mut chat_body, provider);
             super::providers::inject_codex_chat_prompt_cache_key(
                 provider,
                 &mut chat_body,
@@ -1552,6 +1553,11 @@ impl RequestForwarder {
             if codex_impersonate_claude_code {
                 prepend_claude_code_system_prompt(&mut anthropic_body);
             }
+            super::providers::normalize_anthropic_messages_for_provider(
+                &mut anthropic_body,
+                provider,
+                "anthropic",
+            );
             // Enable Anthropic prompt caching (no beta header required). Reuse the
             // configured TTL rather than silently forcing 5m on this conversion path.
             // otherwise system/tools/history are re-sent at full price every round,
