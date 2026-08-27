@@ -403,6 +403,10 @@ fn strip_bedrock_unsupported_top_level_schema_keywords(schema: &mut Value) -> bo
 
 fn is_bedrock_compatible_anthropic_provider(provider: &Provider) -> bool {
     let settings = &provider.settings_config;
+    // Codex provider rows store the live upstream URL inside `settings_config.config`
+    // TOML; without scanning it, the first Chat attempt keeps JDCloud-rejected tool
+    // schemas and only the fallback Anthropic route succeeds after a noisy 400.
+    let config_text = settings.get("config").and_then(Value::as_str);
     let base_urls = [
         settings
             .get("env")
@@ -411,6 +415,7 @@ fn is_bedrock_compatible_anthropic_provider(provider: &Provider) -> bool {
         settings.get("base_url").and_then(Value::as_str),
         settings.get("baseURL").and_then(Value::as_str),
         settings.get("apiEndpoint").and_then(Value::as_str),
+        config_text,
     ];
 
     if base_urls
@@ -2615,6 +2620,35 @@ mod tests {
             schema["properties"]["status"]["enum"],
             json!(["todo", "done"])
         );
+    }
+
+    #[test]
+    fn test_jdcloud_chat_sanitizes_config_toml_provider() {
+        let provider = create_provider(json!({
+            "config": "model = \"GPT-5.5\"\nbase_url = \"http://ai-api.jdcloud.com/v1\"\nwire_api = \"chat\"\n"
+        }));
+        let mut body = json!({
+            "model": "GPT-5.5",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "mcp__codex_app__automation_update",
+                    "parameters": {
+                        "type": "object",
+                        "anyOf": [{ "required": ["id"] }],
+                        "properties": { "id": { "type": "string" } }
+                    }
+                }
+            }]
+        });
+
+        let changed = normalize_bedrock_compatible_chat_request(&mut body, &provider);
+
+        assert!(changed, "Codex JDCloud providers keep their URL in config TOML, so the first Chat attempt must be sanitized before fallback");
+        assert!(body["tools"][0]["function"]["parameters"]
+            .get("anyOf")
+            .is_none());
     }
 
     #[test]
