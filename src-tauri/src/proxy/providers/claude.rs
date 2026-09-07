@@ -252,6 +252,143 @@ pub fn normalize_anthropic_messages_for_provider(
     changed
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BedrockAnthropicRequestDiagnostics {
+    pub model: Option<String>,
+    pub stream: bool,
+    pub max_tokens: Option<u64>,
+    pub thinking_type: Option<String>,
+    pub top_level_key_count: usize,
+    pub message_count: usize,
+    pub system_message_count: usize,
+    pub top_level_system_present: bool,
+    pub tool_count: usize,
+    pub tool_schemas_with_top_level_unsupported_keywords: usize,
+    pub tool_schemas_with_nested_unsupported_keywords: usize,
+    pub tool_schemas_missing_object_type: usize,
+    pub tool_schemas_missing_properties: usize,
+    pub context_management_present: bool,
+    pub metadata_present: bool,
+    pub anthropic_beta_header_present: bool,
+    pub request_hash: String,
+}
+
+impl BedrockAnthropicRequestDiagnostics {
+    fn unsupported_top_level_schema_keys_summary(&self) -> String {
+        format!(
+            "top_level_unsupported={} nested_unsupported={} missing_object_type={} missing_properties={}",
+            self.tool_schemas_with_top_level_unsupported_keywords,
+            self.tool_schemas_with_nested_unsupported_keywords,
+            self.tool_schemas_missing_object_type,
+            self.tool_schemas_missing_properties
+        )
+    }
+}
+
+pub fn collect_bedrock_anthropic_request_diagnostics(
+    body: &Value,
+    anthropic_beta_header_present: bool,
+) -> BedrockAnthropicRequestDiagnostics {
+    let top_level_key_count = body.as_object().map_or(0, |obj| obj.len());
+    let messages = body.get("messages").and_then(Value::as_array);
+    let tools = body.get("tools").and_then(Value::as_array);
+
+    let mut diagnostics = BedrockAnthropicRequestDiagnostics {
+        model: body
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string),
+        stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
+        max_tokens: body.get("max_tokens").and_then(Value::as_u64),
+        thinking_type: body
+            .get("thinking")
+            .and_then(|thinking| thinking.get("type"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        top_level_key_count,
+        message_count: messages.map_or(0, Vec::len),
+        system_message_count: messages.map_or(0, |messages| {
+            messages
+                .iter()
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+                .count()
+        }),
+        top_level_system_present: body.get("system").is_some(),
+        tool_count: tools.map_or(0, Vec::len),
+        context_management_present: body.get("context_management").is_some(),
+        metadata_present: body.get("metadata").is_some(),
+        anthropic_beta_header_present,
+        // Hash the canonical body so repeated 400s can be correlated without logging prompts,
+        // tool descriptions, or secrets.
+        request_hash: crate::proxy::json_canonical::short_value_hash(Some(
+            &crate::proxy::json_canonical::canonicalize_value(body.clone()),
+        )),
+        ..Default::default()
+    };
+
+    if let Some(tools) = tools {
+        for tool in tools {
+            let Some(schema) = tool.get("input_schema") else {
+                diagnostics.tool_schemas_missing_object_type += 1;
+                diagnostics.tool_schemas_missing_properties += 1;
+                continue;
+            };
+            if schema.get("type").and_then(Value::as_str) != Some("object") {
+                diagnostics.tool_schemas_missing_object_type += 1;
+            }
+            if !schema.get("properties").is_some_and(Value::is_object) {
+                diagnostics.tool_schemas_missing_properties += 1;
+            }
+            if schema_has_top_level_bedrock_unsupported_keywords(schema) {
+                diagnostics.tool_schemas_with_top_level_unsupported_keywords += 1;
+            }
+            if schema_has_nested_bedrock_unsupported_keywords(schema) {
+                diagnostics.tool_schemas_with_nested_unsupported_keywords += 1;
+            }
+        }
+    }
+
+    diagnostics
+}
+
+pub fn log_bedrock_anthropic_request_diagnostics(
+    provider: &Provider,
+    endpoint: &str,
+    body: &Value,
+    anthropic_beta_header_present: bool,
+) {
+    if !is_bedrock_compatible_anthropic_provider(provider) {
+        return;
+    }
+
+    let diagnostics =
+        collect_bedrock_anthropic_request_diagnostics(body, anthropic_beta_header_present);
+    // JDCloud/Bedrock 400s often return only "request rejected or invalid" with no field path.
+    // Log only structure-level facts plus a body hash so the next failure can be correlated
+    // without exposing prompt text, tool descriptions, or credentials.
+    log::info!(
+        "[Claude] Bedrock Anthropic outbound diagnostics: provider={} name={} endpoint={} model={} stream={} max_tokens={:?} thinking_type={} top_keys={} messages={} system_messages={} top_system={} tools={} {} context_management={} metadata={} anthropic_beta={} body_hash={}",
+        provider.id,
+        provider.name,
+        endpoint,
+        diagnostics.model.as_deref().unwrap_or(""),
+        diagnostics.stream,
+        diagnostics.max_tokens,
+        diagnostics.thinking_type.as_deref().unwrap_or(""),
+        diagnostics.top_level_key_count,
+        diagnostics.message_count,
+        diagnostics.system_message_count,
+        diagnostics.top_level_system_present,
+        diagnostics.tool_count,
+        diagnostics.unsupported_top_level_schema_keys_summary(),
+        diagnostics.context_management_present,
+        diagnostics.metadata_present,
+        diagnostics.anthropic_beta_header_present,
+        diagnostics.request_hash
+    );
+}
+
 pub fn normalize_bedrock_compatible_chat_request(body: &mut Value, provider: &Provider) -> bool {
     if !is_bedrock_compatible_anthropic_provider(provider) {
         return false;
@@ -387,8 +524,8 @@ fn strip_bedrock_unsupported_top_level_schema_keywords(schema: &mut Value) -> bo
     // Dropping only the top-level unsupported constraints preserves nested property
     // validation while avoiding non-retryable HTTP 400s from Codex MCP tools.
     let mut changed = false;
-    for key in ["oneOf", "anyOf", "allOf", "enum", "const", "not"] {
-        changed |= obj.remove(key).is_some();
+    for key in BEDROCK_UNSUPPORTED_SCHEMA_KEYS {
+        changed |= obj.remove(*key).is_some();
     }
     if obj.get("type").and_then(Value::as_str) != Some("object") {
         obj.insert("type".to_string(), json!("object"));
@@ -399,6 +536,40 @@ fn strip_bedrock_unsupported_top_level_schema_keywords(schema: &mut Value) -> bo
         changed = true;
     }
     changed
+}
+
+const BEDROCK_UNSUPPORTED_SCHEMA_KEYS: &[&str] =
+    &["oneOf", "anyOf", "allOf", "enum", "const", "not"];
+
+fn schema_has_top_level_bedrock_unsupported_keywords(schema: &Value) -> bool {
+    let Some(obj) = schema.as_object() else {
+        return false;
+    };
+    BEDROCK_UNSUPPORTED_SCHEMA_KEYS
+        .iter()
+        .any(|key| obj.contains_key(*key))
+}
+
+fn schema_has_nested_bedrock_unsupported_keywords(schema: &Value) -> bool {
+    let Some(obj) = schema.as_object() else {
+        return false;
+    };
+
+    obj.values()
+        .any(value_has_bedrock_unsupported_schema_keywords)
+}
+
+fn value_has_bedrock_unsupported_schema_keywords(value: &Value) -> bool {
+    match value {
+        Value::Object(obj) => obj.iter().any(|(key, child)| {
+            BEDROCK_UNSUPPORTED_SCHEMA_KEYS.contains(&key.as_str())
+                || value_has_bedrock_unsupported_schema_keywords(child)
+        }),
+        Value::Array(items) => items
+            .iter()
+            .any(value_has_bedrock_unsupported_schema_keywords),
+        _ => false,
+    }
 }
 
 fn is_bedrock_compatible_anthropic_provider(provider: &Provider) -> bool {
@@ -2619,6 +2790,58 @@ mod tests {
         assert_eq!(
             schema["properties"]["status"]["enum"],
             json!(["todo", "done"])
+        );
+    }
+
+    #[test]
+    fn test_jdcloud_bedrock_diagnostics_report_structure_without_payload_text() {
+        let body = json!({
+            "model": "claude-opus-4-8",
+            "stream": true,
+            "max_tokens": 4096,
+            "thinking": { "type": "enabled", "budget_tokens": 1024 },
+            "context_management": { "edits": "secret-ish config detail" },
+            "metadata": { "user_id": "do-not-log-this" },
+            "system": "private system prompt",
+            "messages": [
+                { "role": "system", "content": "private system message" },
+                { "role": "user", "content": "private user prompt" }
+            ],
+            "tools": [{
+                "name": "secret_tool_name",
+                "description": "secret tool description",
+                "input_schema": {
+                    "anyOf": [{ "required": ["id"] }],
+                    "properties": {
+                        "status": { "enum": ["todo", "done"], "type": "string" }
+                    }
+                }
+            }]
+        });
+
+        let diagnostics = collect_bedrock_anthropic_request_diagnostics(&body, true);
+
+        assert_eq!(diagnostics.model.as_deref(), Some("claude-opus-4-8"));
+        assert!(diagnostics.stream);
+        assert_eq!(diagnostics.max_tokens, Some(4096));
+        assert_eq!(diagnostics.thinking_type.as_deref(), Some("enabled"));
+        assert_eq!(diagnostics.message_count, 2);
+        assert_eq!(diagnostics.system_message_count, 1);
+        assert!(diagnostics.top_level_system_present);
+        assert_eq!(diagnostics.tool_count, 1);
+        assert_eq!(
+            diagnostics.tool_schemas_with_top_level_unsupported_keywords,
+            1
+        );
+        assert_eq!(diagnostics.tool_schemas_with_nested_unsupported_keywords, 1);
+        assert_eq!(diagnostics.tool_schemas_missing_object_type, 1);
+        assert!(diagnostics.context_management_present);
+        assert!(diagnostics.metadata_present);
+        assert!(diagnostics.anthropic_beta_header_present);
+        assert_eq!(diagnostics.request_hash.len(), 16);
+        assert_ne!(
+            diagnostics.request_hash, "private user prompt",
+            "Bedrock diagnostics must correlate failures by hash instead of logging prompt text"
         );
     }
 

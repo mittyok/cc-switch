@@ -1706,6 +1706,20 @@ impl RequestForwarder {
             &filtered_body,
             self.session_client_provided,
         );
+        // JDCloud/Bedrock Anthropic 400s often collapse upstream validation details into
+        // generic messages like "bad response status code 400" or "请求被拒绝或参数有误".
+        // Emit a final-shape, structure-only snapshot here (after mapping/sanitizers/overrides)
+        // so the rejected field class can be inferred without logging prompts or secrets.
+        if adapter.name() == "Claude"
+            && matches!(resolved_claude_api_format.as_deref(), Some("anthropic"))
+        {
+            super::providers::log_bedrock_anthropic_request_diagnostics(
+                provider,
+                &effective_endpoint,
+                &filtered_body,
+                true,
+            );
+        }
         let request_is_streaming =
             is_streaming_request(&effective_endpoint, &filtered_body, headers);
         let force_identity_encoding = needs_transform
