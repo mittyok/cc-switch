@@ -415,8 +415,14 @@ fn normalize_bedrock_compatible_anthropic_request(body: &mut Value, provider: &P
         return false;
     }
 
+    // 最新 JDCloud/Bedrock `/responses`→Claude fallback 400 里，schema/adaptive/max_tokens
+    // 已清理后仍出现泛化 `upstream request failed`；相邻请求触发 thinking 签名整流并重试成功。
+    // 因此对该兼容层提前移除历史 thinking/redacted_thinking/signature，避免泛化 400 无法触发反应式整流。
+    let rectified_thinking_history =
+        crate::proxy::thinking_rectifier::rectify_anthropic_request(body);
+
     let Some(body_obj) = body.as_object_mut() else {
-        return false;
+        return rectified_thinking_history.applied;
     };
 
     let removed_context_management = body_obj.remove("context_management").is_some();
@@ -468,16 +474,20 @@ fn normalize_bedrock_compatible_anthropic_request(body: &mut Value, provider: &P
         || sanitized_tool_schemas > 0
         || removed_adaptive_thinking
         || clamped_max_tokens.is_some()
+        || rectified_thinking_history.applied
         || hoisted_system_messages > 0;
     if changed {
         log::info!(
-            "[Claude] Applied Bedrock-compatible Anthropic request sanitization: provider={} name={} removed_context_management={} sanitized_tool_schemas={} removed_adaptive_thinking={} clamped_max_tokens_from={:?} hoisted_system_messages={} unsupported_system_messages={}",
+            "[Claude] Applied Bedrock-compatible Anthropic request sanitization: provider={} name={} removed_context_management={} sanitized_tool_schemas={} removed_adaptive_thinking={} clamped_max_tokens_from={:?} removed_thinking_blocks={} removed_redacted_thinking_blocks={} removed_signature_fields={} hoisted_system_messages={} unsupported_system_messages={}",
             provider.id,
             provider.name,
             removed_context_management,
             sanitized_tool_schemas,
             removed_adaptive_thinking,
             clamped_max_tokens,
+            rectified_thinking_history.removed_thinking_blocks,
+            rectified_thinking_history.removed_redacted_thinking_blocks,
+            rectified_thinking_history.removed_signature_fields,
             hoisted_system_messages,
             unsupported_system_messages
         );
@@ -2862,6 +2872,47 @@ mod tests {
         );
         assert!(body.get("thinking").is_none());
         assert_eq!(body["max_tokens"], json!(32000));
+    }
+
+    #[test]
+    fn test_jdcloud_bedrock_strips_history_thinking_before_upstream() {
+        let provider = create_provider(json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "http://ai-api.jdcloud.com/anthropic/v1/messages",
+                "ANTHROPIC_AUTH_TOKEN": "test-key"
+            }
+        }));
+        let mut body = json!({
+            "model": "Claude-Opus-4.6",
+            "max_tokens": 16384,
+            "thinking": { "type": "enabled" },
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    { "type": "thinking", "thinking": "private chain", "signature": "bad-sig" },
+                    { "type": "tool_use", "id": "toolu_1", "name": "do_it", "input": {}, "signature": "leftover" }
+                ]
+            }],
+            "tools": [{
+                "name": "do_it",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {}
+                }
+            }]
+        });
+
+        let changed = normalize_anthropic_messages_for_provider(&mut body, &provider, "anthropic");
+
+        assert!(
+            changed,
+            "JDCloud/Bedrock 泛化 400 相邻请求显示 thinking 签名整流可恢复，需提前移除历史 thinking/signature"
+        );
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "tool_use");
+        assert!(content[0].get("signature").is_none());
+        assert!(body.get("thinking").is_none());
     }
 
     #[test]

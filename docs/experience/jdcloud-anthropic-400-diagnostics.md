@@ -12,6 +12,8 @@ The first 2026-09 JDCloud failure pattern was not caused by a missing Full URL f
 
 A later `/responses` → Claude fallback failure had already passed that downgrade: `max_tokens=16384`, no `context_management`, no adaptive thinking, top-level unsupported schema count zero, but `nested_unsupported=12` remained. Treat nested JSON schema composition/enum keywords as JDCloud/Bedrock-incompatible too; recursively strip unsupported schema keywords while preserving property names under `properties`.
 
+A follow-up 400 after recursive schema cleanup showed `nested_unsupported=0`; nearby logs had the reactive thinking-signature rectifier remove historical thinking blocks and then succeed. Because JDCloud sometimes returns only generic `upstream request failed` instead of a signature-specific error, proactively run the same history thinking/signature cleanup for JDCloud/Bedrock Anthropic requests before dispatch.
+
 The log deliberately includes only request-shape facts:
 
 - provider id/name and effective endpoint
