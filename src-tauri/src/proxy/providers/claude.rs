@@ -31,6 +31,7 @@ const REASONING_VENDOR_HINTS: &[&str] = &["deepseek", "mimo", "xiaomimimo"];
 // `role=system` messages. Keep this list conservative: an over-broad match would
 // silently weaken requests for gateways that intentionally support those fields.
 const BEDROCK_COMPAT_ANTHROPIC_HOST_HINTS: &[&str] = &["ai-api.jdcloud.com"];
+const BEDROCK_COMPAT_ANTHROPIC_MAX_TOKENS: u64 = 32_000;
 
 // ChatGPT Codex 后端按 originator+version 组合做模型 cohort 路由：非官方身份会把
 // gpt-5.6-luna 解析到未部署的内部引擎（HTTP 404 Model not found，openai/codex#31967，
@@ -420,6 +421,8 @@ fn normalize_bedrock_compatible_anthropic_request(body: &mut Value, provider: &P
 
     let removed_context_management = body_obj.remove("context_management").is_some();
     let sanitized_tool_schemas = normalize_bedrock_compatible_anthropic_tool_schemas(body_obj);
+    let removed_adaptive_thinking = normalize_bedrock_compatible_anthropic_thinking(body_obj);
+    let clamped_max_tokens = normalize_bedrock_compatible_anthropic_max_tokens(body_obj);
     let mut hoisted_system_messages = 0usize;
     let mut unsupported_system_messages = 0usize;
     let mut system_texts = Vec::new();
@@ -461,20 +464,60 @@ fn normalize_bedrock_compatible_anthropic_request(body: &mut Value, provider: &P
         );
     }
 
-    let changed =
-        removed_context_management || sanitized_tool_schemas > 0 || hoisted_system_messages > 0;
+    let changed = removed_context_management
+        || sanitized_tool_schemas > 0
+        || removed_adaptive_thinking
+        || clamped_max_tokens.is_some()
+        || hoisted_system_messages > 0;
     if changed {
         log::info!(
-            "[Claude] Applied Bedrock-compatible Anthropic request sanitization: provider={} name={} removed_context_management={} sanitized_tool_schemas={} hoisted_system_messages={} unsupported_system_messages={}",
+            "[Claude] Applied Bedrock-compatible Anthropic request sanitization: provider={} name={} removed_context_management={} sanitized_tool_schemas={} removed_adaptive_thinking={} clamped_max_tokens_from={:?} hoisted_system_messages={} unsupported_system_messages={}",
             provider.id,
             provider.name,
             removed_context_management,
             sanitized_tool_schemas,
+            removed_adaptive_thinking,
+            clamped_max_tokens,
             hoisted_system_messages,
             unsupported_system_messages
         );
     }
     changed
+}
+
+fn normalize_bedrock_compatible_anthropic_thinking(
+    body_obj: &mut serde_json::Map<String, Value>,
+) -> bool {
+    let thinking_type = body_obj
+        .get("thinking")
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str);
+
+    if thinking_type != Some("adaptive") {
+        return false;
+    }
+
+    // JDCloud/Bedrock 兼容层曾在诊断中表现为：context_management=false、tool schema
+    // unsupported=0 时仍对 `thinking.type=adaptive` + `max_tokens=64000` 返回泛化 HTTP 400。
+    // 删除 adaptive thinking 让请求退回普通非 thinking 调用，避免继续触发上游不稳定字段校验。
+    body_obj.remove("thinking").is_some()
+}
+
+fn normalize_bedrock_compatible_anthropic_max_tokens(
+    body_obj: &mut serde_json::Map<String, Value>,
+) -> Option<u64> {
+    let max_tokens = body_obj.get("max_tokens").and_then(Value::as_u64)?;
+    if max_tokens <= BEDROCK_COMPAT_ANTHROPIC_MAX_TOKENS {
+        return None;
+    }
+
+    // 同一批 JDCloud/Bedrock 400 诊断显示失败请求集中在 max_tokens=64000；
+    // 将兼容层出站请求保守限制到 32000，和已观测成功的 warmup/disabled 请求保持一致。
+    body_obj.insert(
+        "max_tokens".to_string(),
+        json!(BEDROCK_COMPAT_ANTHROPIC_MAX_TOKENS),
+    );
+    Some(max_tokens)
 }
 
 fn normalize_bedrock_compatible_anthropic_tool_schemas(
@@ -2754,6 +2797,39 @@ mod tests {
         assert_eq!(messages[0]["role"], "user");
         assert_eq!(messages[0]["content"], "hello");
         assert_eq!(messages[1]["role"], "assistant");
+    }
+
+    #[test]
+    fn test_jdcloud_bedrock_strips_adaptive_thinking_and_clamps_max_tokens() {
+        let provider = create_provider(json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "http://ai-api.jdcloud.com/anthropic/v1/messages",
+                "ANTHROPIC_AUTH_TOKEN": "test-key"
+            }
+        }));
+        let mut body = json!({
+            "model": "Claude-Opus-4.6",
+            "stream": true,
+            "max_tokens": 64000,
+            "thinking": { "type": "adaptive" },
+            "messages": [{ "role": "user", "content": "hello" }],
+            "tools": [{
+                "name": "mcp__codex_app__automation_update",
+                "input_schema": {
+                    "type": "object",
+                    "properties": { "id": { "type": "string" } }
+                }
+            }]
+        });
+
+        let changed = normalize_anthropic_messages_for_provider(&mut body, &provider, "anthropic");
+
+        assert!(
+            changed,
+            "JDCloud/Bedrock 泛化 400 诊断指向 adaptive thinking + 64000 max_tokens，需要出站前降级"
+        );
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["max_tokens"], json!(32000));
     }
 
     #[test]

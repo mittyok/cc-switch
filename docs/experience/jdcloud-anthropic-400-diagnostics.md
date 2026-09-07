@@ -8,6 +8,8 @@ Recent Claude proxy failures from JDCloud Anthropic gateways can return generic 
 
 Add structure-only outbound diagnostics for Bedrock-compatible Anthropic providers. The log is emitted after the outbound body is finalized and before sending to upstream, so it reflects model mapping, sanitizer changes, endpoint preparation, and local body overrides.
 
+The 2026-09 JDCloud failure pattern was not caused by a missing Full URL flag. The affected provider already had `meta.isFullUrl=true`; the 400s correlated with Anthropic Messages requests shaped as `thinking.type=adaptive` plus `max_tokens=64000`, while diagnostics showed `context_management=false` and unsupported tool-schema counters at zero. For JDCloud/Bedrock-compatible Anthropic providers, strip adaptive thinking and clamp `max_tokens` to `32000` before upstream dispatch so the request falls back to a conservative shape that matched successful observed warmup/disabled calls.
+
 The log deliberately includes only request-shape facts:
 
 - provider id/name and effective endpoint
