@@ -532,7 +532,7 @@ fn normalize_bedrock_compatible_anthropic_tool_schemas(
         let Some(schema) = tool.get_mut("input_schema") else {
             continue;
         };
-        if strip_bedrock_unsupported_top_level_schema_keywords(schema) {
+        if strip_bedrock_unsupported_schema_keywords(schema) {
             changed += 1;
         }
     }
@@ -552,24 +552,24 @@ fn normalize_bedrock_compatible_chat_tool_schemas(body: &mut Value) -> bool {
         else {
             continue;
         };
-        changed |= strip_bedrock_unsupported_top_level_schema_keywords(parameters);
+        changed |= strip_bedrock_unsupported_schema_keywords(parameters);
     }
     changed
 }
 
-fn strip_bedrock_unsupported_top_level_schema_keywords(schema: &mut Value) -> bool {
-    let Some(obj) = schema.as_object_mut() else {
+fn strip_bedrock_unsupported_schema_keywords(schema: &mut Value) -> bool {
+    if !schema.is_object() {
         return false;
-    };
-
-    // JDCloud routes Claude through Bedrock, whose tool schema validator rejects
-    // top-level composition/enum keywords (`oneOf`/`anyOf`/`allOf`/`enum`/`const`/`not`).
-    // Dropping only the top-level unsupported constraints preserves nested property
-    // validation while avoiding non-retryable HTTP 400s from Codex MCP tools.
-    let mut changed = false;
-    for key in BEDROCK_UNSUPPORTED_SCHEMA_KEYS {
-        changed |= obj.remove(*key).is_some();
     }
+
+    // 最新 JDCloud/Bedrock 400 诊断显示：顶层 schema 已清理但仍有 nested_unsupported=12，
+    // 且失败请求没有 adaptive thinking/64000/context_management。递归删除 schema 关键字可避开
+    // Bedrock 兼容层对嵌套 `oneOf`/`anyOf`/`allOf`/`enum` 等约束的泛化 400；遍历
+    // `properties` 时只处理属性值，避免把合法的属性名误当成 schema 关键字删除。
+    let mut changed = strip_bedrock_unsupported_schema_keywords_recursive(schema);
+    let obj = schema
+        .as_object_mut()
+        .expect("schema object checked before recursive Bedrock schema sanitization");
     if obj.get("type").and_then(Value::as_str) != Some("object") {
         obj.insert("type".to_string(), json!("object"));
         changed = true;
@@ -578,6 +578,38 @@ fn strip_bedrock_unsupported_top_level_schema_keywords(schema: &mut Value) -> bo
         obj.insert("properties".to_string(), json!({}));
         changed = true;
     }
+    changed
+}
+
+fn strip_bedrock_unsupported_schema_keywords_recursive(schema: &mut Value) -> bool {
+    let Some(obj) = schema.as_object_mut() else {
+        if let Some(items) = schema.as_array_mut() {
+            let mut changed = false;
+            for item in items {
+                changed |= strip_bedrock_unsupported_schema_keywords_recursive(item);
+            }
+            return changed;
+        }
+        return false;
+    };
+
+    let mut changed = false;
+    for key in BEDROCK_UNSUPPORTED_SCHEMA_KEYS {
+        changed |= obj.remove(*key).is_some();
+    }
+
+    for (key, child) in obj.iter_mut() {
+        if key == "properties" {
+            if let Some(properties) = child.as_object_mut() {
+                for property_schema in properties.values_mut() {
+                    changed |= strip_bedrock_unsupported_schema_keywords_recursive(property_schema);
+                }
+            }
+        } else {
+            changed |= strip_bedrock_unsupported_schema_keywords_recursive(child);
+        }
+    }
+
     changed
 }
 
@@ -2863,9 +2895,9 @@ mod tests {
         );
         let schema = &body["tools"][0]["input_schema"];
         assert!(schema.get("anyOf").is_none());
-        assert_eq!(
-            schema["properties"]["status"]["enum"],
-            json!(["todo", "done"])
+        assert!(
+            schema["properties"]["status"].get("enum").is_none(),
+            "JDCloud/Bedrock latest 400s still had nested_unsupported after top-level cleanup, so nested enum must be stripped too"
         );
     }
 
