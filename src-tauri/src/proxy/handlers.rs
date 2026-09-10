@@ -1524,6 +1524,32 @@ async fn handle_responses_via_claude_pipeline(
 
     let endpoint = endpoint_with_query(uri, "/v1/messages");
 
+    // Sanitize headers: the Codex→Claude pipeline receives Codex/OpenAI client
+    // headers but forwards as AppType::Claude. The forwarder's fingerprint-header
+    // stripping is gated on `codex_responses_to_anthropic` (which requires
+    // AppType::Codex), so it never fires here. Strip Codex client fingerprints
+    // and normalize Accept before the forwarder sees them — otherwise strict
+    // Anthropic-compatible gateways return generic HTTP 400 ("模型服务调用失败").
+    let mut clean_headers = axum::http::HeaderMap::new();
+    for (name, value) in &headers {
+        let key_str = name.as_str();
+        // Drop Codex/OpenAI client fingerprint headers
+        if super::forwarder::is_codex_client_fingerprint_header(key_str) {
+            continue;
+        }
+        // Normalize Accept: Codex sends text/event-stream but Anthropic
+        // protocol expects application/json (streaming is body-driven).
+        if key_str.eq_ignore_ascii_case("accept") {
+            continue; // replaced below
+        }
+        clean_headers.append(name.clone(), value.clone());
+    }
+    clean_headers.insert(
+        http::header::ACCEPT,
+        http::HeaderValue::from_static("application/json"),
+    );
+    let headers = clean_headers;
+
     // 3. Forward through Claude pipeline
     let forwarder = ctx.create_forwarder(&state);
     let mut result = match forwarder

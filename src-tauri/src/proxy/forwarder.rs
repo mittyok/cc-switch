@@ -3082,7 +3082,7 @@ fn base_url_is_full_endpoint(base_url: &str, endpoint_suffix: &str) -> bool {
         .ends_with(endpoint_suffix)
 }
 
-fn is_codex_client_fingerprint_header(key_str: &str) -> bool {
+pub(super) fn is_codex_client_fingerprint_header(key_str: &str) -> bool {
     matches!(
         key_str,
         "originator"

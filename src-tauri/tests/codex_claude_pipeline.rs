@@ -15,8 +15,9 @@
 //!   ANTHROPIC_TEST_MODEL     (default: claude-sonnet-4-20250514)
 //!   ANTHROPIC_TEST_AUTH_HEADER (default: x-api-key; use "bearer" for JDCloud)
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
 use cc_switch_lib::{
     start_test_proxy, update_settings, AppSettings, CodexClaudePipelineMode, Database, Provider,
 };
@@ -106,6 +107,135 @@ async fn post_responses(port: u16, body: &Value) -> (u16, String) {
     let status = resp.status().as_u16();
     let text = resp.text().await.expect("read response body");
     (status, text)
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn codex_claude_pipeline_sends_clean_anthropic_headers_to_upstream() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let _home = ensure_test_home();
+
+    // reqwest/hyper need a TLS provider installed even when talking over HTTP only.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let captured_headers = Arc::new(Mutex::new(None::<HeaderMap>));
+    let app = Router::new()
+        .route(
+            "/v1/messages",
+            post({
+                let captured_headers = captured_headers.clone();
+                move |State(captured_headers): State<Arc<Mutex<Option<HeaderMap>>>>,
+                      headers: HeaderMap,
+                      Json(_body): Json<Value>| async move {
+                    *captured_headers.lock().expect("capture upstream headers") = Some(headers);
+                    Json(json!({
+                        "id": "msg_test",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-test",
+                        "content": [{"type": "text", "text": "ok"}],
+                        "stop_reason": "end_turn",
+                        "stop_sequence": null,
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                }
+            }),
+        )
+        .with_state(captured_headers.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock upstream");
+    let upstream_port = listener.local_addr().expect("mock upstream addr").port();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("mock upstream server");
+    });
+
+    let db = Arc::new(Database::init().expect("create test database"));
+    let provider = Provider {
+        id: "mock-claude".to_string(),
+        name: "Mock Claude".to_string(),
+        settings_config: json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": format!("http://127.0.0.1:{upstream_port}"),
+                "ANTHROPIC_AUTH_TOKEN": "test-token",
+                "ANTHROPIC_MODEL": "claude-test"
+            }
+        }),
+        website_url: None,
+        category: None,
+        created_at: None,
+        sort_index: None,
+        notes: None,
+        meta: None,
+        icon: None,
+        icon_color: None,
+        in_failover_queue: false,
+    };
+    db.save_provider("claude", &provider)
+        .expect("save mock claude provider");
+
+    let mut settings = AppSettings::default();
+    settings.codex_use_claude_pipeline = CodexClaudePipelineMode::Always;
+    settings.current_provider_claude = Some(provider.id.clone());
+    update_settings(settings).expect("update settings");
+
+    let (proxy_port, server) = start_test_proxy(db.clone()).await.expect("start proxy");
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{proxy_port}/v1/responses"))
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .header("x-stainless-package-version", "0.1.0")
+        .header("openai-beta", "responses=v1")
+        .header("x-codex-session-id", "codex-session")
+        .json(&json!({
+            "model": "claude-test",
+            "input": "Say ok",
+            "max_output_tokens": 16
+        }))
+        .send()
+        .await
+        .expect("send proxy request");
+
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "mock upstream should let the proxy complete so captured headers are authoritative"
+    );
+
+    let headers = captured_headers
+        .lock()
+        .expect("read captured headers")
+        .clone()
+        .expect("mock upstream received one request");
+
+    // Codex→Claude first converts a Codex Responses request into Anthropic Messages.
+    // The upstream must therefore see an Anthropic/Claude-Code-shaped request, not
+    // Codex/OpenAI client fingerprints; strict Claude-compatible gateways have been
+    // returning generic HTTP 400 bodies such as “模型服务调用失败” when these leak.
+    assert!(
+        !headers.contains_key("x-stainless-package-version"),
+        "Codex stainless fingerprint header leaked to Claude upstream"
+    );
+    assert!(
+        !headers.contains_key("openai-beta"),
+        "OpenAI beta header leaked to Claude upstream"
+    );
+    assert!(
+        !headers.contains_key("x-codex-session-id"),
+        "Codex session header leaked to Claude upstream"
+    );
+    assert_eq!(
+        headers.get("accept").and_then(|v| v.to_str().ok()),
+        Some("application/json"),
+        "Codex event-stream Accept must be normalized for Anthropic upstream"
+    );
+
+    drop(server);
 }
 
 #[allow(clippy::await_holding_lock)]
