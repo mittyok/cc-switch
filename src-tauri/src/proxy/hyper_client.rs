@@ -67,6 +67,10 @@ fn global_hyper_client() -> &'static HyperClient {
     CLIENT.get_or_init(|| {
         let mut http_connector = hyper_util::client::legacy::connect::HttpConnector::new();
         http_connector.set_nodelay(true); // TCP_NODELAY for pooled connections
+                                          // hyper-rustls passes the original https:// URI down to HttpConnector to open
+                                          // the TCP socket; disabling HTTP-only validation prevents false
+                                          // `client error (Connect); caused by: invalid URL, scheme is not http` failures.
+        http_connector.enforce_http(false);
 
         let connector = HttpsConnectorBuilder::new()
             .with_webpki_roots()
@@ -996,6 +1000,28 @@ mod tests {
             "连接失败日志必须保留 hyper source chain，避免只看到笼统的 client error (Connect)"
         );
         assert!(message.contains("Connection refused (os error 61)"));
+    }
+
+    #[tokio::test]
+    async fn hyper_https_connector_accepts_https_scheme_before_tcp_connect() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let request = http::Request::builder()
+            .uri(format!("https://127.0.0.1:{port}/"))
+            .body(http_body_util::Full::new(Bytes::new()))
+            .unwrap();
+
+        let error = global_hyper_client().request(request).await.unwrap_err();
+        let message = forward_error_with_sources("上游请求失败", &error);
+
+        assert!(
+            !message.contains("scheme is not http"),
+            "HTTPS 上游必须先进入 TCP/TLS 连接流程，而不是被内部 HttpConnector 的 HTTP-only 校验拒绝: {message}"
+        );
     }
 
     #[tokio::test]
