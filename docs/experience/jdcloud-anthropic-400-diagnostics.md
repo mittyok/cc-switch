@@ -14,6 +14,10 @@ A later `/responses` → Claude fallback failure had already passed that downgra
 
 A follow-up 400 after recursive schema cleanup showed `nested_unsupported=0`; nearby logs had the reactive thinking-signature rectifier remove historical thinking blocks and then succeed. Because JDCloud sometimes returns only generic `upstream request failed` instead of a signature-specific error, proactively run the same history thinking/signature cleanup for JDCloud/Bedrock Anthropic requests before dispatch.
 
+A Codex→Claude `mode=always` incident can fail even earlier, during the preferred Codex-provider first hop, with an OpenAI-style validation path such as `tools[12].function.parameters`: `Invalid schema for function 'mcp__codex_app__automation_update': schema must have type 'object' and not have 'oneOf'/'anyOf'/'allOf'/'enum'/'const'/'not' at the top level`. Normalize the Responses→Chat tool parameters before dispatch by forcing an object root and stripping only those root-level unsupported schema keywords; preserve nested property constraints so ordinary argument guidance is not lost.
+
+A Codex→Claude fallback incident can also fail during the preferred Codex-provider first hop with OpenAI Responses validation like `Invalid 'input[67].id': 'resp_chatcmpl-..._msg'. Expected an ID that begins with 'msg'.` This happens when cc-switch emits assistant `message` output items with Chat-derived ids such as `resp_*_msg`; Codex replays them as future `input[]` items and strict Responses gateways reject the replay. Generate assistant message item ids with a `msg_` prefix on both non-streaming and streaming Chat/Anthropic conversion paths.
+
 The log deliberately includes only request-shape facts:
 
 - provider id/name and effective endpoint

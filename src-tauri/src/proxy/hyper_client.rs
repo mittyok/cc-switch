@@ -10,7 +10,7 @@ use futures::{stream::Stream, StreamExt};
 use http_body_util::BodyExt;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use std::sync::OnceLock;
+use std::{error::Error as StdError, sync::OnceLock};
 
 /// Our own header case map: maps lowercase header name → original wire-casing bytes.
 ///
@@ -248,6 +248,28 @@ impl ProxyResponse {
     }
 }
 
+fn forward_error_with_sources(context: &str, error: &(dyn StdError + 'static)) -> String {
+    let mut message = format!("{context}: {error}");
+    let mut source = error.source();
+    let mut depth = 0;
+
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !cause_text.is_empty() && !message.contains(&cause_text) {
+            message.push_str("; caused by: ");
+            message.push_str(&cause_text);
+        }
+
+        source = cause.source();
+        depth += 1;
+        if depth >= 8 {
+            break;
+        }
+    }
+
+    message
+}
+
 /// Send an HTTP request with header-case preservation.
 ///
 /// Uses a two-tier strategy:
@@ -310,7 +332,11 @@ pub async fn send_request(
         let resp = tokio::time::timeout(timeout, client.request(req))
             .await
             .map_err(|_| ProxyError::Timeout(format!("请求超时: {}s", timeout.as_secs())))?
-            .map_err(|e| ProxyError::ForwardFailed(format!("上游请求失败: {e}")))?;
+            // Hyper's top-level display may only say `client error (Connect)`; include
+            // the source chain so operators can distinguish DNS, TCP, proxy, and TLS failures.
+            .map_err(|e| {
+                ProxyError::ForwardFailed(forward_error_with_sources("上游请求失败", &e))
+            })?;
 
         return Ok(ProxyResponse::Hyper(resp));
     }
@@ -353,7 +379,9 @@ pub async fn send_request(
     let resp = tokio::time::timeout(timeout, client.request(req))
         .await
         .map_err(|_| ProxyError::Timeout(format!("请求超时: {}s", timeout.as_secs())))?
-        .map_err(|e| ProxyError::ForwardFailed(format!("上游请求失败: {e}")))?;
+        // Hyper's top-level display may only say `client error (Connect)`; include
+        // the source chain so operators can distinguish DNS, TCP, proxy, and TLS failures.
+        .map_err(|e| ProxyError::ForwardFailed(forward_error_with_sources("上游请求失败", &e)))?;
 
     Ok(ProxyResponse::Hyper(resp))
 }
@@ -925,6 +953,49 @@ mod tests {
             written < body_len / 2,
             "客户端应在预算耗尽后立即断开，服务器不应写出大部分 body（实际已写 {written}/{body_len} 字节）"
         );
+    }
+
+    #[derive(Debug)]
+    struct TestChainError {
+        message: &'static str,
+        source: Option<Box<TestChainError>>,
+    }
+
+    impl std::fmt::Display for TestChainError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.message)
+        }
+    }
+
+    impl std::error::Error for TestChainError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source
+                .as_deref()
+                .map(|err| err as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn forward_error_with_sources_keeps_connect_root_cause_visible() {
+        let error = TestChainError {
+            message: "client error (Connect)",
+            source: Some(Box::new(TestChainError {
+                message: "tcp connect error",
+                source: Some(Box::new(TestChainError {
+                    message: "Connection refused (os error 61)",
+                    source: None,
+                })),
+            })),
+        };
+
+        let message = forward_error_with_sources("上游请求失败", &error);
+
+        assert!(message.contains("client error (Connect)"));
+        assert!(
+            message.contains("tcp connect error"),
+            "连接失败日志必须保留 hyper source chain，避免只看到笼统的 client error (Connect)"
+        );
+        assert!(message.contains("Connection refused (os error 61)"));
     }
 
     #[tokio::test]

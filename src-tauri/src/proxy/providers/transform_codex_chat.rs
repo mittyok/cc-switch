@@ -50,6 +50,8 @@ const CUSTOM_TOOL_INPUT_FIELD: &str = "input";
 const CHAT_TOOL_NAME_MAX_LEN: usize = 64;
 const CUSTOM_TOOL_INPUT_DESCRIPTION: &str = "Raw string input for the original custom tool. Preserve formatting exactly and follow the original tool definition embedded in the description.";
 const CUSTOM_TOOL_PRESERVED_METADATA_HEADING: &str = "Original tool definition:";
+const CHAT_UNSUPPORTED_ROOT_SCHEMA_KEYS: &[&str] =
+    &["oneOf", "anyOf", "allOf", "enum", "const", "not"];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CodexToolKind {
     Function,
@@ -323,6 +325,7 @@ pub fn responses_to_chat_completions_with_reasoning(
     let tools = tool_context.chat_tools();
     if !tools.is_empty() {
         result["tools"] = json!(tools);
+        strip_chat_unsupported_tool_schema_keywords(&mut result);
     }
 
     if let Some(tool_choice) = body.get("tool_choice") {
@@ -1424,6 +1427,42 @@ fn serialize_tool_definition_for_description(tool: &Value) -> String {
     canonical_json_string(tool)
 }
 
+fn strip_chat_unsupported_root_schema_keywords(schema: &mut Value) -> bool {
+    let Some(obj) = schema.as_object_mut() else {
+        return false;
+    };
+
+    let mut changed = false;
+    // The Codex→Claude first-hop model service rejects root-level JSON Schema
+    // unions/constraints with `invalid_function_parameters` before fallback can
+    // run (observed on `mcp__codex_app__automation_update`). Keep this Chat-only:
+    // the Anthropic bridge shares CodexToolContext and still accepts root unions.
+    for key in CHAT_UNSUPPORTED_ROOT_SCHEMA_KEYS {
+        changed |= obj.remove(*key).is_some();
+    }
+    changed
+}
+
+fn strip_chat_unsupported_tool_schema_keywords(body: &mut Value) -> usize {
+    let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+
+    let mut changed = 0usize;
+    for tool in tools {
+        let Some(parameters) = tool
+            .get_mut("function")
+            .and_then(|function| function.get_mut("parameters"))
+        else {
+            continue;
+        };
+        if strip_chat_unsupported_root_schema_keywords(parameters) {
+            changed += 1;
+        }
+    }
+    changed
+}
+
 /// Normalize a function's `parameters` JSON Schema so `type` is always `"object"`.
 ///
 /// Some Responses tools carry `parameters: null` or `parameters: {"type": null}`,
@@ -1438,6 +1477,8 @@ fn normalize_function_parameters(params: Option<&Value>) -> Value {
             Some("object") => {}
             _ => {
                 obj.insert("type".to_string(), json!("object"));
+                obj.entry("properties".to_string())
+                    .or_insert_with(|| json!({}));
             }
         }
     }
@@ -1813,7 +1854,10 @@ fn chat_message_to_response_output_item(message: &Value, response_id: &str) -> O
     }
 
     Some(json!({
-        "id": format!("{response_id}_msg"),
+        // Codex replays output message items as future Responses input; OpenAI
+        // rejects replayed message ids unless they begin with `msg` (seen as
+        // `Invalid 'input[n].id': 'resp_..._msg...'`).
+        "id": format!("msg_{response_id}"),
         "type": "message",
         "status": "completed",
         "role": "assistant",
@@ -2658,13 +2702,14 @@ mod tests {
     }
 
     #[test]
-    fn responses_request_to_chat_defaults_top_level_one_of_tool_parameters_to_object() {
+    fn responses_request_to_chat_strips_top_level_unsupported_tool_schema_keywords() {
         let input = json!({
             "model": "gpt-5.4",
             "tools": [{
                 "type": "function",
-                "name": "lookup",
+                "name": "mcp__codex_app__automation_update",
                 "parameters": {
+                    "type": "object",
                     "oneOf": [
                         {
                             "type": "object",
@@ -2674,7 +2719,15 @@ mod tests {
                             "type": "object",
                             "properties": {"slug": {"type": "string"}}
                         }
-                    ]
+                    ],
+                    "anyOf": [{"required": ["id"]}],
+                    "allOf": [{"required": ["status"]}],
+                    "enum": ["todo", "done"],
+                    "const": "todo",
+                    "not": {"required": ["bad"]},
+                    "properties": {
+                        "status": {"type": "string", "enum": ["todo", "done"]}
+                    }
                 }
             }],
             "input": "hi"
@@ -2684,18 +2737,15 @@ mod tests {
         let parameters = &result["tools"][0]["function"]["parameters"];
 
         assert_eq!(parameters["type"], "object");
+        for key in CHAT_UNSUPPORTED_ROOT_SCHEMA_KEYS {
+            assert!(
+                parameters.get(*key).is_none(),
+                "Codex→Claude first-hop rejects root-level tool schema keyword {key}"
+            );
+        }
         assert_eq!(
-            parameters["oneOf"],
-            json!([
-                {
-                    "type": "object",
-                    "properties": {"id": {"type": "string"}}
-                },
-                {
-                    "type": "object",
-                    "properties": {"slug": {"type": "string"}}
-                }
-            ])
+            parameters["properties"]["status"]["enum"],
+            json!(["todo", "done"])
         );
     }
 
@@ -4497,6 +4547,10 @@ mod tests {
             "I should check the weather before answering."
         );
         assert_eq!(result["output"][1]["type"], "message");
+        assert_eq!(
+            result["output"][1]["id"], "msg_resp_chatcmpl_1",
+            "Responses replay requires output message item ids to begin with msg_"
+        );
         assert_eq!(result["output"][1]["content"][0]["text"], "Let me check.");
         assert_eq!(result["output"][2]["type"], "function_call");
         assert_eq!(result["output"][2]["call_id"], "call_1");

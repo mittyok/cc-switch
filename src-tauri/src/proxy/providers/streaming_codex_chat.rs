@@ -341,7 +341,10 @@ impl ChatToResponsesState {
 
         if !self.text.added {
             let output_index = self.next_output_index();
-            let item_id = format!("{}_msg", self.response_id);
+            // Codex replays output message items as future Responses input; OpenAI
+            // rejects replayed message ids unless they begin with `msg` (seen as
+            // `Invalid 'input[n].id': 'resp_..._msg...'`).
+            let item_id = format!("msg_{}", self.response_id);
             self.text.output_index = Some(output_index);
             self.text.item_id = item_id.clone();
             self.text.added = true;
@@ -1060,6 +1063,10 @@ mod tests {
 
         assert!(output.contains("event: response.created"));
         assert!(output.contains("event: response.output_text.delta"));
+        assert!(
+            output.contains("\"id\":\"msg_resp_chatcmpl_1\""),
+            "Responses replay requires output message item ids to begin with msg_"
+        );
         assert!(output.contains("\"text\":\"Hello\""));
         assert!(output.contains("event: response.completed"));
         assert!(output.contains("\"input_tokens\":4"));
