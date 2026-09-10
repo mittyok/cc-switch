@@ -31,7 +31,13 @@ const REASONING_VENDOR_HINTS: &[&str] = &["deepseek", "mimo", "xiaomimimo"];
 // request fields (for example `context_management`) and mid-conversation
 // `role=system` messages. Keep this list conservative: an over-broad match would
 // silently weaken requests for gateways that intentionally support those fields.
-const BEDROCK_COMPAT_ANTHROPIC_HOST_HINTS: &[&str] = &["ai-api.jdcloud.com"];
+const BEDROCK_COMPAT_ANTHROPIC_HOST_HINTS: &[&str] = &[
+    "ai-api.jdcloud.com",
+    // JDCloud's newer modelservice Anthropic gateway returns 400 when Codex tool
+    // schemas keep top-level `oneOf`/`allOf`/`anyOf`, so it needs the same
+    // Bedrock-compatible schema sanitizer as the older ai-api endpoint.
+    "modelservice.jdcloud.com",
+];
 const BEDROCK_COMPAT_ANTHROPIC_MAX_TOKENS: u64 = 32_000;
 
 /// 获取 Claude 供应商的 API 格式
@@ -2969,6 +2975,40 @@ mod tests {
             schema["properties"]["status"].get("enum").is_none(),
             "JDCloud/Bedrock latest 400s still had nested_unsupported after top-level cleanup, so nested enum must be stripped too"
         );
+    }
+
+    #[test]
+    fn test_jdcloud_modelservice_anthropic_sanitizes_tool_schema_keywords() {
+        let provider = create_provider(json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://modelservice.jdcloud.com/anthropic/v1/messages",
+                "ANTHROPIC_AUTH_TOKEN": "test-key"
+            }
+        }));
+        let mut body = json!({
+            "model": "Claude-Opus-4.6",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "tools": [{
+                "name": "mcp__codex_app__automation_update",
+                "input_schema": {
+                    "oneOf": [{ "required": ["id"] }],
+                    "properties": {
+                        "status": { "allOf": [{ "type": "string" }] }
+                    }
+                }
+            }]
+        });
+
+        let changed = normalize_anthropic_messages_for_provider(&mut body, &provider, "anthropic");
+
+        assert!(
+            changed,
+            "modelservice.jdcloud.com logs reject top-level oneOf/allOf/anyOf in tool input_schema, so this host must use Bedrock-compatible sanitization"
+        );
+        let schema = &body["tools"][0]["input_schema"];
+        assert_eq!(schema["type"], "object");
+        assert!(schema.get("oneOf").is_none());
+        assert!(schema["properties"]["status"].get("allOf").is_none());
     }
 
     #[test]
