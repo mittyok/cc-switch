@@ -2485,11 +2485,26 @@ impl RequestForwarder {
                 None => raw.to_vec(),
             };
             let body_text = String::from_utf8(decoded).ok();
-
-            Err(ProxyError::UpstreamError {
+            let error = ProxyError::UpstreamError {
                 status: status_code,
                 body: body_text,
-            })
+            };
+            let error_summary =
+                crate::redact_known_secrets(&summarize_proxy_error(&error), &log_secrets);
+            // Claude/Codex clients often wrap upstream 400 bodies as generic
+            // "API Error: 400" messages, so log the provider-side detail here
+            // after decompression and known-secret redaction for actionable diagnosis.
+            let app_type_name = app_type.as_str();
+            log::warn!(
+                "[{app_type_name}] [{tag}] <<< 上游请求失败: provider={} status={} target={} model={} error={}",
+                provider.name,
+                status_code,
+                target_for_log,
+                request_model,
+                error_summary
+            );
+
+            Err(error)
         }
     }
 
