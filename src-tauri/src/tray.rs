@@ -410,14 +410,8 @@ pub fn handle_profile_tray_event(app: &tauri::AppHandle, event_id: &str) -> bool
             return true;
         };
         if let Some(app_state) = app.try_state::<AppState>() {
-            match crate::services::profile::ProfileService::clear_current(app_state.inner(), scope)
-            {
-                Ok(warnings) => {
-                    for warning in warnings {
-                        log::warn!("[Profile] 清除当前项目警告: {warning}");
-                    }
-                }
-                Err(e) => log::error!("清除当前项目失败: {e}"),
+            if let Err(e) = app_state.db.set_current_profile_id(scope.as_str(), None) {
+                log::error!("清除当前项目失败: {e}");
             }
         }
         // 通知主窗口刷新（profileId=null 表示该分组已清除当前项目）

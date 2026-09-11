@@ -152,10 +152,10 @@ pub fn delete_profile(state: State<'_, AppState>, id: String) -> Result<(), Stri
 #[tauri::command]
 pub fn clear_current_profile(state: State<'_, AppState>, scope: String) -> Result<(), String> {
     let scope = ProfileScope::parse(&scope).map_err(|e| e.to_string())?;
-    for warning in ProfileService::clear_current(&state, scope).map_err(|e| e.to_string())? {
-        log::warn!("[Profile] 清除当前项目警告: {warning}");
-    }
-    Ok(())
+    state
+        .db
+        .set_current_profile_id(scope.as_str(), None)
+        .map_err(|e| e.to_string())
 }
 
 /// 应用项目快照（只作用于发起页所属分组内的应用）。
