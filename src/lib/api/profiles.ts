@@ -28,6 +28,8 @@ export interface ProfilePayload {
   mcp: PerApp<string[] | null>;
   skills: PerApp<string[] | null>;
   prompts: PerApp<string | null>;
+  /** Per-app failover queue provider ids captured with the project. */
+  failover: PerApp<string[] | null>;
 }
 
 export interface Profile {

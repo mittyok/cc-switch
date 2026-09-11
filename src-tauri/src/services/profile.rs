@@ -130,6 +130,15 @@ pub struct ProfilePayload {
     pub skills: PerApp<Option<Vec<String>>>,
     /// 每 app 激活的 prompt id
     pub prompts: PerApp<Option<String>>,
+    /// 每 app 的故障转移队列成员（按快照时优先级排序的供应商 id）
+    ///
+    /// 队列本体存在 providers.in_failover_queue 全局布尔位上、不随项目
+    /// 切换，会把上一项目的队列带进新项目（代理可能把请求打到别的项目的
+    /// 供应商）；这里随项目快照保存成员关系，apply 时按快照重建。
+    /// auto_failover 开关不在快照内：切换项目总是先退出代理接管
+    /// （enabled=false），开关属于代理运行态，恢复它会造成
+    /// "接管关、开关开"的不一致状态。
+    pub failover: PerApp<Option<Vec<String>>>,
 }
 
 impl ProfilePayload {
@@ -151,6 +160,9 @@ impl ProfilePayload {
             if let (Some(dst), Some(src)) = (self.prompts.get_mut(app), other.prompts.get(app)) {
                 *dst = src.clone();
             }
+            if let (Some(dst), Some(src)) = (self.failover.get_mut(app), other.failover.get(app)) {
+                *dst = src.clone();
+            }
         }
     }
 
@@ -161,6 +173,7 @@ impl ProfilePayload {
                 || self.mcp.get(app).is_some_and(|s| s.is_some())
                 || self.skills.get(app).is_some_and(|s| s.is_some())
                 || self.prompts.get(app).is_some_and(|s| s.is_some())
+                || self.failover.get(app).is_some_and(|s| s.is_some())
         })
     }
 }
@@ -188,6 +201,30 @@ fn plan_toggles(
         .collect();
 
     (toggles, dangling)
+}
+
+/// 计算故障转移队列成员的最小增删集：返回 (待加入, 待移除)
+///
+/// 队列持久化是 providers.in_failover_queue 全局布尔位，优先级由
+/// providers.sort_index 派生——恢复项目快照时只需对齐成员集合，
+/// 快照中记录的顺序仅用于可读性，无需额外写入。
+fn plan_failover_membership(
+    current_ids: &[String],
+    target_ids: &HashSet<&str>,
+) -> (Vec<String>, Vec<String>) {
+    let current: HashSet<&str> = current_ids.iter().map(String::as_str).collect();
+    let mut add: Vec<String> = target_ids
+        .iter()
+        .filter(|id| !current.contains(**id))
+        .map(|id| id.to_string())
+        .collect();
+    add.sort();
+    let remove: Vec<String> = current_ids
+        .iter()
+        .filter(|id| !target_ids.contains(id.as_str()))
+        .cloned()
+        .collect();
+    (add, remove)
 }
 
 pub struct ProfileService;
@@ -231,6 +268,20 @@ impl ProfileService {
                     .values()
                     .find(|p| p.enabled)
                     .map(|p| p.id.clone());
+            }
+            if let Some(slot) = payload.failover.get_mut(app) {
+                // 只有带本地代理数据面的应用才有故障转移队列；Claude Desktop
+                // 等无代理应用的槽位保持 None（"不适用"），apply 时不动它。
+                if app.supports_local_proxy() {
+                    *slot = Some(
+                        state
+                            .db
+                            .get_failover_queue(app.as_str())?
+                            .into_iter()
+                            .map(|item| item.provider_id)
+                            .collect(),
+                    );
+                }
             }
         }
         Ok(payload)
@@ -391,7 +442,60 @@ impl ProfileService {
                 }
             }
 
-            // 3. MCP diff（最小 toggle：仅动目标态≠当前态的条目；None = 该侧未拍过，不动）
+            // 3. 故障转移队列成员（None = 该侧未拍过或该应用不支持代理，不动）
+            //
+            // 不重建整个队列（clear + 逐个 add），而是按快照 diff 出最小增删：
+            // remove_from_failover_queue 会同步清理 provider_health，直接
+            // clear 会让仍在队列里的供应商健康记录被误留、被移出的又漏清。
+            if let Some(Some(target_ids)) = payload.failover.get(app) {
+                let providers = state.db.get_all_providers(app_str)?;
+                let mut target_set: HashSet<&str> = HashSet::new();
+                for id in target_ids {
+                    match providers.get(id) {
+                        None => warnings.push(format!(
+                            "[{app_str}] failover provider '{id}' no longer exists, skipped"
+                        )),
+                        // Codex Official 账号卡禁止参与故障转移（请求携带所选账号的
+                        // Authorization 头，重放到其他账号会越界）；旧快照里即使
+                        // 混入也不恢复。
+                        Some(p)
+                            if !crate::proxy::provider_router::provider_supports_failover(
+                                app_str, p,
+                            ) =>
+                        {
+                            warnings.push(format!(
+                                "[{app_str}] failover provider '{id}' does not support failover, skipped"
+                            ));
+                        }
+                        Some(_) => {
+                            target_set.insert(id.as_str());
+                        }
+                    }
+                }
+                let current_ids: Vec<String> = state
+                    .db
+                    .get_failover_queue(app_str)?
+                    .into_iter()
+                    .map(|item| item.provider_id)
+                    .collect();
+                let (to_add, to_remove) = plan_failover_membership(&current_ids, &target_set);
+                for id in to_add {
+                    if let Err(e) = state.db.add_to_failover_queue(app_str, &id) {
+                        warnings.push(format!(
+                            "[{app_str}] add failover provider '{id}' failed: {e}"
+                        ));
+                    }
+                }
+                for id in to_remove {
+                    if let Err(e) = state.db.remove_from_failover_queue(app_str, &id) {
+                        warnings.push(format!(
+                            "[{app_str}] remove failover provider '{id}' failed: {e}"
+                        ));
+                    }
+                }
+            }
+
+            // 4. MCP diff（最小 toggle：仅动目标态≠当前态的条目；None = 该侧未拍过，不动）
             if let Some(Some(target_ids)) = payload.mcp.get(app) {
                 let servers = state.db.get_all_mcp_servers()?;
                 let current: Vec<(String, bool)> = servers
@@ -411,7 +515,7 @@ impl ProfileService {
                 }
             }
 
-            // 4. Skills diff（SkillService 返回 anyhow::Result，收进 warning）
+            // 5. Skills diff（SkillService 返回 anyhow::Result，收进 warning）
             if let Some(Some(target_ids)) = payload.skills.get(app) {
                 let skills = state.db.get_all_installed_skills()?;
                 let current: Vec<(String, bool)> = skills
@@ -433,7 +537,7 @@ impl ProfileService {
                 }
             }
 
-            // 5. Prompt（None = 不动；已激活则幂等跳过，避免无谓的文件写与备份）
+            // 6. Prompt（None = 不动；已激活则幂等跳过，避免无谓的文件写与备份）
             if let Some(Some(target_prompt)) = payload.prompts.get(app) {
                 let prompts = state.db.get_prompts(app_str)?;
                 match prompts.get(target_prompt) {
@@ -496,6 +600,11 @@ mod tests {
                 claude_desktop: None,
                 codex: Some("pr1".into()),
             },
+            failover: PerApp {
+                claude: Some(ids(&["p1", "p2"])),
+                claude_desktop: None,
+                codex: Some(ids(&["c1"])),
+            },
         };
         let json = serde_json::to_string(&payload).unwrap();
         // per-app key 必须与 AppType 的 serde 形式一致（claude-desktop 是连字符）
@@ -520,6 +629,10 @@ mod tests {
         assert_eq!(back.mcp.claude_desktop, None);
         assert_eq!(back.mcp.codex, None, "missing slot means untouched");
         assert_eq!(back.prompts.codex, None);
+        assert_eq!(
+            back.failover.codex, None,
+            "old profiles did not capture failover"
+        );
 
         let empty: ProfilePayload = serde_json::from_str("{}").unwrap();
         assert_eq!(empty, ProfilePayload::default());
@@ -539,6 +652,11 @@ mod tests {
                 claude_desktop: Some(vec![]),
                 codex: Some(ids(&["m9"])),
             },
+            failover: PerApp {
+                claude: Some(ids(&["f1"])),
+                claude_desktop: None,
+                codex: Some(ids(&["cf1"])),
+            },
             ..Default::default()
         };
         // 在 Claude 页"以当前状态更新"：只覆盖 claude 组槽位
@@ -553,6 +671,11 @@ mod tests {
                 claude_desktop: Some(vec![]),
                 codex: None,
             },
+            failover: PerApp {
+                claude: Some(ids(&["f2", "f3"])),
+                claude_desktop: None,
+                codex: Some(ids(&["SHOULD-NOT-LEAK"])),
+            },
             ..Default::default()
         };
         payload.merge_scope_from(&fresh, ProfileScope::Claude);
@@ -564,9 +687,11 @@ mod tests {
             "claude-desktop slot is in its own scope, untouched by claude merge"
         );
         assert_eq!(payload.mcp.claude, Some(ids(&["m2"])));
+        assert_eq!(payload.failover.claude, Some(ids(&["f2", "f3"])));
         // codex 侧完好：既没被覆盖也没被 fresh 的值污染
         assert_eq!(payload.providers.codex, Some("c1".to_string()));
         assert_eq!(payload.mcp.codex, Some(ids(&["m9"])));
+        assert_eq!(payload.failover.codex, Some(ids(&["cf1"])));
     }
 
     #[test]
@@ -582,6 +707,14 @@ mod tests {
         assert!(!payload.scope_captured(ProfileScope::ClaudeDesktop));
         assert!(!payload.scope_captured(ProfileScope::Codex));
 
+        let mut codex_failover_only = ProfilePayload::default();
+        codex_failover_only.failover.codex = Some(vec![]);
+        assert!(
+            codex_failover_only.scope_captured(ProfileScope::Codex),
+            "an intentionally empty failover queue is still a captured project setting"
+        );
+        assert!(!codex_failover_only.scope_captured(ProfileScope::Claude));
+
         // Desktop 槽位属于独立的 claude-desktop 组
         let mut desktop_only = ProfilePayload::default();
         desktop_only.providers.claude_desktop = Some("d1".into());
@@ -596,6 +729,18 @@ mod tests {
         assert!(per.get(&AppType::ClaudeDesktop).is_some());
         assert!(per.get(&AppType::Codex).is_some());
         assert!(per.get(&AppType::Gemini).is_none());
+    }
+
+    #[test]
+    fn test_plan_failover_membership_minimal_diff() {
+        let current = ids(&["keep", "remove"]);
+        let mut target = HashSet::new();
+        target.insert("keep");
+        target.insert("add");
+
+        let (to_add, to_remove) = plan_failover_membership(&current, &target);
+        assert_eq!(to_add, ids(&["add"]));
+        assert_eq!(to_remove, ids(&["remove"]));
     }
 
     #[test]
