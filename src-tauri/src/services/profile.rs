@@ -119,11 +119,47 @@ impl<T> PerApp<T> {
 /// 故障转移实际按 providers.sort_index 排序；只保存 provider id 会导致
 /// 项目内调整的 P1/P2 优先级泄漏到其它项目/未使用项目，所以快照必须
 /// 同时保存排序值。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FailoverProfileItem {
     pub provider_id: String,
     pub sort_index: Option<usize>,
+    #[serde(skip)]
+    legacy_order_only: bool,
+}
+
+impl<'de> Deserialize<'de> for FailoverProfileItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Item {
+            provider_id: String,
+            sort_index: Option<usize>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum ItemOrLegacyId {
+            Item(Item),
+            LegacyId(String),
+        }
+
+        match ItemOrLegacyId::deserialize(deserializer)? {
+            ItemOrLegacyId::Item(item) => Ok(Self {
+                provider_id: item.provider_id,
+                sort_index: item.sort_index,
+                legacy_order_only: false,
+            }),
+            ItemOrLegacyId::LegacyId(provider_id) => Ok(Self {
+                provider_id,
+                sort_index: None,
+                legacy_order_only: true,
+            }),
+        }
+    }
 }
 
 /// Profile 的 JSON 快照结构（与前端 TS 类型严格对应）
@@ -239,6 +275,42 @@ fn plan_failover_membership(
     (add, remove)
 }
 
+fn infer_missing_failover_sort_index(failover: &mut PerApp<Option<Vec<FailoverProfileItem>>>) {
+    for slot in [
+        &mut failover.claude,
+        &mut failover.claude_desktop,
+        &mut failover.codex,
+    ] {
+        if let Some(items) = slot {
+            for (index, item) in items.iter_mut().enumerate() {
+                // 兼容旧版 payload/no-profile 设置：当时只保存按路由优先级
+                // 排好序的 provider id。读取后把数组位置补成 sort_index，避免
+                // 升级后切换“不使用项目”直接解析失败，且尽量保留旧顺序。
+                if item.legacy_order_only {
+                    item.sort_index = Some(index);
+                    item.legacy_order_only = false;
+                }
+            }
+        }
+    }
+}
+
+fn parse_profile_payload(value: &str) -> Result<ProfilePayload, AppError> {
+    let mut payload: ProfilePayload = serde_json::from_str(value)
+        .map_err(|e| AppError::Config(format!("解析 profile payload 失败: {e}")))?;
+    infer_missing_failover_sort_index(&mut payload.failover);
+    Ok(payload)
+}
+
+fn parse_failover_payload(
+    value: &str,
+) -> Result<PerApp<Option<Vec<FailoverProfileItem>>>, AppError> {
+    let mut failover: PerApp<Option<Vec<FailoverProfileItem>>> = serde_json::from_str(value)
+        .map_err(|e| AppError::Config(format!("解析 no-profile failover payload 失败: {e}")))?;
+    infer_missing_failover_sort_index(&mut failover);
+    Ok(failover)
+}
+
 fn no_profile_failover_key(scope: ProfileScope) -> String {
     format!("no_profile_failover_{}", scope.as_str())
 }
@@ -297,6 +369,7 @@ impl ProfileService {
                             .map(|item| FailoverProfileItem {
                                 provider_id: item.provider_id,
                                 sort_index: item.sort_index,
+                                legacy_order_only: false,
                             })
                             .collect(),
                     );
@@ -327,6 +400,7 @@ impl ProfileService {
                             .map(|item| FailoverProfileItem {
                                 provider_id: item.provider_id,
                                 sort_index: item.sort_index,
+                                legacy_order_only: false,
                             })
                             .collect(),
                     );
@@ -448,10 +522,7 @@ impl ProfileService {
 
         let saved = state.db.get_setting(&no_profile_failover_key(scope))?;
         let failover = match saved {
-            Some(value) => serde_json::from_str::<PerApp<Option<Vec<FailoverProfileItem>>>>(&value)
-                .map_err(|e| {
-                    AppError::Config(format!("解析 no-profile failover payload 失败: {e}"))
-                })?,
+            Some(value) => parse_failover_payload(&value)?,
             None => PerApp::default(),
         };
         Self::restore_failover_slots(state, &failover, scope, &mut warnings)?;
@@ -507,8 +578,7 @@ impl ProfileService {
             let scope = scope.ok_or_else(|| {
                 AppError::InvalidInput("Resnapshot requires a profile scope".to_string())
             })?;
-            let mut payload: ProfilePayload = serde_json::from_str(&profile.payload)
-                .map_err(|e| AppError::Config(format!("解析 profile payload 失败: {e}")))?;
+            let mut payload = parse_profile_payload(&profile.payload)?;
             payload.merge_scope_from(&Self::snapshot_current(state, scope)?, scope);
             profile.payload = serde_json::to_string(&payload)
                 .map_err(|e| AppError::Config(format!("序列化 profile payload 失败: {e}")))?;
@@ -573,8 +643,7 @@ impl ProfileService {
             .db
             .get_profile(profile_id)?
             .ok_or_else(|| AppError::InvalidInput(format!("Profile not found: {profile_id}")))?;
-        let payload: ProfilePayload = serde_json::from_str(&profile.payload)
-            .map_err(|e| AppError::Config(format!("解析 profile payload 失败: {e}")))?;
+        let payload = parse_profile_payload(&profile.payload)?;
 
         if !payload.scope_captured(scope) {
             warnings.push(format!(
@@ -707,6 +776,7 @@ mod tests {
             .map(|(provider_id, sort_index)| FailoverProfileItem {
                 provider_id: provider_id.to_string(),
                 sort_index: *sort_index,
+                legacy_order_only: false,
             })
             .collect()
     }
@@ -779,6 +849,50 @@ mod tests {
         assert!(json.contains("\"codex\""));
         let back: ProfilePayload = serde_json::from_str(&json).unwrap();
         assert_eq!(back, payload);
+    }
+
+    #[test]
+    fn test_legacy_failover_provider_id_payload_is_accepted() {
+        let mut payload = parse_profile_payload(
+            r#"{
+                "providers":{},
+                "failover":{
+                    "claude":["p1","p2"],
+                    "codex":[{"providerId":"c1","sortIndex":7}]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            payload.failover.claude.take(),
+            Some(failover_items(&[("p1", Some(0)), ("p2", Some(1))])),
+            "legacy project snapshots stored only ordered provider ids; upgrade must keep that order"
+        );
+        assert_eq!(
+            payload.failover.codex.take(),
+            Some(failover_items(&[("c1", Some(7))])),
+            "new failover items must keep their explicit route order"
+        );
+    }
+
+    #[test]
+    fn test_legacy_no_profile_failover_provider_id_payload_is_accepted() {
+        let failover = parse_failover_payload(
+            r#"{
+                "claude":["p1","p2"],
+                "claude-desktop":null,
+                "codex":[{"providerId":"c1","sortIndex":3}]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            failover.claude,
+            Some(failover_items(&[("p1", Some(0)), ("p2", Some(1))])),
+            "switching back to no-profile must not fail on the previous string-id payload format"
+        );
+        assert_eq!(failover.codex, Some(failover_items(&[("c1", Some(3))])));
     }
 
     #[test]
