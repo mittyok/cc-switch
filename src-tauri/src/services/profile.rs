@@ -183,10 +183,16 @@ pub struct ProfilePayload {
     /// 队列本体存在 providers.in_failover_queue 全局布尔位上，路由优先级
     /// 复用 providers.sort_index；二者默认都不随项目切换，会把上一项目的
     /// P1/P2 路由带进新项目。这里随项目快照保存成员关系和排序值，apply
-    /// 时一起恢复。auto_failover 开关不在快照内：切换项目总是先退出代理
-    /// 接管（enabled=false），开关属于代理运行态，恢复它会造成
-    /// "接管关、开关开"的不一致状态。
+    /// 时一起恢复。
     pub failover: PerApp<Option<Vec<FailoverProfileItem>>>,
+    /// 每 app 的故障转移路由开关（proxy_config.auto_failover_enabled）。
+    ///
+    /// 该开关与队列成员共同决定路由行为；若不随项目/未使用项目保存，
+    /// GLM 项目里打开的路由会泄漏到“未使用项目”，切回项目又会被
+    /// 切换流程关闭接管时丢失。只恢复 auto_failover_enabled，不恢复
+    /// proxy enabled 接管态，保持“切项目必退出接管”的既有约束。
+    #[serde(rename = "autoFailover")]
+    pub auto_failover: PerApp<Option<bool>>,
 }
 
 impl ProfilePayload {
@@ -211,6 +217,12 @@ impl ProfilePayload {
             if let (Some(dst), Some(src)) = (self.failover.get_mut(app), other.failover.get(app)) {
                 *dst = src.clone();
             }
+            if let (Some(dst), Some(src)) = (
+                self.auto_failover.get_mut(app),
+                other.auto_failover.get(app),
+            ) {
+                *dst = *src;
+            }
         }
     }
 
@@ -222,6 +234,7 @@ impl ProfilePayload {
                 || self.skills.get(app).is_some_and(|s| s.is_some())
                 || self.prompts.get(app).is_some_and(|s| s.is_some())
                 || self.failover.get(app).is_some_and(|s| s.is_some())
+                || self.auto_failover.get(app).is_some_and(|s| s.is_some())
         })
     }
 }
@@ -302,13 +315,36 @@ fn parse_profile_payload(value: &str) -> Result<ProfilePayload, AppError> {
     Ok(payload)
 }
 
-fn parse_failover_payload(
-    value: &str,
-) -> Result<PerApp<Option<Vec<FailoverProfileItem>>>, AppError> {
-    let mut failover: PerApp<Option<Vec<FailoverProfileItem>>> = serde_json::from_str(value)
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct NoProfileFailoverPayload {
+    failover: PerApp<Option<Vec<FailoverProfileItem>>>,
+    #[serde(rename = "autoFailover")]
+    auto_failover: PerApp<Option<bool>>,
+}
+
+fn parse_failover_payload(value: &str) -> Result<NoProfileFailoverPayload, AppError> {
+    let raw: serde_json::Value = serde_json::from_str(value)
         .map_err(|e| AppError::Config(format!("解析 no-profile failover payload 失败: {e}")))?;
-    infer_missing_failover_sort_index(&mut failover);
-    Ok(failover)
+    let is_wrapper = raw
+        .as_object()
+        .is_some_and(|obj| obj.contains_key("failover") || obj.contains_key("autoFailover"));
+
+    let mut payload = if is_wrapper {
+        serde_json::from_value(raw)
+            .map_err(|e| AppError::Config(format!("解析 no-profile failover payload 失败: {e}")))?
+    } else {
+        // 兼容已落盘的旧 no-profile 值：顶层就是 PerApp<failover>，不能让
+        // 新 wrapper 的 serde(default) 吞掉 claude/codex 键而误判为空快照。
+        let failover: PerApp<Option<Vec<FailoverProfileItem>>> = serde_json::from_value(raw)
+            .map_err(|e| AppError::Config(format!("解析 no-profile failover payload 失败: {e}")))?;
+        NoProfileFailoverPayload {
+            failover,
+            auto_failover: PerApp::default(),
+        }
+    };
+    infer_missing_failover_sort_index(&mut payload.failover);
+    Ok(payload)
 }
 
 fn no_profile_failover_key(scope: ProfileScope) -> String {
@@ -375,6 +411,12 @@ impl ProfileService {
                     );
                 }
             }
+            if let Some(slot) = payload.auto_failover.get_mut(app) {
+                if app.supports_local_proxy() {
+                    let (_, auto_failover_enabled) = state.db.get_proxy_flags_sync(app.as_str());
+                    *slot = Some(auto_failover_enabled);
+                }
+            }
         }
         Ok(payload)
     }
@@ -387,11 +429,11 @@ impl ProfileService {
     fn snapshot_failover_current(
         state: &AppState,
         scope: ProfileScope,
-    ) -> Result<PerApp<Option<Vec<FailoverProfileItem>>>, AppError> {
-        let mut failover = PerApp::default();
+    ) -> Result<NoProfileFailoverPayload, AppError> {
+        let mut payload = NoProfileFailoverPayload::default();
         for app in scope.apps() {
-            if let Some(slot) = failover.get_mut(app) {
-                if app.supports_local_proxy() {
+            if app.supports_local_proxy() {
+                if let Some(slot) = payload.failover.get_mut(app) {
                     *slot = Some(
                         state
                             .db
@@ -405,14 +447,18 @@ impl ProfileService {
                             .collect(),
                     );
                 }
+                if let Some(slot) = payload.auto_failover.get_mut(app) {
+                    let (_, auto_failover_enabled) = state.db.get_proxy_flags_sync(app.as_str());
+                    *slot = Some(auto_failover_enabled);
+                }
             }
         }
-        Ok(failover)
+        Ok(payload)
     }
 
     fn save_no_profile_failover(state: &AppState, scope: ProfileScope) -> Result<(), AppError> {
-        let failover = Self::snapshot_failover_current(state, scope)?;
-        let value = serde_json::to_string(&failover).map_err(|e| {
+        let payload = Self::snapshot_failover_current(state, scope)?;
+        let value = serde_json::to_string(&payload).map_err(|e| {
             AppError::Config(format!("序列化 no-profile failover payload 失败: {e}"))
         })?;
         state
@@ -508,6 +554,43 @@ impl ProfileService {
         Ok(())
     }
 
+    fn restore_auto_failover_for_app(
+        state: &AppState,
+        app: &AppType,
+        target_auto_failover: bool,
+        warnings: &mut Vec<String>,
+    ) {
+        let app_str = app.as_str();
+        let (enabled, current_auto_failover) = state.db.get_proxy_flags_sync(app_str);
+        if current_auto_failover == target_auto_failover {
+            return;
+        }
+        // 项目切换会先关闭 proxy enabled（接管态），但用户看到的“路由开关”
+        // 是 auto_failover_enabled；只恢复这个开关，防止 GLM 项目与“未使用项目”
+        // 之间互相泄漏，同时不重新打开已退出的代理接管。
+        if let Err(e) = state
+            .db
+            .set_proxy_flags_sync(app_str, enabled, target_auto_failover)
+        {
+            warnings.push(format!(
+                "[{app_str}] restore auto failover switch -> {target_auto_failover} failed: {e}"
+            ));
+        }
+    }
+
+    fn restore_auto_failover_slots(
+        state: &AppState,
+        auto_failover: &PerApp<Option<bool>>,
+        scope: ProfileScope,
+        warnings: &mut Vec<String>,
+    ) {
+        for app in scope.apps() {
+            if let Some(Some(target_auto_failover)) = auto_failover.get(app) {
+                Self::restore_auto_failover_for_app(state, app, *target_auto_failover, warnings);
+            }
+        }
+    }
+
     /// 离开项目时恢复“未使用项目”的故障转移队列，避免项目内新增的
     /// failover provider 泄漏到全局未绑定状态。
     pub fn clear_current(state: &AppState, scope: ProfileScope) -> Result<Vec<String>, AppError> {
@@ -521,11 +604,12 @@ impl ProfileService {
         }
 
         let saved = state.db.get_setting(&no_profile_failover_key(scope))?;
-        let failover = match saved {
+        let payload = match saved {
             Some(value) => parse_failover_payload(&value)?,
-            None => PerApp::default(),
+            None => NoProfileFailoverPayload::default(),
         };
-        Self::restore_failover_slots(state, &failover, scope, &mut warnings)?;
+        Self::restore_failover_slots(state, &payload.failover, scope, &mut warnings)?;
+        Self::restore_auto_failover_slots(state, &payload.auto_failover, scope, &mut warnings);
         state.db.set_current_profile_id(scope.as_str(), None)?;
         Ok(warnings)
     }
@@ -688,6 +772,14 @@ impl ProfileService {
             if let Some(Some(target_ids)) = payload.failover.get(app) {
                 Self::restore_failover_for_app(state, app, target_ids, &mut warnings)?;
             }
+            if let Some(Some(target_auto_failover)) = payload.auto_failover.get(app) {
+                Self::restore_auto_failover_for_app(
+                    state,
+                    app,
+                    *target_auto_failover,
+                    &mut warnings,
+                );
+            }
 
             // 4. MCP diff（最小 toggle：仅动目标态≠当前态的条目；None = 该侧未拍过，不动）
             if let Some(Some(target_ids)) = payload.mcp.get(app) {
@@ -841,6 +933,11 @@ mod tests {
                 claude_desktop: None,
                 codex: Some(failover_items(&[("c1", Some(3))])),
             },
+            auto_failover: PerApp {
+                claude: Some(true),
+                claude_desktop: None,
+                codex: Some(false),
+            },
         };
         let json = serde_json::to_string(&payload).unwrap();
         // per-app key 必须与 AppType 的 serde 形式一致（claude-desktop 是连字符）
@@ -878,7 +975,7 @@ mod tests {
 
     #[test]
     fn test_legacy_no_profile_failover_provider_id_payload_is_accepted() {
-        let failover = parse_failover_payload(
+        let payload = parse_failover_payload(
             r#"{
                 "claude":["p1","p2"],
                 "claude-desktop":null,
@@ -888,11 +985,44 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            failover.claude,
+            payload.failover.claude,
             Some(failover_items(&[("p1", Some(0)), ("p2", Some(1))])),
             "switching back to no-profile must not fail on the previous string-id payload format"
         );
-        assert_eq!(failover.codex, Some(failover_items(&[("c1", Some(3))])));
+        assert_eq!(
+            payload.failover.codex,
+            Some(failover_items(&[("c1", Some(3))]))
+        );
+        assert_eq!(
+            payload.auto_failover.codex, None,
+            "legacy no-profile baseline did not capture the route switch"
+        );
+    }
+
+    #[test]
+    fn test_no_profile_failover_wrapper_payload_is_accepted() {
+        let payload = parse_failover_payload(
+            r#"{
+                "failover": {
+                    "claude": [{"providerId":"p1","sortIndex":4}],
+                    "claude-desktop": null,
+                    "codex": []
+                },
+                "autoFailover": {
+                    "claude": true,
+                    "claude-desktop": null,
+                    "codex": false
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            payload.failover.claude,
+            Some(failover_items(&[("p1", Some(4))]))
+        );
+        assert_eq!(payload.auto_failover.claude, Some(true));
+        assert_eq!(payload.auto_failover.codex, Some(false));
     }
 
     #[test]
@@ -912,6 +1042,10 @@ mod tests {
         assert_eq!(
             back.failover.codex, None,
             "old profiles did not capture failover"
+        );
+        assert_eq!(
+            back.auto_failover.codex, None,
+            "old profiles did not capture the route switch"
         );
 
         let empty: ProfilePayload = serde_json::from_str("{}").unwrap();
@@ -937,6 +1071,11 @@ mod tests {
                 claude_desktop: None,
                 codex: Some(failover_items(&[("cf1", Some(2))])),
             },
+            auto_failover: PerApp {
+                claude: Some(true),
+                claude_desktop: None,
+                codex: Some(false),
+            },
             ..Default::default()
         };
         // 在 Claude 页"以当前状态更新"：只覆盖 claude 组槽位
@@ -956,6 +1095,11 @@ mod tests {
                 claude_desktop: None,
                 codex: Some(failover_items(&[("SHOULD-NOT-LEAK", Some(9))])),
             },
+            auto_failover: PerApp {
+                claude: Some(false),
+                claude_desktop: Some(true),
+                codex: Some(true),
+            },
             ..Default::default()
         };
         payload.merge_scope_from(&fresh, ProfileScope::Claude);
@@ -971,6 +1115,11 @@ mod tests {
             payload.failover.claude,
             Some(failover_items(&[("f2", Some(0)), ("f3", Some(4))]))
         );
+        assert_eq!(
+            payload.auto_failover.claude,
+            Some(false),
+            "route switch is part of the scoped failover snapshot and must update with it"
+        );
         // codex 侧完好：既没被覆盖也没被 fresh 的值污染
         assert_eq!(payload.providers.codex, Some("c1".to_string()));
         assert_eq!(payload.mcp.codex, Some(ids(&["m9"])));
@@ -978,6 +1127,7 @@ mod tests {
             payload.failover.codex,
             Some(failover_items(&[("cf1", Some(2))]))
         );
+        assert_eq!(payload.auto_failover.codex, Some(false));
     }
 
     #[test]
@@ -1000,6 +1150,13 @@ mod tests {
             "an intentionally empty failover queue is still a captured project setting"
         );
         assert!(!codex_failover_only.scope_captured(ProfileScope::Claude));
+
+        let mut codex_route_switch_only = ProfilePayload::default();
+        codex_route_switch_only.auto_failover.codex = Some(false);
+        assert!(
+            codex_route_switch_only.scope_captured(ProfileScope::Codex),
+            "an explicitly off route switch is still a captured project setting"
+        );
 
         // Desktop 槽位属于独立的 claude-desktop 组
         let mut desktop_only = ProfilePayload::default();
@@ -1071,9 +1228,16 @@ mod tests {
 
         let result = (|| {
             let state = state_with_providers(&[("a", 0, true), ("b", 1, false), ("c", 2, false)])?;
+            let (_, initial_auto) = state.db.get_proxy_flags_sync(AppType::Claude.as_str());
+            assert!(!initial_auto, "initial auto_failover should be false");
+
             let profile_payload = ProfilePayload {
                 failover: PerApp {
                     claude: Some(failover_items(&[("b", Some(0)), ("c", Some(1))])),
+                    ..Default::default()
+                },
+                auto_failover: PerApp {
+                    claude: Some(true),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -1098,9 +1262,14 @@ mod tests {
                 vec![("b".to_string(), Some(0)), ("c".to_string(), Some(1))],
                 "using a project should replace the no-profile failover queue"
             );
+            let (_, auto_after_apply) = state.db.get_proxy_flags_sync(AppType::Claude.as_str());
+            assert!(
+                auto_after_apply,
+                "applying a project with auto_failover=true must turn on the route switch"
+            );
 
             // 模拟用户在项目内调整故障转移：如果 clear_current 不恢复 no-profile
-            // 快照，这些成员和 P1/P2 排序都会泄漏回“未使用项目”。
+            // 快照，这些成员、P1/P2 排序和路由开关都会泄漏回“未使用项目”。
             let mut a = state
                 .db
                 .get_provider_by_id("a", AppType::Claude.as_str())?
@@ -1141,6 +1310,11 @@ mod tests {
                     .expect("provider b")
                     .in_failover_queue,
                 "provider added by the project must not remain in the no-profile queue"
+            );
+            let (_, auto_after_clear) = state.db.get_proxy_flags_sync(AppType::Claude.as_str());
+            assert!(
+                !auto_after_clear,
+                "returning to no-profile must restore the route switch to its original off state"
             );
 
             Ok(())

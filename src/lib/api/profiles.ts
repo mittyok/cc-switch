@@ -35,6 +35,8 @@ export interface ProfilePayload {
   prompts: PerApp<string | null>;
   /** Per-app failover queue entries and route order captured with the project. */
   failover: PerApp<FailoverProfileItem[] | null>;
+  /** Per-app failover routing switch captured with the project. */
+  autoFailover: PerApp<boolean | null>;
 }
 
 export interface Profile {
