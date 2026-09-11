@@ -227,6 +227,10 @@ fn plan_failover_membership(
     (add, remove)
 }
 
+fn no_profile_failover_key(scope: ProfileScope) -> String {
+    format!("no_profile_failover_{}", scope.as_str())
+}
+
 pub struct ProfileService;
 
 impl ProfileService {
@@ -290,6 +294,131 @@ impl ProfileService {
     /// 列出所有项目（项目实体全应用共享，current 标记按分组单独读取）
     pub fn list(state: &AppState) -> Result<Vec<Profile>, AppError> {
         state.db.get_all_profiles()
+    }
+
+    fn snapshot_failover_current(
+        state: &AppState,
+        scope: ProfileScope,
+    ) -> Result<PerApp<Option<Vec<String>>>, AppError> {
+        let mut failover = PerApp::default();
+        for app in scope.apps() {
+            if let Some(slot) = failover.get_mut(app) {
+                if app.supports_local_proxy() {
+                    *slot = Some(
+                        state
+                            .db
+                            .get_failover_queue(app.as_str())?
+                            .into_iter()
+                            .map(|item| item.provider_id)
+                            .collect(),
+                    );
+                }
+            }
+        }
+        Ok(failover)
+    }
+
+    fn save_no_profile_failover(state: &AppState, scope: ProfileScope) -> Result<(), AppError> {
+        let failover = Self::snapshot_failover_current(state, scope)?;
+        let value = serde_json::to_string(&failover).map_err(|e| {
+            AppError::Config(format!("序列化 no-profile failover payload 失败: {e}"))
+        })?;
+        state
+            .db
+            .set_setting(&no_profile_failover_key(scope), &value)
+    }
+
+    fn restore_failover_for_app(
+        state: &AppState,
+        app: &AppType,
+        target_ids: &[String],
+        warnings: &mut Vec<String>,
+    ) -> Result<(), AppError> {
+        let app_str = app.as_str();
+        let providers = state.db.get_all_providers(app_str)?;
+        let mut target_set: HashSet<&str> = HashSet::new();
+        for id in target_ids {
+            match providers.get(id) {
+                None => warnings.push(format!(
+                    "[{app_str}] failover provider '{id}' no longer exists, skipped"
+                )),
+                // Codex Official 账号卡禁止参与故障转移（请求携带所选账号的
+                // Authorization 头，重放到其他账号会越界）；旧快照里即使
+                // 混入也不恢复。
+                Some(p)
+                    if !crate::proxy::provider_router::provider_supports_failover(app_str, p) =>
+                {
+                    warnings.push(format!(
+                        "[{app_str}] failover provider '{id}' does not support failover, skipped"
+                    ));
+                }
+                Some(_) => {
+                    target_set.insert(id.as_str());
+                }
+            }
+        }
+        let current_ids: Vec<String> = state
+            .db
+            .get_failover_queue(app_str)?
+            .into_iter()
+            .map(|item| item.provider_id)
+            .collect();
+        let (to_add, to_remove) = plan_failover_membership(&current_ids, &target_set);
+        for id in to_add {
+            if let Err(e) = state.db.add_to_failover_queue(app_str, &id) {
+                warnings.push(format!(
+                    "[{app_str}] add failover provider '{id}' failed: {e}"
+                ));
+            }
+        }
+        for id in to_remove {
+            if let Err(e) = state.db.remove_from_failover_queue(app_str, &id) {
+                warnings.push(format!(
+                    "[{app_str}] remove failover provider '{id}' failed: {e}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_failover_slots(
+        state: &AppState,
+        failover: &PerApp<Option<Vec<String>>>,
+        scope: ProfileScope,
+        warnings: &mut Vec<String>,
+    ) -> Result<(), AppError> {
+        for app in scope.apps() {
+            if let Some(Some(target_ids)) = failover.get(app) {
+                Self::restore_failover_for_app(state, app, target_ids, warnings)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 离开项目时恢复“未使用项目”的故障转移队列，避免项目内新增的
+    /// failover provider 泄漏到全局未绑定状态。
+    pub fn clear_current(state: &AppState, scope: ProfileScope) -> Result<Vec<String>, AppError> {
+        let mut warnings = Vec::new();
+        if let Some(current_id) = state.db.get_current_profile_id(scope.as_str())? {
+            if let Err(e) = Self::update(state, &current_id, None, true, Some(scope)) {
+                warnings.push(format!(
+                    "autosave profile '{current_id}' before clearing project failed: {e}"
+                ));
+            }
+        }
+
+        let saved = state.db.get_setting(&no_profile_failover_key(scope))?;
+        let failover = match saved {
+            Some(value) => {
+                serde_json::from_str::<PerApp<Option<Vec<String>>>>(&value).map_err(|e| {
+                    AppError::Config(format!("解析 no-profile failover payload 失败: {e}"))
+                })?
+            }
+            None => PerApp::default(),
+        };
+        Self::restore_failover_slots(state, &failover, scope, &mut warnings)?;
+        state.db.set_current_profile_id(scope.as_str(), None)?;
+        Ok(warnings)
     }
 
     /// 创建新项目：只拍发起页所属分组的当前状态，其余分组槽位留 None
@@ -385,7 +514,9 @@ impl ProfileService {
     ) -> Result<(Vec<String>, bool), AppError> {
         let mut warnings = Vec::new();
 
-        // 自动保存旧项目当前状态（仅当前分组），失败不阻塞切换
+        // 自动保存旧项目当前状态（仅当前分组），失败不阻塞切换；
+        // 若当前处于“未使用项目”，也保存它自己的故障转移队列，否则进入
+        // 项目后添加的 failover provider 会在回到“未使用项目”时继续残留。
         if let Some(current_id) = state.db.get_current_profile_id(scope.as_str())? {
             if current_id != profile_id {
                 if let Err(e) = Self::update(state, &current_id, None, true, Some(scope)) {
@@ -394,6 +525,10 @@ impl ProfileService {
                     ));
                 }
             }
+        } else if let Err(e) = Self::save_no_profile_failover(state, scope) {
+            warnings.push(format!(
+                "autosave no-profile failover before switch failed: {e}"
+            ));
         }
 
         let profile = state
@@ -443,56 +578,8 @@ impl ProfileService {
             }
 
             // 3. 故障转移队列成员（None = 该侧未拍过或该应用不支持代理，不动）
-            //
-            // 不重建整个队列（clear + 逐个 add），而是按快照 diff 出最小增删：
-            // remove_from_failover_queue 会同步清理 provider_health，直接
-            // clear 会让仍在队列里的供应商健康记录被误留、被移出的又漏清。
             if let Some(Some(target_ids)) = payload.failover.get(app) {
-                let providers = state.db.get_all_providers(app_str)?;
-                let mut target_set: HashSet<&str> = HashSet::new();
-                for id in target_ids {
-                    match providers.get(id) {
-                        None => warnings.push(format!(
-                            "[{app_str}] failover provider '{id}' no longer exists, skipped"
-                        )),
-                        // Codex Official 账号卡禁止参与故障转移（请求携带所选账号的
-                        // Authorization 头，重放到其他账号会越界）；旧快照里即使
-                        // 混入也不恢复。
-                        Some(p)
-                            if !crate::proxy::provider_router::provider_supports_failover(
-                                app_str, p,
-                            ) =>
-                        {
-                            warnings.push(format!(
-                                "[{app_str}] failover provider '{id}' does not support failover, skipped"
-                            ));
-                        }
-                        Some(_) => {
-                            target_set.insert(id.as_str());
-                        }
-                    }
-                }
-                let current_ids: Vec<String> = state
-                    .db
-                    .get_failover_queue(app_str)?
-                    .into_iter()
-                    .map(|item| item.provider_id)
-                    .collect();
-                let (to_add, to_remove) = plan_failover_membership(&current_ids, &target_set);
-                for id in to_add {
-                    if let Err(e) = state.db.add_to_failover_queue(app_str, &id) {
-                        warnings.push(format!(
-                            "[{app_str}] add failover provider '{id}' failed: {e}"
-                        ));
-                    }
-                }
-                for id in to_remove {
-                    if let Err(e) = state.db.remove_from_failover_queue(app_str, &id) {
-                        warnings.push(format!(
-                            "[{app_str}] remove failover provider '{id}' failed: {e}"
-                        ));
-                    }
-                }
+                Self::restore_failover_for_app(state, app, target_ids, &mut warnings)?;
             }
 
             // 4. MCP diff（最小 toggle：仅动目标态≠当前态的条目；None = 该侧未拍过，不动）
