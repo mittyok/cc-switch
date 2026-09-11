@@ -23,13 +23,18 @@ export interface PerApp<T> {
  * 所有槽位 null = 该侧从未拍过快照（应用时不动），与"拍到的就是空集"
  * （空数组，应用时清空启用）严格区分。
  */
+export interface FailoverProfileItem {
+  providerId: string;
+  sortIndex?: number | null;
+}
+
 export interface ProfilePayload {
   providers: PerApp<string | null>;
   mcp: PerApp<string[] | null>;
   skills: PerApp<string[] | null>;
   prompts: PerApp<string | null>;
-  /** Per-app failover queue provider ids captured with the project. */
-  failover: PerApp<string[] | null>;
+  /** Per-app failover queue entries and route order captured with the project. */
+  failover: PerApp<FailoverProfileItem[] | null>;
 }
 
 export interface Profile {
