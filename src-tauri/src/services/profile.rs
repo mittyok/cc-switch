@@ -114,18 +114,6 @@ impl<T> PerApp<T> {
     }
 }
 
-/// 项目内保存的故障转移路由项。
-///
-/// 故障转移实际按 providers.sort_index 排序；只保存 provider id 会导致
-/// 项目内调整的 P1/P2 优先级泄漏到其它项目/未使用项目，所以快照必须
-/// 同时保存排序值。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FailoverProfileItem {
-    pub provider_id: String,
-    pub sort_index: Option<usize>,
-}
-
 /// Profile 的 JSON 快照结构（与前端 TS 类型严格对应）
 ///
 /// 所有槽位都是 Option：None = 该侧从未拍过快照（应用时不动），
@@ -142,15 +130,15 @@ pub struct ProfilePayload {
     pub skills: PerApp<Option<Vec<String>>>,
     /// 每 app 激活的 prompt id
     pub prompts: PerApp<Option<String>>,
-    /// 每 app 的故障转移队列成员与路由优先级。
+    /// 每 app 的故障转移队列成员（按快照时优先级排序的供应商 id）
     ///
-    /// 队列本体存在 providers.in_failover_queue 全局布尔位上，路由优先级
-    /// 复用 providers.sort_index；二者默认都不随项目切换，会把上一项目的
-    /// P1/P2 路由带进新项目。这里随项目快照保存成员关系和排序值，apply
-    /// 时一起恢复。auto_failover 开关不在快照内：切换项目总是先退出代理
-    /// 接管（enabled=false），开关属于代理运行态，恢复它会造成
+    /// 队列本体存在 providers.in_failover_queue 全局布尔位上、不随项目
+    /// 切换，会把上一项目的队列带进新项目（代理可能把请求打到别的项目的
+    /// 供应商）；这里随项目快照保存成员关系，apply 时按快照重建。
+    /// auto_failover 开关不在快照内：切换项目总是先退出代理接管
+    /// （enabled=false），开关属于代理运行态，恢复它会造成
     /// "接管关、开关开"的不一致状态。
-    pub failover: PerApp<Option<Vec<FailoverProfileItem>>>,
+    pub failover: PerApp<Option<Vec<String>>>,
 }
 
 impl ProfilePayload {
@@ -217,18 +205,18 @@ fn plan_toggles(
 
 /// 计算故障转移队列成员的最小增删集：返回 (待加入, 待移除)
 ///
-/// 队列持久化是 providers.in_failover_queue 全局布尔位；路由优先级
-/// 由 providers.sort_index 派生，需在恢复时另行按项目快照写回，避免
-/// 只隔离成员而遗漏 P1/P2 路由顺序。
+/// 队列持久化是 providers.in_failover_queue 全局布尔位，优先级由
+/// providers.sort_index 派生——恢复项目快照时只需对齐成员集合，
+/// 快照中记录的顺序仅用于可读性，无需额外写入。
 fn plan_failover_membership(
     current_ids: &[String],
-    target_ids: &HashSet<String>,
+    target_ids: &HashSet<&str>,
 ) -> (Vec<String>, Vec<String>) {
     let current: HashSet<&str> = current_ids.iter().map(String::as_str).collect();
     let mut add: Vec<String> = target_ids
         .iter()
-        .filter(|id| !current.contains(id.as_str()))
-        .cloned()
+        .filter(|id| !current.contains(**id))
+        .map(|id| id.to_string())
         .collect();
     add.sort();
     let remove: Vec<String> = current_ids
@@ -294,10 +282,7 @@ impl ProfileService {
                             .db
                             .get_failover_queue(app.as_str())?
                             .into_iter()
-                            .map(|item| FailoverProfileItem {
-                                provider_id: item.provider_id,
-                                sort_index: item.sort_index,
-                            })
+                            .map(|item| item.provider_id)
                             .collect(),
                     );
                 }
@@ -314,7 +299,7 @@ impl ProfileService {
     fn snapshot_failover_current(
         state: &AppState,
         scope: ProfileScope,
-    ) -> Result<PerApp<Option<Vec<FailoverProfileItem>>>, AppError> {
+    ) -> Result<PerApp<Option<Vec<String>>>, AppError> {
         let mut failover = PerApp::default();
         for app in scope.apps() {
             if let Some(slot) = failover.get_mut(app) {
@@ -324,10 +309,7 @@ impl ProfileService {
                             .db
                             .get_failover_queue(app.as_str())?
                             .into_iter()
-                            .map(|item| FailoverProfileItem {
-                                provider_id: item.provider_id,
-                                sort_index: item.sort_index,
-                            })
+                            .map(|item| item.provider_id)
                             .collect(),
                     );
                 }
@@ -349,14 +331,13 @@ impl ProfileService {
     fn restore_failover_for_app(
         state: &AppState,
         app: &AppType,
-        target_items: &[FailoverProfileItem],
+        target_ids: &[String],
         warnings: &mut Vec<String>,
     ) -> Result<(), AppError> {
         let app_str = app.as_str();
-        let mut providers = state.db.get_all_providers(app_str)?;
-        let mut target_set: HashSet<String> = HashSet::new();
-        for item in target_items {
-            let id = &item.provider_id;
+        let providers = state.db.get_all_providers(app_str)?;
+        let mut target_set: HashSet<&str> = HashSet::new();
+        for id in target_ids {
             match providers.get(id) {
                 None => warnings.push(format!(
                     "[{app_str}] failover provider '{id}' no longer exists, skipped"
@@ -372,30 +353,10 @@ impl ProfileService {
                     ));
                 }
                 Some(_) => {
-                    target_set.insert(id.clone());
+                    target_set.insert(id.as_str());
                 }
             }
         }
-
-        // 故障转移路由顺序由 provider.sort_index 决定；恢复队列成员但不恢复
-        // sort_index 会让项目 A 的 P1/P2 排序污染项目 B 或“未使用项目”。
-        for item in target_items {
-            if !target_set.contains(&item.provider_id) {
-                continue;
-            }
-            if let Some(provider) = providers.get_mut(&item.provider_id) {
-                if provider.sort_index != item.sort_index {
-                    provider.sort_index = item.sort_index;
-                    if let Err(e) = state.db.save_provider(app_str, provider) {
-                        warnings.push(format!(
-                            "[{app_str}] restore failover provider '{id}' route order failed: {e}",
-                            id = item.provider_id
-                        ));
-                    }
-                }
-            }
-        }
-
         let current_ids: Vec<String> = state
             .db
             .get_failover_queue(app_str)?
@@ -422,7 +383,7 @@ impl ProfileService {
 
     fn restore_failover_slots(
         state: &AppState,
-        failover: &PerApp<Option<Vec<FailoverProfileItem>>>,
+        failover: &PerApp<Option<Vec<String>>>,
         scope: ProfileScope,
         warnings: &mut Vec<String>,
     ) -> Result<(), AppError> {
@@ -448,10 +409,11 @@ impl ProfileService {
 
         let saved = state.db.get_setting(&no_profile_failover_key(scope))?;
         let failover = match saved {
-            Some(value) => serde_json::from_str::<PerApp<Option<Vec<FailoverProfileItem>>>>(&value)
-                .map_err(|e| {
+            Some(value) => {
+                serde_json::from_str::<PerApp<Option<Vec<String>>>>(&value).map_err(|e| {
                     AppError::Config(format!("解析 no-profile failover payload 失败: {e}"))
-                })?,
+                })?
+            }
             None => PerApp::default(),
         };
         Self::restore_failover_slots(state, &failover, scope, &mut warnings)?;
@@ -702,47 +664,6 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    fn failover_items(v: &[(&str, Option<usize>)]) -> Vec<FailoverProfileItem> {
-        v.iter()
-            .map(|(provider_id, sort_index)| FailoverProfileItem {
-                provider_id: provider_id.to_string(),
-                sort_index: *sort_index,
-            })
-            .collect()
-    }
-
-    fn state_with_providers(providers: &[(&str, usize, bool)]) -> Result<AppState, AppError> {
-        let state = AppState::new(std::sync::Arc::new(crate::database::Database::memory()?));
-        for (id, sort_index, in_failover_queue) in providers {
-            let mut provider = crate::provider::Provider::with_id(
-                (*id).to_string(),
-                (*id).to_string(),
-                serde_json::json!({
-                    "env": {
-                        "ANTHROPIC_AUTH_TOKEN": format!("token-{id}"),
-                        "ANTHROPIC_BASE_URL": "https://example.test"
-                    }
-                }),
-                None,
-            );
-            provider.sort_index = Some(*sort_index);
-            provider.in_failover_queue = *in_failover_queue;
-            state
-                .db
-                .save_provider(AppType::Claude.as_str(), &provider)?;
-        }
-        Ok(state)
-    }
-
-    fn failover_ids_and_order(state: &AppState) -> Result<Vec<(String, Option<usize>)>, AppError> {
-        Ok(state
-            .db
-            .get_failover_queue(AppType::Claude.as_str())?
-            .into_iter()
-            .map(|item| (item.provider_id, item.sort_index))
-            .collect())
-    }
-
     #[test]
     fn test_payload_serde_roundtrip() {
         let payload = ProfilePayload {
@@ -767,9 +688,9 @@ mod tests {
                 codex: Some("pr1".into()),
             },
             failover: PerApp {
-                claude: Some(failover_items(&[("p1", Some(0)), ("p2", Some(1))])),
+                claude: Some(ids(&["p1", "p2"])),
                 claude_desktop: None,
-                codex: Some(failover_items(&[("c1", Some(3))])),
+                codex: Some(ids(&["c1"])),
             },
         };
         let json = serde_json::to_string(&payload).unwrap();
@@ -819,9 +740,9 @@ mod tests {
                 codex: Some(ids(&["m9"])),
             },
             failover: PerApp {
-                claude: Some(failover_items(&[("f1", Some(1))])),
+                claude: Some(ids(&["f1"])),
                 claude_desktop: None,
-                codex: Some(failover_items(&[("cf1", Some(2))])),
+                codex: Some(ids(&["cf1"])),
             },
             ..Default::default()
         };
@@ -838,9 +759,9 @@ mod tests {
                 codex: None,
             },
             failover: PerApp {
-                claude: Some(failover_items(&[("f2", Some(0)), ("f3", Some(4))])),
+                claude: Some(ids(&["f2", "f3"])),
                 claude_desktop: None,
-                codex: Some(failover_items(&[("SHOULD-NOT-LEAK", Some(9))])),
+                codex: Some(ids(&["SHOULD-NOT-LEAK"])),
             },
             ..Default::default()
         };
@@ -853,17 +774,11 @@ mod tests {
             "claude-desktop slot is in its own scope, untouched by claude merge"
         );
         assert_eq!(payload.mcp.claude, Some(ids(&["m2"])));
-        assert_eq!(
-            payload.failover.claude,
-            Some(failover_items(&[("f2", Some(0)), ("f3", Some(4))]))
-        );
+        assert_eq!(payload.failover.claude, Some(ids(&["f2", "f3"])));
         // codex 侧完好：既没被覆盖也没被 fresh 的值污染
         assert_eq!(payload.providers.codex, Some("c1".to_string()));
         assert_eq!(payload.mcp.codex, Some(ids(&["m9"])));
-        assert_eq!(
-            payload.failover.codex,
-            Some(failover_items(&[("cf1", Some(2))]))
-        );
+        assert_eq!(payload.failover.codex, Some(ids(&["cf1"])));
     }
 
     #[test]
@@ -907,136 +822,12 @@ mod tests {
     fn test_plan_failover_membership_minimal_diff() {
         let current = ids(&["keep", "remove"]);
         let mut target = HashSet::new();
-        target.insert("keep".to_string());
-        target.insert("add".to_string());
+        target.insert("keep");
+        target.insert("add");
 
         let (to_add, to_remove) = plan_failover_membership(&current, &target);
         assert_eq!(to_add, ids(&["add"]));
         assert_eq!(to_remove, ids(&["remove"]));
-    }
-
-    #[test]
-    fn test_restore_failover_for_app_restores_membership_and_route_order() -> Result<(), AppError> {
-        let state = state_with_providers(&[("a", 7, true), ("b", 2, false), ("c", 1, true)])?;
-        let mut warnings = Vec::new();
-
-        ProfileService::restore_failover_for_app(
-            &state,
-            &AppType::Claude,
-            &failover_items(&[("b", Some(0)), ("a", Some(3))]),
-            &mut warnings,
-        )?;
-
-        assert!(
-            warnings.is_empty(),
-            "unexpected restore warnings: {warnings:?}"
-        );
-        assert_eq!(
-            failover_ids_and_order(&state)?,
-            vec![("b".to_string(), Some(0)), ("a".to_string(), Some(3))],
-            "project failover restore must reset both queue membership and route priority"
-        );
-        assert!(
-            !state
-                .db
-                .get_provider_by_id("c", AppType::Claude.as_str())?
-                .expect("provider c")
-                .in_failover_queue,
-            "providers only added inside another project must be removed from this project's queue"
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_no_profile_failover_roundtrip_restores_queue_and_route_order() -> Result<(), AppError> {
-        let temp_home = tempfile::tempdir().expect("temp test home");
-        let previous_home = std::env::var_os("CC_SWITCH_TEST_HOME");
-        std::env::set_var("CC_SWITCH_TEST_HOME", temp_home.path());
-
-        let result = (|| {
-            let state = state_with_providers(&[("a", 0, true), ("b", 1, false), ("c", 2, false)])?;
-            let profile_payload = ProfilePayload {
-                failover: PerApp {
-                    claude: Some(failover_items(&[("b", Some(0)), ("c", Some(1))])),
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            state.db.save_profile(&Profile {
-                id: "profile-1".to_string(),
-                name: "Project".to_string(),
-                payload: serde_json::to_string(&profile_payload).unwrap(),
-                sort_order: None,
-                created_at: Some(1),
-                updated_at: Some(1),
-            })?;
-
-            let (apply_warnings, _should_stop_proxy) =
-                ProfileService::apply(&state, "profile-1", ProfileScope::Claude)?;
-            assert!(
-                apply_warnings.is_empty(),
-                "unexpected apply warnings: {apply_warnings:?}"
-            );
-            assert_eq!(
-                failover_ids_and_order(&state)?,
-                vec![("b".to_string(), Some(0)), ("c".to_string(), Some(1))],
-                "using a project should replace the no-profile failover queue"
-            );
-
-            // 模拟用户在项目内调整故障转移：如果 clear_current 不恢复 no-profile
-            // 快照，这些成员和 P1/P2 排序都会泄漏回“未使用项目”。
-            let mut a = state
-                .db
-                .get_provider_by_id("a", AppType::Claude.as_str())?
-                .expect("provider a");
-            a.sort_index = Some(9);
-            state.db.save_provider(AppType::Claude.as_str(), &a)?;
-            let mut b = state
-                .db
-                .get_provider_by_id("b", AppType::Claude.as_str())?
-                .expect("provider b");
-            b.sort_index = Some(8);
-            state.db.save_provider(AppType::Claude.as_str(), &b)?;
-            state
-                .db
-                .add_to_failover_queue(AppType::Claude.as_str(), "a")?;
-
-            let clear_warnings = ProfileService::clear_current(&state, ProfileScope::Claude)?;
-            assert!(
-                clear_warnings.is_empty(),
-                "unexpected clear warnings: {clear_warnings:?}"
-            );
-            assert_eq!(
-                state
-                    .db
-                    .get_current_profile_id(ProfileScope::Claude.as_str())?,
-                None,
-                "clearing the project should return to no-profile mode"
-            );
-            assert_eq!(
-                failover_ids_and_order(&state)?,
-                vec![("a".to_string(), Some(0))],
-                "returning to no-profile must restore its own queue membership and route order"
-            );
-            assert!(
-                !state
-                    .db
-                    .get_provider_by_id("b", AppType::Claude.as_str())?
-                    .expect("provider b")
-                    .in_failover_queue,
-                "provider added by the project must not remain in the no-profile queue"
-            );
-
-            Ok(())
-        })();
-
-        match previous_home {
-            Some(value) => std::env::set_var("CC_SWITCH_TEST_HOME", value),
-            None => std::env::remove_var("CC_SWITCH_TEST_HOME"),
-        }
-        result
     }
 
     #[test]
