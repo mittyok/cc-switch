@@ -106,7 +106,7 @@ fn profile_snapshot_apply_roundtrip_restores_configuration() {
 
     let state = create_test_state().expect("create test state");
 
-    // ---- 种子数据：2 个 Claude 供应商（p1 为当前）+ 2 个 MCP + 1 个 Skill + 2 个 Prompt ----
+    // ---- 种子数据：2 个 Claude 供应商（p1 为当前）+ 故障转移队列 + 2 个 MCP + 1 个 Skill + 2 个 Prompt ----
     state
         .db
         .save_provider(AppType::Claude.as_str(), &claude_provider("p1", "key-1"))
@@ -119,6 +119,13 @@ fn profile_snapshot_apply_roundtrip_restores_configuration() {
         .db
         .set_current_provider(AppType::Claude.as_str(), "p1")
         .expect("set current provider p1");
+    state
+        .db
+        .replace_failover_queue(
+            AppType::Claude.as_str(),
+            &["p1".to_string(), "p2".to_string()],
+        )
+        .expect("seed failover queue p1 then p2");
 
     // Claude Desktop 只有供应商一个活跃维度（MCP/Skills/Prompt 对它不适用）
     state
@@ -180,6 +187,11 @@ fn profile_snapshot_apply_roundtrip_restores_configuration() {
     let payload: ProfilePayload =
         serde_json::from_str(&profile_a.payload).expect("parse profile A payload");
     assert_eq!(payload.providers.claude.as_deref(), Some("p1"));
+    assert_eq!(
+        payload.failover.claude,
+        Some(vec!["p1".to_string(), "p2".to_string()]),
+        "profile snapshot captures failover queue priority for the active scope"
+    );
     assert_eq!(payload.mcp.claude, Some(vec!["m1".to_string()]));
     assert_eq!(
         payload.skills.claude,
@@ -190,6 +202,10 @@ fn profile_snapshot_apply_roundtrip_restores_configuration() {
         payload.providers.codex, None,
         "codex side not captured when creating from the claude group"
     );
+    assert_eq!(
+        payload.failover.codex, None,
+        "uncaptured failover side stays None"
+    );
     assert_eq!(payload.mcp.codex, None, "uncaptured side stays None");
     assert_eq!(
         payload.providers.claude_desktop, None,
@@ -198,6 +214,10 @@ fn profile_snapshot_apply_roundtrip_restores_configuration() {
 
     // ---- 改动全部四类配置（走真实切换路径）----
     ProviderService::switch(&state, AppType::Claude, "p2").expect("switch to p2");
+    state
+        .db
+        .replace_failover_queue(AppType::Claude.as_str(), &["p2".to_string()])
+        .expect("mutate failover queue before restore");
     // Desktop 现在有自己的项目分组；Claude 分组 apply 不应再影响 Desktop
     #[cfg(any(target_os = "macos", windows))]
     ProviderService::switch(&state, AppType::ClaudeDesktop, "d2").expect("switch desktop to d2");
@@ -217,6 +237,18 @@ fn profile_snapshot_apply_roundtrip_restores_configuration() {
         .get_current_provider(AppType::Claude.as_str())
         .expect("get current provider");
     assert_eq!(current.as_deref(), Some("p1"), "provider restored to p1");
+    let failover_queue = state
+        .db
+        .get_failover_queue(AppType::Claude.as_str())
+        .expect("get restored failover queue")
+        .into_iter()
+        .map(|item| item.provider_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        failover_queue,
+        vec!["p1".to_string(), "p2".to_string()],
+        "failover queue members and priority restored with the project snapshot"
+    );
 
     // Claude 分组不再管理 Desktop：apply 后 Desktop 保持切换前的状态不变。
     // macOS/Windows 上上面已切到 d2；Linux（CI）不支持 Desktop 切换、那行被 cfg 门控
