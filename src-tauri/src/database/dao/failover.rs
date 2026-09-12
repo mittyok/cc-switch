@@ -20,16 +20,16 @@ pub struct FailoverQueueItem {
 }
 
 impl Database {
-    /// 获取故障转移队列（按 sort_index 排序）
+    /// 获取故障转移队列（按独立故障转移顺序排序）
     pub fn get_failover_queue(&self, app_type: &str) -> Result<Vec<FailoverQueueItem>, AppError> {
         let conn = lock_conn!(self.conn);
 
         let mut stmt = conn
             .prepare(
-                "SELECT id, name, sort_index, notes
+                "SELECT id, name, COALESCE(failover_sort_index, sort_index), notes
                  FROM providers
                  WHERE app_type = ?1 AND in_failover_queue = 1
-                 ORDER BY COALESCE(sort_index, 999999), id ASC",
+                 ORDER BY COALESCE(failover_sort_index, sort_index, 999999), id ASC",
             )
             .map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -53,9 +53,10 @@ impl Database {
     pub fn get_failover_providers(&self, app_type: &str) -> Result<Vec<Provider>, AppError> {
         let all_providers = self.get_all_providers(app_type)?;
 
-        let result: Vec<Provider> = all_providers
-            .into_values()
-            .filter(|p| p.in_failover_queue)
+        let queue = self.get_failover_queue(app_type)?;
+        let result: Vec<Provider> = queue
+            .into_iter()
+            .filter_map(|item| all_providers.get(&item.provider_id).cloned())
             .collect();
 
         Ok(result)
@@ -66,7 +67,15 @@ impl Database {
         let conn = lock_conn!(self.conn);
 
         conn.execute(
-            "UPDATE providers SET in_failover_queue = 1 WHERE id = ?1 AND app_type = ?2",
+            "UPDATE providers
+             SET in_failover_queue = 1,
+                 failover_sort_index = COALESCE(
+                     failover_sort_index,
+                     (SELECT COALESCE(MAX(failover_sort_index), MAX(sort_index), -1) + 1
+                      FROM providers
+                      WHERE app_type = ?2 AND in_failover_queue = 1)
+                 )
+             WHERE id = ?1 AND app_type = ?2",
             rusqlite::params![provider_id, app_type],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -84,7 +93,7 @@ impl Database {
 
         // 1. 从队列中移除
         conn.execute(
-            "UPDATE providers SET in_failover_queue = 0 WHERE id = ?1 AND app_type = ?2",
+            "UPDATE providers SET in_failover_queue = 0, failover_sort_index = NULL WHERE id = ?1 AND app_type = ?2",
             rusqlite::params![provider_id, app_type],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -106,7 +115,7 @@ impl Database {
         let conn = lock_conn!(self.conn);
 
         conn.execute(
-            "UPDATE providers SET in_failover_queue = 0 WHERE app_type = ?1",
+            "UPDATE providers SET in_failover_queue = 0, failover_sort_index = NULL WHERE app_type = ?1",
             [app_type],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -129,7 +138,7 @@ impl Database {
             .map_err(|e| AppError::Database(e.to_string()))?;
 
         tx.execute(
-            "UPDATE providers SET in_failover_queue = 0 WHERE app_type = ?1",
+            "UPDATE providers SET in_failover_queue = 0, failover_sort_index = NULL WHERE app_type = ?1",
             [app_type],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
@@ -137,7 +146,7 @@ impl Database {
         for (index, provider_id) in provider_ids.iter().enumerate() {
             tx.execute(
                 "UPDATE providers
-                 SET in_failover_queue = 1, sort_index = ?1
+                 SET in_failover_queue = 1, failover_sort_index = ?1
                  WHERE app_type = ?2 AND id = ?3",
                 params![index, app_type, provider_id],
             )
