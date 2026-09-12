@@ -13,6 +13,37 @@ const updateTrayMenuSafely = async () => {
   }
 };
 
+const PROFILE_SCOPE_APPS: Record<ProfileScope, string[]> = {
+  claude: ["claude"],
+  "claude-desktop": ["claude-desktop"],
+  codex: ["codex"],
+};
+
+const invalidateProfileScopeQueries = async (
+  queryClient: ReturnType<typeof useQueryClient>,
+  scope?: ProfileScope,
+) => {
+  await queryClient.invalidateQueries({ queryKey: ["profiles"] });
+  await queryClient.invalidateQueries({ queryKey: ["mcp", "all"] });
+  await queryClient.invalidateQueries({ queryKey: ["skills"] });
+
+  // Profile apply restores failover membership/order in the backend; without
+  // invalidating these per-app queries, the failover UI can keep showing the
+  // previous project's queue and look like projects are not isolated.
+  const apps = scope
+    ? PROFILE_SCOPE_APPS[scope]
+    : Object.values(PROFILE_SCOPE_APPS).flat();
+  await Promise.all(
+    apps.flatMap((app) => [
+      queryClient.invalidateQueries({ queryKey: ["providers", app] }),
+      queryClient.invalidateQueries({ queryKey: ["failoverQueue", app] }),
+      queryClient.invalidateQueries({
+        queryKey: ["availableProvidersForFailover", app],
+      }),
+    ]),
+  );
+};
+
 export const useProfilesQuery = () => {
   return useQuery({
     queryKey: ["profiles"],
@@ -118,17 +149,8 @@ export const useApplyProfileMutation = () => {
   return useMutation({
     mutationFn: ({ id, scope }: { id: string; scope: ProfileScope }) =>
       profilesApi.apply(id, scope),
-    onSuccess: async (warnings) => {
-      await queryClient.invalidateQueries({ queryKey: ["profiles"] });
-      await queryClient.invalidateQueries({
-        queryKey: ["providers", "claude"],
-      });
-      await queryClient.invalidateQueries({
-        queryKey: ["providers", "claude-desktop"],
-      });
-      await queryClient.invalidateQueries({ queryKey: ["providers", "codex"] });
-      await queryClient.invalidateQueries({ queryKey: ["mcp", "all"] });
-      await queryClient.invalidateQueries({ queryKey: ["skills"] });
+    onSuccess: async (warnings, variables) => {
+      await invalidateProfileScopeQueries(queryClient, variables.scope);
       await updateTrayMenuSafely();
 
       if (warnings.length > 0) {
