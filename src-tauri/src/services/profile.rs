@@ -15,7 +15,8 @@
 
 use std::collections::HashSet;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
 use crate::app_config::AppType;
 use crate::database::Profile;
@@ -94,6 +95,85 @@ pub struct PerApp<T> {
     pub codex: T,
 }
 
+/// Profile 快照里的 provider/prompt 槽位历史上应保存字符串 id；线上曾出现
+/// 旧实现把完整对象写入槽位，导致应用项目时报 `invalid type: map, expected a string`。
+/// 这里仅在快照边界做兼容：能从常见 id 字段恢复则恢复，否则视为未拍过该槽位。
+fn deserialize_per_app_optional_string<'de, D>(
+    deserializer: D,
+) -> Result<PerApp<Option<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?.unwrap_or(Value::Null);
+    Ok(per_app_optional_string_from_value(value))
+}
+
+fn per_app_optional_string_from_value(value: Value) -> PerApp<Option<String>> {
+    let mut per_app = PerApp::default();
+    let Some(map) = value.as_object() else {
+        return per_app;
+    };
+
+    per_app.claude = optional_id_from_value(map.get("claude"));
+    per_app.claude_desktop = optional_id_from_value(map.get("claude-desktop"));
+    per_app.codex = optional_id_from_value(map.get("codex"));
+    per_app
+}
+
+fn optional_id_from_value(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
+        Some(Value::Object(map)) => ["id", "providerId", "promptId"]
+            .iter()
+            .find_map(|key| map.get(*key).and_then(Value::as_str))
+            .filter(|id| !id.is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// 故障转移队列新结构只保存 provider id 数组；兼容旧/错误快照中保存完整
+/// queue item 对象数组的形态，避免单个历史项目无法被应用。
+fn deserialize_per_app_optional_string_vec<'de, D>(
+    deserializer: D,
+) -> Result<PerApp<Option<Vec<String>>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?.unwrap_or(Value::Null);
+    Ok(per_app_optional_string_vec_from_value(value))
+}
+
+fn per_app_optional_string_vec_from_value(value: Value) -> PerApp<Option<Vec<String>>> {
+    let mut per_app = PerApp::default();
+    let Some(map) = value.as_object() else {
+        return per_app;
+    };
+
+    per_app.claude = optional_id_vec_from_value(map.get("claude"));
+    per_app.claude_desktop = optional_id_vec_from_value(map.get("claude-desktop"));
+    per_app.codex = optional_id_vec_from_value(map.get("codex"));
+    per_app
+}
+
+fn optional_id_vec_from_value(value: Option<&Value>) -> Option<Vec<String>> {
+    match value {
+        Some(Value::Array(items)) => Some(
+            items
+                .iter()
+                .filter_map(|item| optional_id_from_value(Some(item)))
+                .collect(),
+        ),
+        Some(Value::Object(map)) => ["providers", "items", "queue"]
+            .iter()
+            .find_map(|key| map.get(*key))
+            .and_then(|items| optional_id_vec_from_value(Some(items)))
+            .or_else(|| optional_id_from_value(value).map(|id| vec![id])),
+        Some(Value::Null) | None => None,
+        _ => Some(vec![]),
+    }
+}
+
 impl<T> PerApp<T> {
     pub fn get(&self, app: &AppType) -> Option<&T> {
         match app {
@@ -123,14 +203,17 @@ impl<T> PerApp<T> {
 #[serde(default)]
 pub struct ProfilePayload {
     /// 每 app 的当前供应商 id
+    #[serde(deserialize_with = "deserialize_per_app_optional_string")]
     pub providers: PerApp<Option<String>>,
     /// 每 app 的故障转移队列 provider id，顺序即故障转移优先级
+    #[serde(deserialize_with = "deserialize_per_app_optional_string_vec")]
     pub failover: PerApp<Option<Vec<String>>>,
     /// 每 app 启用的 MCP server id 集合
     pub mcp: PerApp<Option<Vec<String>>>,
     /// 每 app 启用的 Skill id 集合
     pub skills: PerApp<Option<Vec<String>>>,
     /// 每 app 激活的 prompt id
+    #[serde(deserialize_with = "deserialize_per_app_optional_string")]
     pub prompts: PerApp<Option<String>>,
 }
 
@@ -611,6 +694,38 @@ mod tests {
 
         let empty: ProfilePayload = serde_json::from_str("{}").unwrap();
         assert_eq!(empty, ProfilePayload::default());
+    }
+
+    #[test]
+    fn test_payload_tolerates_object_slots_from_legacy_snapshots() {
+        // 回归 Owner 反馈：历史/错误快照可能把完整对象写进本应为字符串 id 的槽位，
+        // 不能再因 `invalid type: map, expected a string` 导致项目应用整体失败。
+        let back: ProfilePayload = serde_json::from_str(
+            r#"{
+                "providers": {
+                    "claude": { "id": "p1", "name": "Provider 1" },
+                    "codex": { "providerId": "c1" }
+                },
+                "failover": {
+                    "claude": [
+                        { "providerId": "p2", "providerName": "Provider 2" },
+                        "p1",
+                        { "id": "p3" }
+                    ],
+                    "codex": { "queue": [{ "providerId": "c2" }] }
+                },
+                "prompts": {
+                    "claude": { "promptId": "pr1", "name": "Prompt 1" }
+                }
+            }"#,
+        )
+        .expect("legacy object slots should deserialize");
+
+        assert_eq!(back.providers.claude, Some("p1".to_string()));
+        assert_eq!(back.providers.codex, Some("c1".to_string()));
+        assert_eq!(back.failover.claude, Some(ids(&["p2", "p1", "p3"])));
+        assert_eq!(back.failover.codex, Some(ids(&["c2"])));
+        assert_eq!(back.prompts.claude, Some("pr1".to_string()));
     }
 
     #[test]
