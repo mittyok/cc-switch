@@ -124,6 +124,8 @@ impl<T> PerApp<T> {
 pub struct ProfilePayload {
     /// 每 app 的当前供应商 id
     pub providers: PerApp<Option<String>>,
+    /// 每 app 的故障转移队列 provider id，顺序即故障转移优先级
+    pub failover: PerApp<Option<Vec<String>>>,
     /// 每 app 启用的 MCP server id 集合
     pub mcp: PerApp<Option<Vec<String>>>,
     /// 每 app 启用的 Skill id 集合
@@ -142,6 +144,9 @@ impl ProfilePayload {
             {
                 *dst = src.clone();
             }
+            if let (Some(dst), Some(src)) = (self.failover.get_mut(app), other.failover.get(app)) {
+                *dst = src.clone();
+            }
             if let (Some(dst), Some(src)) = (self.mcp.get_mut(app), other.mcp.get(app)) {
                 *dst = src.clone();
             }
@@ -158,6 +163,7 @@ impl ProfilePayload {
     pub fn scope_captured(&self, scope: ProfileScope) -> bool {
         scope.apps().iter().any(|app| {
             self.providers.get(app).is_some_and(|s| s.is_some())
+                || self.failover.get(app).is_some_and(|s| s.is_some())
                 || self.mcp.get(app).is_some_and(|s| s.is_some())
                 || self.skills.get(app).is_some_and(|s| s.is_some())
                 || self.prompts.get(app).is_some_and(|s| s.is_some())
@@ -190,6 +196,33 @@ fn plan_toggles(
     (toggles, dangling)
 }
 
+/// 计算从当前故障转移队列到目标顺序的最小可恢复计划。
+///
+/// 旧项目快照切换时必须恢复完整优先级顺序；快照中的悬空 provider id
+/// 按既有 MCP/Skill 容错策略跳过，避免单个已删除节点中断项目切换。
+fn plan_failover_restore(
+    existing_provider_ids: &HashSet<&str>,
+    current_queue_ids: &[String],
+    target_queue_ids: &[String],
+) -> (Vec<String>, Vec<String>, bool) {
+    let mut restored = Vec::new();
+    let mut dangling = Vec::new();
+    let mut seen = HashSet::new();
+
+    for id in target_queue_ids {
+        if !existing_provider_ids.contains(id.as_str()) {
+            dangling.push(id.clone());
+            continue;
+        }
+        if seen.insert(id.as_str()) {
+            restored.push(id.clone());
+        }
+    }
+
+    let changed = restored != current_queue_ids;
+    (restored, dangling, changed)
+}
+
 pub struct ProfileService;
 
 impl ProfileService {
@@ -205,6 +238,16 @@ impl ProfileService {
         for app in scope.apps().iter() {
             if let Some(slot) = payload.providers.get_mut(app) {
                 *slot = crate::settings::get_effective_current_provider(&state.db, app)?;
+            }
+            if let Some(slot) = payload.failover.get_mut(app) {
+                *slot = Some(
+                    state
+                        .db
+                        .get_failover_queue(app.as_str())?
+                        .into_iter()
+                        .map(|item| item.provider_id)
+                        .collect(),
+                );
             }
             if let Some(slot) = payload.mcp.get_mut(app) {
                 *slot = Some(
@@ -391,7 +434,41 @@ impl ProfileService {
                 }
             }
 
-            // 3. MCP diff（最小 toggle：仅动目标态≠当前态的条目；None = 该侧未拍过，不动）
+            // 3. 故障转移队列（None = 旧快照未包含该槽位，不触碰当前运行时队列）
+            if let Some(Some(target_ids)) = payload.failover.get(app) {
+                let providers = state.db.get_all_providers(app_str)?;
+                let existing_provider_ids: HashSet<&str> =
+                    providers.keys().map(|id| id.as_str()).collect();
+                let current_queue_ids: Vec<String> = state
+                    .db
+                    .get_failover_queue(app_str)?
+                    .into_iter()
+                    .map(|item| item.provider_id)
+                    .collect();
+                let (restored_ids, dangling, changed) =
+                    plan_failover_restore(&existing_provider_ids, &current_queue_ids, target_ids);
+
+                for id in dangling {
+                    warnings.push(format!(
+                        "[{app_str}] failover provider '{id}' no longer exists, skipped"
+                    ));
+                }
+
+                if changed {
+                    if let Err(e) = state.db.replace_failover_queue(app_str, &restored_ids) {
+                        warnings.push(format!("[{app_str}] restore failover queue failed: {e}"));
+                    } else {
+                        log::info!(
+                            "[Profile] restored failover queue: profile_id='{profile_id}', scope='{}', app_type='{app_str}', before={:?}, after={:?}",
+                            scope.as_str(),
+                            current_queue_ids,
+                            restored_ids
+                        );
+                    }
+                }
+            }
+
+            // 4. MCP diff（最小 toggle：仅动目标态≠当前态的条目；None = 该侧未拍过，不动）
             if let Some(Some(target_ids)) = payload.mcp.get(app) {
                 let servers = state.db.get_all_mcp_servers()?;
                 let current: Vec<(String, bool)> = servers
@@ -411,7 +488,7 @@ impl ProfileService {
                 }
             }
 
-            // 4. Skills diff（SkillService 返回 anyhow::Result，收进 warning）
+            // 5. Skills diff（SkillService 返回 anyhow::Result，收进 warning）
             if let Some(Some(target_ids)) = payload.skills.get(app) {
                 let skills = state.db.get_all_installed_skills()?;
                 let current: Vec<(String, bool)> = skills
@@ -433,7 +510,7 @@ impl ProfileService {
                 }
             }
 
-            // 5. Prompt（None = 不动；已激活则幂等跳过，避免无谓的文件写与备份）
+            // 6. Prompt（None = 不动；已激活则幂等跳过，避免无谓的文件写与备份）
             if let Some(Some(target_prompt)) = payload.prompts.get(app) {
                 let prompts = state.db.get_prompts(app_str)?;
                 match prompts.get(target_prompt) {
@@ -481,6 +558,11 @@ mod tests {
                 claude_desktop: Some("d1".into()),
                 codex: None,
             },
+            failover: PerApp {
+                claude: Some(ids(&["p1", "p2"])),
+                claude_desktop: Some(vec![]),
+                codex: None,
+            },
             mcp: PerApp {
                 claude: Some(ids(&["m1", "m2"])),
                 claude_desktop: Some(vec![]),
@@ -516,6 +598,12 @@ mod tests {
         assert_eq!(back.providers.claude, Some("p1".to_string()));
         assert_eq!(back.providers.claude_desktop, None);
         assert_eq!(back.providers.codex, None);
+        assert_eq!(
+            back.failover.claude, None,
+            "old snapshot leaves failover untouched"
+        );
+        assert_eq!(back.failover.claude_desktop, None);
+        assert_eq!(back.failover.codex, None);
         assert_eq!(back.mcp.claude, Some(ids(&["m1"])));
         assert_eq!(back.mcp.claude_desktop, None);
         assert_eq!(back.mcp.codex, None, "missing slot means untouched");
@@ -534,6 +622,11 @@ mod tests {
                 claude_desktop: Some("d1".into()),
                 codex: Some("c1".into()),
             },
+            failover: PerApp {
+                claude: Some(ids(&["p1", "p3"])),
+                claude_desktop: Some(ids(&["d1"])),
+                codex: Some(ids(&["c1"])),
+            },
             mcp: PerApp {
                 claude: Some(ids(&["m1"])),
                 claude_desktop: Some(vec![]),
@@ -548,6 +641,11 @@ mod tests {
                 claude_desktop: None,
                 codex: Some("SHOULD-NOT-LEAK".into()),
             },
+            failover: PerApp {
+                claude: Some(ids(&["p2", "p1"])),
+                claude_desktop: Some(ids(&["SHOULD-NOT-LEAK"])),
+                codex: None,
+            },
             mcp: PerApp {
                 claude: Some(ids(&["m2"])),
                 claude_desktop: Some(vec![]),
@@ -558,6 +656,7 @@ mod tests {
         payload.merge_scope_from(&fresh, ProfileScope::Claude);
 
         assert_eq!(payload.providers.claude, Some("p2".to_string()));
+        assert_eq!(payload.failover.claude, Some(ids(&["p2", "p1"])));
         assert_eq!(
             payload.providers.claude_desktop,
             Some("d1".to_string()),
@@ -566,6 +665,7 @@ mod tests {
         assert_eq!(payload.mcp.claude, Some(ids(&["m2"])));
         // codex 侧完好：既没被覆盖也没被 fresh 的值污染
         assert_eq!(payload.providers.codex, Some("c1".to_string()));
+        assert_eq!(payload.failover.codex, Some(ids(&["c1"])));
         assert_eq!(payload.mcp.codex, Some(ids(&["m9"])));
     }
 
@@ -587,6 +687,13 @@ mod tests {
         desktop_only.providers.claude_desktop = Some("d1".into());
         assert!(desktop_only.scope_captured(ProfileScope::ClaudeDesktop));
         assert!(!desktop_only.scope_captured(ProfileScope::Claude));
+
+        let mut failover_only = ProfilePayload::default();
+        failover_only.failover.codex = Some(vec![]);
+        assert!(
+            failover_only.scope_captured(ProfileScope::Codex),
+            "an empty captured failover queue is still a deliberate project snapshot"
+        );
     }
 
     #[test]
@@ -652,5 +759,34 @@ mod tests {
         let (toggles, dangling) = plan_toggles(&current, &[]);
         assert_eq!(toggles, vec![("a".to_string(), false)]);
         assert!(dangling.is_empty());
+    }
+
+    #[test]
+    fn test_plan_failover_restore_preserves_priority_and_drops_missing() {
+        let existing = HashSet::from(["p1", "p2", "p3"]);
+        let current = ids(&["p3", "p1"]);
+        let target = ids(&["p2", "ghost", "p1", "p2"]);
+
+        let (restored, dangling, changed) = plan_failover_restore(&existing, &current, &target);
+
+        assert_eq!(restored, ids(&["p2", "p1"]));
+        assert_eq!(dangling, ids(&["ghost"]));
+        assert!(changed, "priority order changed and must be written back");
+    }
+
+    #[test]
+    fn test_plan_failover_restore_is_idempotent_when_order_matches() {
+        let existing = HashSet::from(["p1", "p2"]);
+        let current = ids(&["p1", "p2"]);
+        let target = ids(&["p1", "p2"]);
+
+        let (restored, dangling, changed) = plan_failover_restore(&existing, &current, &target);
+
+        assert_eq!(restored, current);
+        assert!(dangling.is_empty());
+        assert!(
+            !changed,
+            "repeat profile apply should not rewrite unchanged failover queue"
+        );
     }
 }

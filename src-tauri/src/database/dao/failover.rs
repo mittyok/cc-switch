@@ -5,6 +5,7 @@
 use crate::database::{lock_conn, Database};
 use crate::error::AppError;
 use crate::provider::Provider;
+use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
 /// 故障转移队列条目（简化版，用于前端展示）
@@ -110,6 +111,48 @@ impl Database {
         )
         .map_err(|e| AppError::Database(e.to_string()))?;
 
+        Ok(())
+    }
+
+    /// 用给定 provider id 顺序原子替换某应用的故障转移队列。
+    ///
+    /// Profile 切换需要完整恢复队列成员与优先级；先清空再按快照顺序写入，
+    /// 可避免旧项目遗留成员混入新项目的故障转移链路。
+    pub fn replace_failover_queue(
+        &self,
+        app_type: &str,
+        provider_ids: &[String],
+    ) -> Result<(), AppError> {
+        let mut conn = lock_conn!(self.conn);
+        let tx = conn
+            .transaction()
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tx.execute(
+            "UPDATE providers SET in_failover_queue = 0 WHERE app_type = ?1",
+            [app_type],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        for (index, provider_id) in provider_ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE providers
+                 SET in_failover_queue = 1, sort_index = ?1
+                 WHERE app_type = ?2 AND id = ?3",
+                params![index, app_type, provider_id],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+
+        tx.execute(
+            "DELETE FROM provider_health WHERE app_type = ?1 AND provider_id NOT IN (
+                SELECT id FROM providers WHERE app_type = ?1 AND in_failover_queue = 1
+            )",
+            [app_type],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        tx.commit().map_err(|e| AppError::Database(e.to_string()))?;
         Ok(())
     }
 
