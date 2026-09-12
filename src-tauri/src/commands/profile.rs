@@ -92,6 +92,34 @@ pub fn emit_profile_apply_events(
     crate::tray::refresh_tray_menu(app);
 }
 
+/// “不使用项目”完成后的统一收尾：同步 provider/proxy/failover 相关 UI。
+pub fn emit_profile_cleared_events(app: &tauri::AppHandle, state: &AppState, scope: ProfileScope) {
+    for app_type in scope.apps().iter() {
+        let app_str = app_type.as_str();
+        let (proxy_enabled, auto_failover_enabled) = state.db.get_proxy_flags_sync(app_str);
+        let provider_id = crate::settings::get_effective_current_provider(&state.db, app_type)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let event_data = serde_json::json!({
+            "appType": app_str,
+            "proxyEnabled": proxy_enabled,
+            "autoFailoverEnabled": auto_failover_enabled,
+            "providerId": provider_id,
+        });
+        if let Err(e) = app.emit("provider-switched", event_data) {
+            log::error!("发射 provider-switched 事件失败: {e}");
+        }
+    }
+    if let Err(e) = app.emit(
+        "profile-applied",
+        serde_json::json!({ "profileId": null, "scope": scope.as_str() }),
+    ) {
+        log::error!("发射 profile-applied 事件失败: {e}");
+    }
+    crate::tray::refresh_tray_menu(app);
+}
+
 #[tauri::command]
 pub fn list_profiles(state: State<'_, AppState>) -> Result<ProfilesResponse, String> {
     let profiles = ProfileService::list(&state).map_err(|e| e.to_string())?;
@@ -150,12 +178,34 @@ pub fn delete_profile(state: State<'_, AppState>, id: String) -> Result<(), Stri
 }
 
 #[tauri::command]
-pub fn clear_current_profile(state: State<'_, AppState>, scope: String) -> Result<(), String> {
+pub fn clear_current_profile(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    scope: String,
+) -> Result<(), String> {
     let scope = ProfileScope::parse(&scope).map_err(|e| e.to_string())?;
-    state
-        .db
-        .set_current_profile_id(scope.as_str(), None)
-        .map_err(|e| e.to_string())
+    let (warnings, should_stop_proxy) =
+        ProfileService::clear_current(&state, scope).map_err(|e| e.to_string())?;
+    for warning in &warnings {
+        log::warn!("[Profile] 清除当前项目警告: {warning}");
+    }
+
+    if should_stop_proxy {
+        let app_handle = app.clone();
+        let proxy_service = state.proxy_service.clone();
+        tauri::async_runtime::spawn(async move {
+            if let Err(e) = proxy_service.stop().await {
+                log::warn!("清除当前项目后停止代理服务失败: {e}");
+            }
+            if let Some(app_state) = app_handle.try_state::<AppState>() {
+                emit_profile_cleared_events(&app_handle, app_state.inner(), scope);
+            }
+        });
+    } else {
+        emit_profile_cleared_events(&app, &state, scope);
+    }
+
+    Ok(())
 }
 
 /// 应用项目快照（只作用于发起页所属分组内的应用）。

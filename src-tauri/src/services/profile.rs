@@ -306,6 +306,159 @@ fn plan_failover_restore(
     (restored, dangling, changed)
 }
 
+fn none_profile_payload_key(scope: ProfileScope) -> String {
+    format!("profile_none_payload_{}", scope.as_str())
+}
+
+fn apply_payload(
+    state: &AppState,
+    payload: &ProfilePayload,
+    scope: ProfileScope,
+    source_id: &str,
+) -> Result<(Vec<String>, bool), AppError> {
+    let mut warnings = Vec::new();
+
+    if !payload.scope_captured(scope) {
+        warnings.push(format!(
+            "no {} configuration captured in this project yet; marked as current without changes (it will be saved automatically when you switch away)",
+            scope.as_str()
+        ));
+    }
+
+    for app in scope.apps().iter() {
+        let app_str = app.as_str();
+
+        // 1. 切换项目前无条件关闭当前应用的代理接管。
+        // 接管态下 live 文件属于代理；用户希望切换工作目录时总是退出当前
+        // 代理环境，再按快照写入真实供应商配置。
+        if let Err(e) = state.proxy_service.disable_takeover_for_app_sync(app) {
+            warnings.push(format!(
+                "[{app_str}] auto-disable proxy takeover before profile switch failed: {e}"
+            ));
+        }
+
+        // 2. 供应商
+        if let Some(Some(target_pid)) = payload.providers.get(app) {
+            let providers = state.db.get_all_providers(app_str)?;
+            if !providers.contains_key(target_pid) {
+                warnings.push(format!(
+                    "[{app_str}] provider '{target_pid}' no longer exists, skipped"
+                ));
+            } else {
+                let current = crate::settings::get_effective_current_provider(&state.db, app)?;
+                if current.as_deref() != Some(target_pid.as_str()) {
+                    match ProviderService::switch(state, app.clone(), target_pid) {
+                        Ok(result) => warnings.extend(result.warnings),
+                        Err(e) => warnings.push(format!(
+                            "[{app_str}] switch provider '{target_pid}' failed: {e}"
+                        )),
+                    }
+                }
+            }
+        }
+
+        // 3. 故障转移队列（None = 旧快照未包含该槽位，不触碰当前运行时队列）
+        if let Some(Some(target_ids)) = payload.failover.get(app) {
+            let providers = state.db.get_all_providers(app_str)?;
+            let existing_provider_ids: HashSet<&str> =
+                providers.keys().map(|id| id.as_str()).collect();
+            let current_queue_ids: Vec<String> = state
+                .db
+                .get_failover_queue(app_str)?
+                .into_iter()
+                .map(|item| item.provider_id)
+                .collect();
+            let (restored_ids, dangling, changed) =
+                plan_failover_restore(&existing_provider_ids, &current_queue_ids, target_ids);
+
+            for id in dangling {
+                warnings.push(format!(
+                    "[{app_str}] failover provider '{id}' no longer exists, skipped"
+                ));
+            }
+
+            if changed {
+                if let Err(e) = state.db.replace_failover_queue(app_str, &restored_ids) {
+                    warnings.push(format!("[{app_str}] restore failover queue failed: {e}"));
+                } else {
+                    log::info!(
+                        "[Profile] restored failover queue: source_id='{source_id}', scope='{}', app_type='{app_str}', before={:?}, after={:?}",
+                        scope.as_str(),
+                        current_queue_ids,
+                        restored_ids
+                    );
+                }
+            }
+        }
+
+        // 4. MCP diff（最小 toggle：仅动目标态≠当前态的条目；None = 该侧未拍过，不动）
+        if let Some(Some(target_ids)) = payload.mcp.get(app) {
+            let servers = state.db.get_all_mcp_servers()?;
+            let current: Vec<(String, bool)> = servers
+                .values()
+                .map(|s| (s.id.clone(), s.apps.is_enabled_for(app)))
+                .collect();
+            let (toggles, dangling) = plan_toggles(&current, target_ids);
+            for id in dangling {
+                warnings.push(format!("[{app_str}] MCP '{id}' no longer exists, skipped"));
+            }
+            for (id, enabled) in toggles {
+                if let Err(e) = McpService::toggle_app(state, &id, app.clone(), enabled) {
+                    warnings.push(format!(
+                        "[{app_str}] toggle MCP '{id}' -> {enabled} failed: {e}"
+                    ));
+                }
+            }
+        }
+
+        // 5. Skills diff（SkillService 返回 anyhow::Result，收进 warning）
+        if let Some(Some(target_ids)) = payload.skills.get(app) {
+            let skills = state.db.get_all_installed_skills()?;
+            let current: Vec<(String, bool)> = skills
+                .values()
+                .map(|s| (s.id.clone(), s.apps.is_enabled_for(app)))
+                .collect();
+            let (toggles, dangling) = plan_toggles(&current, target_ids);
+            for id in dangling {
+                warnings.push(format!(
+                    "[{app_str}] skill '{id}' no longer exists, skipped"
+                ));
+            }
+            for (id, enabled) in toggles {
+                if let Err(e) = SkillService::toggle_app(&state.db, &id, app, enabled) {
+                    warnings.push(format!(
+                        "[{app_str}] toggle skill '{id}' -> {enabled} failed: {e}"
+                    ));
+                }
+            }
+        }
+
+        // 6. Prompt（None = 不动；已激活则幂等跳过，避免无谓的文件写与备份）
+        if let Some(Some(target_prompt)) = payload.prompts.get(app) {
+            let prompts = state.db.get_prompts(app_str)?;
+            match prompts.get(target_prompt) {
+                None => warnings.push(format!(
+                    "[{app_str}] prompt '{target_prompt}' no longer exists, skipped"
+                )),
+                Some(p) if p.enabled => {}
+                Some(_) => {
+                    if let Err(e) = PromptService::enable_prompt(state, app.clone(), target_prompt)
+                    {
+                        warnings.push(format!(
+                            "[{app_str}] enable prompt '{target_prompt}' failed: {e}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // 当前分组内所有接管已关闭；若其它应用也无接管，可停止代理服务。
+    let should_stop_proxy = !state.db.is_live_takeover_active_sync();
+
+    Ok((warnings, should_stop_proxy))
+}
+
 pub struct ProfileService;
 
 impl ProfileService {
@@ -437,22 +590,75 @@ impl ProfileService {
         Ok(())
     }
 
+    /// 保存某分组的“未使用项目”运行态。
+    ///
+    /// “不使用项目”也需要像一个独立工作区一样保留 provider/failover 状态；
+    /// 否则从无项目切回具体项目时，会把无项目期间的队列误认为项目队列。
+    fn save_none_snapshot(state: &AppState, scope: ProfileScope) -> Result<(), AppError> {
+        let payload = Self::snapshot_current(state, scope)?;
+        let serialized = serde_json::to_string(&payload)
+            .map_err(|e| AppError::Config(format!("序列化 no-profile payload 失败: {e}")))?;
+        state
+            .db
+            .set_setting(&none_profile_payload_key(scope), &serialized)
+    }
+
+    fn load_none_snapshot(
+        state: &AppState,
+        scope: ProfileScope,
+    ) -> Result<Option<ProfilePayload>, AppError> {
+        state
+            .db
+            .get_setting(&none_profile_payload_key(scope))?
+            .map(|payload| {
+                serde_json::from_str(&payload)
+                    .map_err(|e| AppError::Config(format!("解析 no-profile payload 失败: {e}")))
+            })
+            .transpose()
+    }
+
+    /// 切到“不使用项目”：先保存当前项目，再恢复该分组上一次的无项目运行态。
+    pub fn clear_current(
+        state: &AppState,
+        scope: ProfileScope,
+    ) -> Result<(Vec<String>, bool), AppError> {
+        let mut warnings = Vec::new();
+
+        if let Some(current_id) = state.db.get_current_profile_id(scope.as_str())? {
+            if let Err(e) = Self::update(state, &current_id, None, true, Some(scope)) {
+                warnings.push(format!(
+                    "autosave profile '{current_id}' before clearing current project failed: {e}"
+                ));
+            }
+        }
+
+        let should_stop_proxy = if let Some(payload) = Self::load_none_snapshot(state, scope)? {
+            let (apply_warnings, should_stop_proxy) =
+                apply_payload(state, &payload, scope, "__none__")?;
+            warnings.extend(apply_warnings);
+            should_stop_proxy
+        } else {
+            !state.db.is_live_takeover_active_sync()
+        };
+
+        state.db.set_current_profile_id(scope.as_str(), None)?;
+        Ok((warnings, should_stop_proxy))
+    }
+
     /// 应用项目快照（best-effort，返回 warnings）
     ///
     /// 只作用于发起页所属分组内的应用，不碰其他分组的配置与 current 标记。
     /// 该分组从未拍过快照时不改动任何配置，仅标记 current 并返回提示
     /// （下次从该项目切走时，自动保存会补拍该侧快照）。
     ///
-    /// **切换前会自动保存旧项目**：若当前分组已绑定到另一个项目，先把当前
-    /// 状态写入那个旧项目（仅当前分组槽位），再加载目标项目。这样切走后
-    /// 旧项目仍保留离开时的配置，回来时状态一致。自动保存失败时作为 warning
-    /// 继续，不阻塞切换。
+    /// **切换前会自动保存旧项目或“无项目”状态**：若当前分组已绑定到另一个项目，
+    /// 先把当前状态写入那个旧项目；若处于“不使用项目”，则写入独立 no-profile
+    /// 快照，避免无项目期间的 provider/failover 状态污染目标项目。
     ///
     /// 应用指定项目的快照到当前分组内的所有应用。
     ///
     /// 返回 `(warnings, should_stop_proxy)`：当当前分组内所有接管都被关闭、且
-    /// 其它应用也没有接管时，建议调用者停止代理服务，以便 Claude Desktop 的
-    /// "本地路由"总开关同步显示为关闭。
+    /// 其它应用也没有接管时，建议调用者停止代理服务。
     pub fn apply(
         state: &AppState,
         profile_id: &str,
@@ -469,6 +675,11 @@ impl ProfileService {
                     ));
                 }
             }
+        } else if let Err(e) = Self::save_none_snapshot(state, scope) {
+            log::warn!(
+                "[Profile] autosave no-profile state before switch failed: scope='{}', error={e}",
+                scope.as_str()
+            );
         }
 
         let profile = state
@@ -478,148 +689,13 @@ impl ProfileService {
         let payload: ProfilePayload = serde_json::from_str(&profile.payload)
             .map_err(|e| AppError::Config(format!("解析 profile payload 失败: {e}")))?;
 
-        if !payload.scope_captured(scope) {
-            warnings.push(format!(
-                "no {} configuration captured in this project yet; marked as current without changes (it will be saved automatically when you switch away)",
-                scope.as_str()
-            ));
-        }
-
-        for app in scope.apps().iter() {
-            let app_str = app.as_str();
-
-            // 1. 切换项目前无条件关闭当前应用的代理接管。
-            // 接管态下 live 文件属于代理；用户希望切换工作目录时总是退出当前
-            // 代理环境，再按快照写入真实供应商配置。
-            if let Err(e) = state.proxy_service.disable_takeover_for_app_sync(app) {
-                warnings.push(format!(
-                    "[{app_str}] auto-disable proxy takeover before profile switch failed: {e}"
-                ));
-            }
-
-            // 2. 供应商
-            if let Some(Some(target_pid)) = payload.providers.get(app) {
-                let providers = state.db.get_all_providers(app_str)?;
-                if !providers.contains_key(target_pid) {
-                    warnings.push(format!(
-                        "[{app_str}] provider '{target_pid}' no longer exists, skipped"
-                    ));
-                } else {
-                    let current = crate::settings::get_effective_current_provider(&state.db, app)?;
-                    if current.as_deref() != Some(target_pid.as_str()) {
-                        match ProviderService::switch(state, app.clone(), target_pid) {
-                            Ok(result) => warnings.extend(result.warnings),
-                            Err(e) => warnings.push(format!(
-                                "[{app_str}] switch provider '{target_pid}' failed: {e}"
-                            )),
-                        }
-                    }
-                }
-            }
-
-            // 3. 故障转移队列（None = 旧快照未包含该槽位，不触碰当前运行时队列）
-            if let Some(Some(target_ids)) = payload.failover.get(app) {
-                let providers = state.db.get_all_providers(app_str)?;
-                let existing_provider_ids: HashSet<&str> =
-                    providers.keys().map(|id| id.as_str()).collect();
-                let current_queue_ids: Vec<String> = state
-                    .db
-                    .get_failover_queue(app_str)?
-                    .into_iter()
-                    .map(|item| item.provider_id)
-                    .collect();
-                let (restored_ids, dangling, changed) =
-                    plan_failover_restore(&existing_provider_ids, &current_queue_ids, target_ids);
-
-                for id in dangling {
-                    warnings.push(format!(
-                        "[{app_str}] failover provider '{id}' no longer exists, skipped"
-                    ));
-                }
-
-                if changed {
-                    if let Err(e) = state.db.replace_failover_queue(app_str, &restored_ids) {
-                        warnings.push(format!("[{app_str}] restore failover queue failed: {e}"));
-                    } else {
-                        log::info!(
-                            "[Profile] restored failover queue: profile_id='{profile_id}', scope='{}', app_type='{app_str}', before={:?}, after={:?}",
-                            scope.as_str(),
-                            current_queue_ids,
-                            restored_ids
-                        );
-                    }
-                }
-            }
-
-            // 4. MCP diff（最小 toggle：仅动目标态≠当前态的条目；None = 该侧未拍过，不动）
-            if let Some(Some(target_ids)) = payload.mcp.get(app) {
-                let servers = state.db.get_all_mcp_servers()?;
-                let current: Vec<(String, bool)> = servers
-                    .values()
-                    .map(|s| (s.id.clone(), s.apps.is_enabled_for(app)))
-                    .collect();
-                let (toggles, dangling) = plan_toggles(&current, target_ids);
-                for id in dangling {
-                    warnings.push(format!("[{app_str}] MCP '{id}' no longer exists, skipped"));
-                }
-                for (id, enabled) in toggles {
-                    if let Err(e) = McpService::toggle_app(state, &id, app.clone(), enabled) {
-                        warnings.push(format!(
-                            "[{app_str}] toggle MCP '{id}' -> {enabled} failed: {e}"
-                        ));
-                    }
-                }
-            }
-
-            // 5. Skills diff（SkillService 返回 anyhow::Result，收进 warning）
-            if let Some(Some(target_ids)) = payload.skills.get(app) {
-                let skills = state.db.get_all_installed_skills()?;
-                let current: Vec<(String, bool)> = skills
-                    .values()
-                    .map(|s| (s.id.clone(), s.apps.is_enabled_for(app)))
-                    .collect();
-                let (toggles, dangling) = plan_toggles(&current, target_ids);
-                for id in dangling {
-                    warnings.push(format!(
-                        "[{app_str}] skill '{id}' no longer exists, skipped"
-                    ));
-                }
-                for (id, enabled) in toggles {
-                    if let Err(e) = SkillService::toggle_app(&state.db, &id, app, enabled) {
-                        warnings.push(format!(
-                            "[{app_str}] toggle skill '{id}' -> {enabled} failed: {e}"
-                        ));
-                    }
-                }
-            }
-
-            // 6. Prompt（None = 不动；已激活则幂等跳过，避免无谓的文件写与备份）
-            if let Some(Some(target_prompt)) = payload.prompts.get(app) {
-                let prompts = state.db.get_prompts(app_str)?;
-                match prompts.get(target_prompt) {
-                    None => warnings.push(format!(
-                        "[{app_str}] prompt '{target_prompt}' no longer exists, skipped"
-                    )),
-                    Some(p) if p.enabled => {}
-                    Some(_) => {
-                        if let Err(e) =
-                            PromptService::enable_prompt(state, app.clone(), target_prompt)
-                        {
-                            warnings.push(format!(
-                                "[{app_str}] enable prompt '{target_prompt}' failed: {e}"
-                            ));
-                        }
-                    }
-                }
-            }
-        }
+        let (apply_warnings, should_stop_proxy) =
+            apply_payload(state, &payload, scope, profile_id)?;
+        warnings.extend(apply_warnings);
 
         state
             .db
             .set_current_profile_id(scope.as_str(), Some(profile_id))?;
-
-        // 当前分组内所有接管已关闭；若其它应用也无接管，可停止代理服务。
-        let should_stop_proxy = !state.db.is_live_takeover_active_sync();
 
         Ok((warnings, should_stop_proxy))
     }
