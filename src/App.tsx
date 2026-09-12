@@ -441,19 +441,34 @@ function App() {
     }
   });
 
-  // 应用项目后刷新相关缓存（providers 由既有 provider-switched 监听承接；
-  // proxy 状态由后端直接改 DB，不走 mutation，必须显式刷新）
-  useTauriEvent("profile-applied", async () => {
+  // 应用项目后刷新相关缓存（providers/failover 可能由 profile apply 直接改 DB，
+  // 不一定走对应 mutation；必须显式刷新，避免 UI 继续展示上个项目的队列）
+  useTauriEvent<{ scope?: string }>("profile-applied", async (payload) => {
+    const scopeApps: Record<string, string[]> = {
+      claude: ["claude"],
+      "claude-desktop": ["claude-desktop"],
+      codex: ["codex"],
+    };
+    const apps = payload?.scope
+      ? (scopeApps[payload.scope] ?? [])
+      : Object.values(scopeApps).flat();
+
     await queryClient.invalidateQueries({ queryKey: ["profiles"] });
     await queryClient.invalidateQueries({ queryKey: ["mcp", "all"] });
     await queryClient.invalidateQueries({ queryKey: ["skills"] });
+    await Promise.all(
+      apps.flatMap((app) => [
+        queryClient.invalidateQueries({ queryKey: ["providers", app] }),
+        queryClient.invalidateQueries({ queryKey: ["failoverQueue", app] }),
+        queryClient.invalidateQueries({
+          queryKey: ["availableProvidersForFailover", app],
+        }),
+      ]),
+    );
     await queryClient.invalidateQueries({
       queryKey: proxyKeys.takeoverStatus,
     });
     await queryClient.invalidateQueries({ queryKey: proxyKeys.status });
-    await queryClient.invalidateQueries({
-      queryKey: ["providers", "claude-desktop"],
-    });
   });
 
   useTauriEvent<SyncStatusUpdatedPayload | null | undefined>(
