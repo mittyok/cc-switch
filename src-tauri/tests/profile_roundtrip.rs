@@ -311,6 +311,101 @@ fn profile_snapshot_apply_roundtrip_restores_configuration() {
 }
 
 #[test]
+fn no_profile_state_is_isolated_from_project_failover_queue() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let home = ensure_test_home();
+
+    let state = create_test_state().expect("create test state");
+    for id in ["p1", "p2", "p3"] {
+        state
+            .db
+            .save_provider(AppType::Claude.as_str(), &claude_provider(id, id))
+            .expect("save provider");
+    }
+    state
+        .db
+        .set_current_provider(AppType::Claude.as_str(), "p1")
+        .expect("set current provider p1");
+    let claude_dir = home.join(".claude");
+    fs::create_dir_all(&claude_dir).expect("create .claude dir");
+    fs::write(
+        claude_dir.join("settings.json"),
+        serde_json::to_string_pretty(&claude_provider("p1", "p1").settings_config)
+            .expect("serialize p1 settings"),
+    )
+    .expect("seed live settings.json");
+
+    state
+        .db
+        .replace_failover_queue(
+            AppType::Claude.as_str(),
+            &["p1".to_string(), "p2".to_string()],
+        )
+        .expect("seed project queue");
+    let project = ProfileService::create(&state, "Project", ProfileScope::Claude)
+        .expect("create project snapshot");
+    state
+        .db
+        .set_current_profile_id(ProfileScope::Claude.as_str(), Some(&project.id))
+        .expect("mark project current");
+
+    state
+        .db
+        .replace_failover_queue(AppType::Claude.as_str(), &["p3".to_string()])
+        .expect("simulate no-profile queue before clear");
+    let (warnings, _) = ProfileService::clear_current(&state, ProfileScope::Claude)
+        .expect("clear current should save project and restore no-profile state");
+    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    assert_eq!(
+        state
+            .db
+            .get_current_profile_id(ProfileScope::Claude.as_str())
+            .expect("get current profile"),
+        None
+    );
+
+    state
+        .db
+        .replace_failover_queue(AppType::Claude.as_str(), &["p3".to_string()])
+        .expect("mutate no-profile queue while no project selected");
+    let (warnings, _) = ProfileService::apply(&state, &project.id, ProfileScope::Claude)
+        .expect("apply project restores project queue");
+    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    let project_queue = state
+        .db
+        .get_failover_queue(AppType::Claude.as_str())
+        .expect("get project queue")
+        .into_iter()
+        .map(|item| item.provider_id)
+        .collect::<Vec<_>>();
+    assert_eq!(project_queue, vec!["p3".to_string()]);
+
+    state
+        .db
+        .replace_failover_queue(
+            AppType::Claude.as_str(),
+            &["p2".to_string(), "p1".to_string()],
+        )
+        .expect("mutate project queue before returning to no-profile");
+    let (warnings, _) = ProfileService::clear_current(&state, ProfileScope::Claude)
+        .expect("return to no-profile restores its independent queue");
+    assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    let no_profile_queue = state
+        .db
+        .get_failover_queue(AppType::Claude.as_str())
+        .expect("get no-profile queue")
+        .into_iter()
+        .map(|item| item.provider_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        no_profile_queue,
+        vec!["p3".to_string()],
+        "no-profile keeps its own failover queue instead of reusing the project queue"
+    );
+}
+
+#[test]
 fn shared_profile_sides_are_isolated_and_mergeable() {
     let _guard = test_mutex().lock().expect("acquire test mutex");
     reset_test_fs();

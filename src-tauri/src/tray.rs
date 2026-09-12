@@ -449,18 +449,37 @@ pub fn handle_profile_tray_event(app: &tauri::AppHandle, event_id: &str) -> bool
             return true;
         };
         if let Some(app_state) = app.try_state::<AppState>() {
-            if let Err(e) = app_state.db.set_current_profile_id(scope.as_str(), None) {
-                log::error!("清除当前项目失败: {e}");
+            match crate::services::profile::ProfileService::clear_current(app_state.inner(), scope)
+            {
+                Ok((warnings, should_stop_proxy)) => {
+                    for warning in &warnings {
+                        log::warn!("[Profile] 清除当前项目警告: {warning}");
+                    }
+                    if should_stop_proxy {
+                        let app_handle = app.clone();
+                        let proxy_service = app_state.proxy_service.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(e) = proxy_service.stop().await {
+                                log::warn!("托盘清除当前项目后停止代理服务失败: {e}");
+                            }
+                            if let Some(state) = app_handle.try_state::<AppState>() {
+                                crate::commands::emit_profile_cleared_events(
+                                    &app_handle,
+                                    state.inner(),
+                                    scope,
+                                );
+                            }
+                        });
+                    } else {
+                        crate::commands::emit_profile_cleared_events(app, app_state.inner(), scope);
+                    }
+                }
+                Err(e) => {
+                    log::error!("清除当前项目失败: {e}");
+                    refresh_tray_menu(app);
+                }
             }
         }
-        // 通知主窗口刷新（profileId=null 表示该分组已清除当前项目）
-        if let Err(e) = app.emit(
-            "profile-applied",
-            serde_json::json!({ "profileId": null, "scope": scope.as_str() }),
-        ) {
-            log::error!("发射 profile-applied 事件失败: {e}");
-        }
-        refresh_tray_menu(app);
         return true;
     }
 
