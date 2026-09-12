@@ -328,16 +328,8 @@ fn apply_payload(
     for app in scope.apps().iter() {
         let app_str = app.as_str();
 
-        // 1. 切换项目前无条件关闭当前应用的代理接管。
-        // 接管态下 live 文件属于代理；用户希望切换工作目录时总是退出当前
-        // 代理环境，再按快照写入真实供应商配置。
-        if let Err(e) = state.proxy_service.disable_takeover_for_app_sync(app) {
-            warnings.push(format!(
-                "[{app_str}] auto-disable proxy takeover before profile switch failed: {e}"
-            ));
-        }
-
-        // 2. 供应商
+        // 1. 供应商。项目切换必须保持路由开关的最后状态；接管开启时 ProviderService::switch
+        // 会走热切换路径，避免用户反馈的“切换项目后路由开关总是关闭”。
         if let Some(Some(target_pid)) = payload.providers.get(app) {
             let providers = state.db.get_all_providers(app_str)?;
             if !providers.contains_key(target_pid) {
@@ -357,7 +349,7 @@ fn apply_payload(
             }
         }
 
-        // 3. 故障转移队列（None = 旧快照未包含该槽位，不触碰当前运行时队列）
+        // 2. 故障转移队列（None = 旧快照未包含该槽位，不触碰当前运行时队列）
         if let Some(Some(target_ids)) = payload.failover.get(app) {
             let providers = state.db.get_all_providers(app_str)?;
             let existing_provider_ids: HashSet<&str> =
@@ -391,7 +383,7 @@ fn apply_payload(
             }
         }
 
-        // 4. MCP diff（最小 toggle：仅动目标态≠当前态的条目；None = 该侧未拍过，不动）
+        // 3. MCP diff（最小 toggle：仅动目标态≠当前态的条目；None = 该侧未拍过，不动）
         if let Some(Some(target_ids)) = payload.mcp.get(app) {
             let servers = state.db.get_all_mcp_servers()?;
             let current: Vec<(String, bool)> = servers

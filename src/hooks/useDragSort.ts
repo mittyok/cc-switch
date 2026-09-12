@@ -81,7 +81,7 @@ export function useDragSort(providers: Record<string, Provider>, appId: AppId) {
           queryKey: ["providers", appId],
         });
 
-        // Routing apps derive failover order from sort_index.
+        // Failover order is stored separately; invalidate membership/status only.
         if (isProxyAppId(appId)) {
           await queryClient.invalidateQueries({
             queryKey: ["failoverQueue", appId],

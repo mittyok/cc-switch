@@ -406,6 +406,64 @@ fn no_profile_state_is_isolated_from_project_failover_queue() {
 }
 
 #[test]
+fn failover_queue_order_survives_provider_list_reorder() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let _home = ensure_test_home();
+
+    let state = create_test_state().expect("create test state");
+    for id in ["p1", "p2", "p3"] {
+        state
+            .db
+            .save_provider(AppType::Claude.as_str(), &claude_provider(id, id))
+            .expect("save provider");
+    }
+
+    state
+        .db
+        .replace_failover_queue(
+            AppType::Claude.as_str(),
+            &["p2".to_string(), "p1".to_string(), "p3".to_string()],
+        )
+        .expect("seed failover order");
+
+    // 模拟供应商列表拖拽排序：它只应更新 provider 列表顺序，不能覆盖故障转移优先级。
+    for (id, sort_index) in [("p3", 0), ("p1", 1), ("p2", 2)] {
+        let mut provider = state
+            .db
+            .get_provider_by_id(id, AppType::Claude.as_str())
+            .expect("get provider")
+            .expect("provider exists");
+        provider.sort_index = Some(sort_index);
+        state
+            .db
+            .save_provider(AppType::Claude.as_str(), &provider)
+            .expect("save provider list order");
+    }
+
+    let queue = state
+        .db
+        .get_failover_queue(AppType::Claude.as_str())
+        .expect("get failover queue")
+        .into_iter()
+        .map(|item| item.provider_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        queue,
+        vec!["p2".to_string(), "p1".to_string(), "p3".to_string()],
+        "failover priority must not be overwritten by provider list sort_index changes"
+    );
+
+    let provider_order = state
+        .db
+        .get_all_providers(AppType::Claude.as_str())
+        .expect("get providers");
+    assert_eq!(provider_order["p3"].sort_index, Some(0));
+    assert_eq!(provider_order["p1"].sort_index, Some(1));
+    assert_eq!(provider_order["p2"].sort_index, Some(2));
+}
+
+#[test]
 fn shared_profile_sides_are_isolated_and_mergeable() {
     let _guard = test_mutex().lock().expect("acquire test mutex");
     reset_test_fs();
@@ -771,7 +829,7 @@ fn switching_profile_autosaves_previous_profile_state() {
 }
 
 #[test]
-fn profile_switch_auto_disables_takeover_before_apply() {
+fn profile_switch_preserves_takeover_enabled_state() {
     let _guard = test_mutex().lock().expect("acquire test mutex");
     reset_test_fs();
     let home = ensure_test_home();
@@ -833,7 +891,7 @@ fn profile_switch_auto_disables_takeover_before_apply() {
         .save_profile(&project)
         .expect("save updated project");
 
-    // ---- 应用项目：应无条件自动关闭接管，再切换到 custom2 ----
+    // ---- 应用项目：保持用户切换前的路由开关状态，再切换到 custom2 ----
     let (warnings, _) = ProfileService::apply(&state, &project.id, ProfileScope::Claude)
         .expect("apply custom2 project");
     assert!(
@@ -841,11 +899,11 @@ fn profile_switch_auto_disables_takeover_before_apply() {
         "switching project should not warn: {warnings:?}"
     );
 
-    // 接管已关闭
+    // 用户反馈项目切换后路由开关会被关闭；Profile 应用只切配置，不覆盖开关状态。
     let (proxy_enabled_after, _) = state.db.get_proxy_flags_sync("claude");
     assert!(
-        !proxy_enabled_after,
-        "proxy takeover should be auto-disabled before applying profile"
+        proxy_enabled_after,
+        "profile switch should preserve proxy takeover enabled state"
     );
 
     // 当前供应商已切到 custom2
@@ -859,7 +917,7 @@ fn profile_switch_auto_disables_takeover_before_apply() {
         "current provider should be custom2"
     );
 
-    // live 配置应指向 custom2 的真实 endpoint，而非代理地址
+    // 接管开启时 live 配置仍指向本地代理；ProviderService 热切换当前 provider。
     let settings_path = home.join(".claude/settings.json");
     let settings: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&settings_path).expect("read settings"))
@@ -868,10 +926,9 @@ fn profile_switch_auto_disables_takeover_before_apply() {
         .get("env")
         .and_then(|e| e.get("ANTHROPIC_BASE_URL"))
         .and_then(|v| v.as_str());
-    assert_eq!(
-        base_url,
-        Some("https://api.test"),
-        "live config should point to real endpoint after auto-disable"
+    assert!(
+        base_url.is_some_and(|url| url.starts_with("http://127.0.0.1:")),
+        "profile switch should preserve proxy routing while ProviderService hot-switches target provider"
     );
 }
 

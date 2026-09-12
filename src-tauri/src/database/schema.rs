@@ -39,6 +39,7 @@ impl Database {
                 meta TEXT NOT NULL DEFAULT '{}',
                 is_current BOOLEAN NOT NULL DEFAULT 0,
                 in_failover_queue BOOLEAN NOT NULL DEFAULT 0,
+                failover_sort_index INTEGER,
                 PRIMARY KEY (id, app_type)
             )",
             [],
@@ -411,13 +412,14 @@ impl Database {
             Self::migrate_proxy_config_to_per_app(conn)?;
         }
 
-        // 确保 in_failover_queue 列存在（对于已存在的 v2 数据库）
+        // 确保故障转移列存在（对于已存在的 v2 数据库）
         Self::add_column_if_missing(
             conn,
             "providers",
             "in_failover_queue",
             "BOOLEAN NOT NULL DEFAULT 0",
         )?;
+        Self::add_column_if_missing(conn, "providers", "failover_sort_index", "INTEGER")?;
 
         // 删除旧的 failover_queue 表（如果存在）
         let _ = conn.execute("DROP INDEX IF EXISTS idx_failover_queue_order", []);
@@ -426,7 +428,7 @@ impl Database {
         // 为故障转移队列创建索引（基于 providers 表）
         let _ = conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_providers_failover
-             ON providers(app_type, in_failover_queue, sort_index)",
+             ON providers(app_type, in_failover_queue, failover_sort_index)",
             [],
         );
 
@@ -549,6 +551,11 @@ impl Database {
                         Self::migrate_v17_to_v18(conn)?;
                         Self::set_user_version(conn, 18)?;
                     }
+                    18 => {
+                        log::info!("迁移数据库从 v18 到 v19（故障转移队列独立排序列）");
+                        Self::migrate_v18_to_v19(conn)?;
+                        Self::set_user_version(conn, 19)?;
+                    }
                     _ => {
                         return Err(AppError::Database(format!(
                             "未知的数据库版本 {version}，无法迁移到 {SCHEMA_VERSION}"
@@ -652,6 +659,7 @@ impl Database {
             "in_failover_queue",
             "BOOLEAN NOT NULL DEFAULT 0",
         )?;
+        Self::add_column_if_missing(conn, "providers", "failover_sort_index", "INTEGER")?;
 
         // 添加代理超时配置字段
         if Self::table_exists(conn, "proxy_config")? {
@@ -710,7 +718,7 @@ impl Database {
         // 创建 failover 索引
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_providers_failover
-             ON providers(app_type, in_failover_queue, sort_index)",
+             ON providers(app_type, in_failover_queue, failover_sort_index)",
             [],
         )
         .map_err(|e| AppError::Database(format!("创建 failover 索引失败: {e}")))?;
@@ -1595,6 +1603,17 @@ impl Database {
                 "last_tail_fingerprint",
                 "INTEGER",
             )?;
+        }
+        Ok(())
+    }
+
+    /// v18 -> v19: 故障转移队列使用独立排序列。
+    ///
+    /// 旧实现把故障转移优先级写进 providers.sort_index，会覆盖供应商列表排序；
+    /// 新列只服务故障转移队列，旧数据首次读取仍通过 sort_index 兜底兼容。
+    fn migrate_v18_to_v19(conn: &Connection) -> Result<(), AppError> {
+        if Self::table_exists(conn, "providers")? {
+            Self::add_column_if_missing(conn, "providers", "failover_sort_index", "INTEGER")?;
         }
         Ok(())
     }
@@ -3793,6 +3812,35 @@ mod tests {
         )?;
         assert_eq!(byte_offset, None, "存量行的字节游标必须为 NULL");
         assert_eq!(fingerprint, None, "存量行的尾部指纹必须为 NULL");
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v18_to_v19_adds_failover_sort_index() -> Result<(), AppError> {
+        // 故障转移优先级不能继续复用 providers.sort_index，否则项目切换会污染供应商列表排序。
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE providers (
+                id TEXT NOT NULL,
+                app_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                settings_config TEXT NOT NULL,
+                sort_index INTEGER,
+                in_failover_queue BOOLEAN NOT NULL DEFAULT 0,
+                PRIMARY KEY (id, app_type)
+             );",
+        )?;
+        Database::set_user_version(&conn, 18)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert!(Database::has_column(
+            &conn,
+            "providers",
+            "failover_sort_index"
+        )?);
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+
         Ok(())
     }
 }
