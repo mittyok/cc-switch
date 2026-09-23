@@ -7,8 +7,9 @@ use std::fs;
 use serde_json::json;
 
 use cc_switch_lib::{
-    AppType, InstalledSkill, McpServer, McpService, ProfilePayload, ProfileScope, ProfileService,
-    Prompt, PromptService, Provider, ProviderService, SkillApps, SkillService,
+    AppType, Database, InstalledSkill, McpServer, McpService, Profile, ProfilePayload,
+    ProfileScope, ProfileService, Prompt, PromptService, Provider, ProviderService, SkillApps,
+    SkillService,
 };
 
 #[path = "support.rs"]
@@ -42,6 +43,32 @@ fn desktop_provider(id: &str, token: &str) -> Provider {
         }),
         None,
     )
+}
+
+fn codex_provider(id: &str) -> Provider {
+    Provider::with_id(
+        id.to_string(),
+        id.to_uppercase(),
+        json!({
+            "env": {
+                "OPENAI_API_KEY": format!("key-{id}"),
+                "OPENAI_BASE_URL": "https://codex.test/v1"
+            }
+        }),
+        None,
+    )
+}
+
+fn save_profile_payload(db: &Database, id: &str, payload: ProfilePayload) {
+    db.save_profile(&Profile {
+        id: id.to_string(),
+        name: id.to_string(),
+        payload: serde_json::to_string(&payload).expect("serialize profile payload"),
+        sort_order: None,
+        created_at: Some(1_000),
+        updated_at: Some(1_000),
+    })
+    .expect("save profile payload");
 }
 
 fn mcp_server(id: &str, claude_enabled: bool) -> McpServer {
@@ -994,5 +1021,81 @@ fn claude_desktop_profile_scope_is_independent() {
             .as_deref(),
         Some(project.id.as_str()),
         "desktop scope marker set"
+    );
+}
+
+#[test]
+fn codex_project_route_resolves_saved_provider_chain_without_switching_current_provider() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+
+    let state = create_test_state().expect("create test state");
+    state
+        .db
+        .save_provider(AppType::Codex.as_str(), &codex_provider("global"))
+        .expect("save global codex provider");
+    state
+        .db
+        .save_provider(AppType::Codex.as_str(), &codex_provider("project-primary"))
+        .expect("save project primary provider");
+    state
+        .db
+        .save_provider(AppType::Codex.as_str(), &codex_provider("project-failover"))
+        .expect("save project failover provider");
+    state
+        .db
+        .set_current_provider(AppType::Codex.as_str(), "global")
+        .expect("set global current provider");
+
+    let mut payload = ProfilePayload::default();
+    payload.providers.codex = Some("project-primary".to_string());
+    payload.failover.codex = Some(vec![
+        "project-primary".to_string(),
+        "project-failover".to_string(),
+    ]);
+    save_profile_payload(&state.db, "backend-api", payload);
+
+    let chain = ProfileService::resolve_codex_provider_chain_for_profile(&state.db, "backend-api")
+        .expect("resolve project codex provider chain")
+        .expect("profile exists");
+
+    assert_eq!(
+        chain,
+        vec![
+            "project-primary".to_string(),
+            "project-failover".to_string()
+        ],
+        "project key routing must use the profile's Codex provider and failover order"
+    );
+    assert_eq!(
+        state
+            .db
+            .get_current_provider(AppType::Codex.as_str())
+            .expect("get current provider")
+            .as_deref(),
+        Some("global"),
+        "request-level project routing is read-only and must not switch the global current provider"
+    );
+}
+
+#[test]
+fn codex_project_route_distinguishes_missing_profile_and_missing_codex_provider() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+
+    let state = create_test_state().expect("create test state");
+    save_profile_payload(&state.db, "no-codex", ProfilePayload::default());
+
+    assert!(
+        ProfileService::resolve_codex_provider_chain_for_profile(&state.db, "missing")
+            .expect("resolve missing profile")
+            .is_none(),
+        "unknown profile id should be observable as profile-missing fallback"
+    );
+    assert_eq!(
+        ProfileService::resolve_codex_provider_chain_for_profile(&state.db, "no-codex")
+            .expect("resolve profile without codex provider"),
+        Some(Vec::new()),
+        "profile without a Codex provider should be observable as provider-missing fallback"
     );
 }

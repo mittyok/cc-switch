@@ -8,10 +8,13 @@ use crate::proxy::{
     extract_session_id,
     forwarder::RequestForwarder,
     server::ProxyState,
-    types::{AppProxyConfig, CopilotOptimizerConfig, OptimizerConfig, RectifierConfig},
+    types::{
+        AppProxyConfig, CopilotOptimizerConfig, OptimizerConfig, ProjectRouteStatus,
+        RectifierConfig,
+    },
     ProxyError,
 };
-use axum::http::HeaderMap;
+use axum::http::{header, HeaderMap};
 use std::time::Instant;
 
 /// 流式超时配置
@@ -21,6 +24,17 @@ pub struct StreamingTimeoutConfig {
     pub first_byte_timeout: u64,
     /// 静默期超时（秒），0 表示禁用
     pub idle_timeout: u64,
+}
+
+/// 本次请求的 provider 路由来源。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteSource {
+    /// 沿用当前激活 provider / 现有 failover 队列。
+    CurrentProvider,
+    /// 命中 `ccs_<profileId>_`，使用项目保存的 Codex provider 链。
+    ProjectProfile { profile_id: String },
+    /// 解析到项目 key 但项目或 provider 不可用，已兜底到当前激活 provider。
+    ProjectFallback { profile_id: String, reason: String },
 }
 
 /// 请求上下文
@@ -70,6 +84,8 @@ pub struct RequestContext {
     pub optimizer_config: OptimizerConfig,
     /// Copilot 优化器配置
     pub copilot_optimizer_config: CopilotOptimizerConfig,
+    /// 本次请求 provider 路由来源，用于避免项目路由改写全局 current provider。
+    pub route_source: RouteSource,
 }
 
 impl RequestContext {
@@ -129,19 +145,70 @@ impl RequestContext {
             session_result.client_provided
         );
 
-        // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
-        // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
-        let providers = state
-            .provider_router
-            .select_providers(app_type_str)
-            .await
-            .map_err(|e| match e {
-                crate::error::AppError::AllProvidersCircuitOpen => {
-                    ProxyError::AllProvidersCircuitOpen
-                }
-                crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
-                _ => ProxyError::DatabaseError(e.to_string()),
-            })?;
+        let route_resolution = resolve_project_route(state, headers, &app_type, app_type_str).await;
+
+        // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）。
+        // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额。
+        let (providers, route_source) = match route_resolution {
+            Some(ProjectRouteResolution::Matched {
+                profile_id,
+                provider_chain,
+            }) => {
+                let providers = state
+                    .provider_router
+                    .select_providers_by_ids(app_type_str, &provider_chain)
+                    .await
+                    .map_err(map_provider_selection_error)?;
+                update_project_route_status(
+                    state,
+                    ProjectRouteStatus {
+                        profile_id: profile_id.clone(),
+                        matched: true,
+                        fallback_reason: None,
+                        resolved_provider_id: providers.first().map(|provider| provider.id.clone()),
+                    },
+                )
+                .await;
+                log::info!(
+                    "[Codex] PROJECT_ROUTE_MATCHED profile_id='{profile_id}', resolved_provider_id='{}', path_app='{app_type_str}', session_id='{session_id}'",
+                    providers.first().map(|provider| provider.id.as_str()).unwrap_or("")
+                );
+                (providers, RouteSource::ProjectProfile { profile_id })
+            }
+            Some(ProjectRouteResolution::Fallback { profile_id, reason }) => {
+                let providers = state
+                    .provider_router
+                    .select_providers(app_type_str)
+                    .await
+                    .map_err(map_provider_selection_error)?;
+                update_project_route_status(
+                    state,
+                    ProjectRouteStatus {
+                        profile_id: profile_id.clone(),
+                        matched: false,
+                        fallback_reason: Some(reason.clone()),
+                        resolved_provider_id: providers.first().map(|provider| provider.id.clone()),
+                    },
+                )
+                .await;
+                log::warn!(
+                    "[Codex] {reason} profile_id='{profile_id}', fallback_provider_id='{}', path_app='{app_type_str}', session_id='{session_id}'",
+                    providers.first().map(|provider| provider.id.as_str()).unwrap_or("")
+                );
+                (
+                    providers,
+                    RouteSource::ProjectFallback { profile_id, reason },
+                )
+            }
+            None => {
+                let providers = state
+                    .provider_router
+                    .select_providers(app_type_str)
+                    .await
+                    .map_err(map_provider_selection_error)?;
+                (providers, RouteSource::CurrentProvider)
+            }
+        };
 
         let provider = providers
             .first()
@@ -173,6 +240,7 @@ impl RequestContext {
             rectifier_config,
             optimizer_config,
             copilot_optimizer_config,
+            route_source,
         })
     }
 
@@ -239,6 +307,7 @@ impl RequestContext {
             self.optimizer_config.clone(),
             self.copilot_optimizer_config.clone(),
             max_retries,
+            matches!(self.route_source, RouteSource::ProjectProfile { .. }),
         )
     }
 
@@ -278,6 +347,95 @@ impl RequestContext {
     }
 }
 
+enum ProjectRouteResolution {
+    Matched {
+        profile_id: String,
+        provider_chain: Vec<String>,
+    },
+    Fallback {
+        profile_id: String,
+        reason: String,
+    },
+}
+
+fn map_provider_selection_error(error: crate::error::AppError) -> ProxyError {
+    match error {
+        crate::error::AppError::AllProvidersCircuitOpen => ProxyError::AllProvidersCircuitOpen,
+        crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
+        _ => ProxyError::DatabaseError(error.to_string()),
+    }
+}
+
+async fn resolve_project_route(
+    state: &ProxyState,
+    headers: &HeaderMap,
+    app_type: &AppType,
+    app_type_str: &str,
+) -> Option<ProjectRouteResolution> {
+    if !matches!(app_type, AppType::Codex) {
+        return None;
+    }
+    let profile_id = extract_codex_profile_id(headers)?;
+    match crate::services::profile::ProfileService::resolve_codex_provider_chain_for_profile(
+        &state.db,
+        &profile_id,
+    ) {
+        Ok(Some(provider_chain)) if provider_chain.is_empty() => {
+            Some(ProjectRouteResolution::Fallback {
+                profile_id,
+                reason: "PROJECT_ROUTE_CODEX_PROVIDER_MISSING".to_string(),
+            })
+        }
+        Ok(Some(provider_chain)) => {
+            let primary_provider_exists = provider_chain
+                .first()
+                .and_then(|provider_id| state.db.get_provider_by_id(provider_id, app_type_str).ok())
+                .flatten()
+                .is_some();
+            if !primary_provider_exists {
+                Some(ProjectRouteResolution::Fallback {
+                    profile_id,
+                    reason: "PROJECT_ROUTE_PROVIDER_MISSING".to_string(),
+                })
+            } else {
+                Some(ProjectRouteResolution::Matched {
+                    profile_id,
+                    provider_chain,
+                })
+            }
+        }
+        Ok(None) => Some(ProjectRouteResolution::Fallback {
+            profile_id,
+            reason: "PROJECT_ROUTE_PROFILE_MISSING".to_string(),
+        }),
+        Err(error) => Some(ProjectRouteResolution::Fallback {
+            profile_id,
+            reason: format!("PROJECT_ROUTE_PROFILE_READ_FAILED: {error}"),
+        }),
+    }
+}
+
+fn extract_codex_profile_id(headers: &HeaderMap) -> Option<String> {
+    let authorization = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
+    let mut parts = authorization.split_whitespace();
+    let scheme = parts.next()?;
+    let token = parts.next()?;
+    if !scheme.eq_ignore_ascii_case("bearer") || parts.next().is_some() {
+        return None;
+    }
+    token
+        .strip_prefix("ccs_")
+        .and_then(|rest| rest.strip_suffix('_'))
+        .map(str::trim)
+        .filter(|profile_id| !profile_id.is_empty())
+        .map(str::to_string)
+}
+
+async fn update_project_route_status(state: &ProxyState, route_status: ProjectRouteStatus) {
+    let mut status = state.status.write().await;
+    status.last_project_route = Some(route_status);
+}
+
 /// Pull the Gemini model name out of an API path.
 ///
 /// Accepts forms like `/v1beta/models/gemini-pro:generateContent`,
@@ -298,7 +456,47 @@ pub(crate) fn extract_gemini_model_from_path(endpoint: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_gemini_model_from_path;
+    use super::*;
+    use crate::database::Database;
+    use crate::provider::Provider;
+    use crate::proxy::{failover_switch::FailoverSwitchManager, provider_router::ProviderRouter};
+    use crate::services::profile::ProfilePayload;
+    use serde_json::json;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn test_codex_provider(id: &str) -> Provider {
+        Provider::with_id(
+            id.to_string(),
+            id.to_uppercase(),
+            json!({ "env": { "OPENAI_API_KEY": format!("key-{id}") } }),
+            None,
+        )
+    }
+
+    fn test_state(db: Arc<Database>) -> ProxyState {
+        ProxyState {
+            db: db.clone(),
+            config: Arc::new(RwLock::new(Default::default())),
+            status: Arc::new(RwLock::new(Default::default())),
+            start_time: Arc::new(RwLock::new(None)),
+            current_providers: Arc::new(RwLock::new(Default::default())),
+            provider_router: Arc::new(ProviderRouter::new(db.clone())),
+            gemini_shadow: Arc::new(Default::default()),
+            codex_chat_history: Arc::new(Default::default()),
+            app_handle: None,
+            failover_manager: Arc::new(FailoverSwitchManager::new(db)),
+        }
+    }
+
+    fn bearer_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers
+    }
 
     #[test]
     fn extract_model_with_action() {
@@ -370,6 +568,165 @@ mod tests {
             extract_gemini_model_from_path("/gemini/v1beta/models/gemini-2.0-flash?key=abc")
                 .as_deref(),
             Some("gemini-2.0-flash"),
+        );
+    }
+
+    #[test]
+    fn extract_codex_profile_id_accepts_only_project_route_tokens() {
+        assert_eq!(
+            extract_codex_profile_id(&bearer_headers("ccs_backend-api_")),
+            Some("backend-api".to_string())
+        );
+        assert_eq!(
+            extract_codex_profile_id(&bearer_headers("ccs_has_multiple_underscores_")),
+            Some("has_multiple_underscores".to_string()),
+            "profile ids may contain underscores; only the final delimiter is structural"
+        );
+        assert_eq!(
+            extract_codex_profile_id(&bearer_headers("ccs__")),
+            None,
+            "empty project ids must not trigger project routing"
+        );
+        assert_eq!(
+            extract_codex_profile_id(&bearer_headers("ccs_no-trailing-underscore")),
+            None,
+            "missing trailing delimiter keeps the legacy non-project token path"
+        );
+        assert_eq!(
+            extract_codex_profile_id(&bearer_headers("sk-live-token")),
+            None,
+            "non ccs tokens must keep existing provider routing"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Basic ccs_backend-api_".parse().unwrap(),
+        );
+        assert_eq!(
+            extract_codex_profile_id(&headers),
+            None,
+            "only Bearer tokens participate in project routing"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_context_uses_project_route_and_records_status() {
+        let db = Arc::new(Database::memory().unwrap());
+        db.save_provider("codex", &test_codex_provider("global"))
+            .unwrap();
+        db.save_provider("codex", &test_codex_provider("project"))
+            .unwrap();
+        db.set_current_provider("codex", "global").unwrap();
+
+        let mut payload = ProfilePayload::default();
+        payload.providers.codex = Some("project".to_string());
+        db.save_profile(&crate::database::Profile {
+            id: "backend-api".to_string(),
+            name: "Backend API".to_string(),
+            payload: serde_json::to_string(&payload).unwrap(),
+            sort_order: None,
+            created_at: Some(1),
+            updated_at: Some(1),
+        })
+        .unwrap();
+
+        let state = test_state(db.clone());
+        let ctx = RequestContext::new(
+            &state,
+            &json!({ "model": "gpt-test" }),
+            &bearer_headers("ccs_backend-api_"),
+            AppType::Codex,
+            "Codex",
+            "codex",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ctx.provider.id, "project");
+        assert!(matches!(
+            ctx.route_source,
+            RouteSource::ProjectProfile { .. }
+        ));
+        assert_eq!(
+            db.get_current_provider("codex").unwrap().as_deref(),
+            Some("global"),
+            "project key route must not mutate global current provider"
+        );
+        assert_eq!(
+            state
+                .status
+                .read()
+                .await
+                .last_project_route
+                .as_ref()
+                .map(|route| (
+                    &route.profile_id,
+                    route.matched,
+                    route.resolved_provider_id.as_deref()
+                )),
+            Some((&"backend-api".to_string(), true, Some("project")))
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_context_falls_back_for_missing_project_profile() {
+        let db = Arc::new(Database::memory().unwrap());
+        db.save_provider("codex", &test_codex_provider("global"))
+            .unwrap();
+        db.set_current_provider("codex", "global").unwrap();
+
+        let state = test_state(db);
+        let ctx = RequestContext::new(
+            &state,
+            &json!({ "model": "gpt-test" }),
+            &bearer_headers("ccs_missing_"),
+            AppType::Codex,
+            "Codex",
+            "codex",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ctx.provider.id, "global");
+        assert!(matches!(
+            ctx.route_source,
+            RouteSource::ProjectFallback { .. }
+        ));
+        let status = state.status.read().await;
+        let route = status.last_project_route.as_ref().unwrap();
+        assert_eq!(route.profile_id, "missing");
+        assert_eq!(
+            route.fallback_reason.as_deref(),
+            Some("PROJECT_ROUTE_PROFILE_MISSING")
+        );
+        assert_eq!(route.resolved_provider_id.as_deref(), Some("global"));
+    }
+
+    #[test]
+    fn proxy_status_deserializes_without_project_route_for_old_clients() {
+        let status: crate::proxy::types::ProxyStatus = serde_json::from_value(json!({
+            "running": true,
+            "address": "127.0.0.1",
+            "port": 15721,
+            "active_connections": 0,
+            "total_requests": 1,
+            "success_requests": 1,
+            "failed_requests": 0,
+            "success_rate": 100.0,
+            "uptime_seconds": 3,
+            "current_provider": null,
+            "current_provider_id": null,
+            "last_request_at": null,
+            "last_error": null,
+            "failover_count": 0,
+            "active_targets": []
+        }))
+        .expect("old ProxyStatus JSON remains compatible without last_project_route");
+
+        assert!(
+            status.last_project_route.is_none(),
+            "new observability field is optional so old status payloads remain readable"
         );
     }
 }

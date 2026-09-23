@@ -89,6 +89,19 @@ pub struct ProxyStatus {
     /// 当前活跃的代理目标列表
     #[serde(default)]
     pub active_targets: Vec<ActiveTarget>,
+    /// 最近一次 Codex 项目 key 路由结果，仅内存态，进程重启即丢失。
+    #[serde(default)]
+    pub last_project_route: Option<ProjectRouteStatus>,
+}
+
+/// Codex `ccs_<profileId>_` 请求级项目路由结果。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRouteStatus {
+    pub profile_id: String,
+    pub matched: bool,
+    pub fallback_reason: Option<String>,
+    pub resolved_provider_id: Option<String>,
 }
 
 /// 活跃的代理目标信息
