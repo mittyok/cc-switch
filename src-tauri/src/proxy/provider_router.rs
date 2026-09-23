@@ -43,9 +43,6 @@ impl ProviderRouter {
     /// - 故障转移关闭时：仅返回当前供应商
     /// - 故障转移开启时：仅使用故障转移队列，按队列顺序依次尝试（P1 → P2 → ...）
     pub async fn select_providers(&self, app_type: &str) -> Result<Vec<Provider>, AppError> {
-        let mut result = Vec::new();
-        let mut total_providers = 0usize;
-        let mut circuit_open_count = 0usize;
         let current_id = AppType::from_str(app_type)
             .ok()
             .and_then(|app_enum| {
@@ -68,6 +65,55 @@ impl ProviderRouter {
                 false
             }
         };
+
+        self.select_providers_with_current(app_type, current_provider, auto_failover_enabled)
+            .await
+    }
+
+    /// 按请求级显式 provider id 链选择供应商，不读取/写入全局 current provider。
+    ///
+    /// 项目路由只应该影响本次 Codex 请求；这里仍复用 proxy_config 的故障转移开关、
+    /// 熔断器与 Codex Official 账号隔离规则，避免为 `ccs_<profileId>_` 开出第二套
+    /// 与现有代理行为不一致的并行逻辑。
+    pub async fn select_providers_by_ids(
+        &self,
+        app_type: &str,
+        provider_ids: &[String],
+    ) -> Result<Vec<Provider>, AppError> {
+        let mut providers = provider_ids.iter().filter_map(|provider_id| {
+            match self.db.get_provider_by_id(provider_id, app_type) {
+                Ok(Some(provider)) => Some(Ok(provider)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            }
+        });
+        let current_provider = providers.next().transpose()?;
+
+        if current_provider
+            .as_ref()
+            .is_some_and(|provider| !provider_supports_failover(app_type, provider))
+        {
+            return self
+                .select_providers_with_current(app_type, current_provider, true)
+                .await;
+        }
+
+        let ordered_providers = current_provider
+            .into_iter()
+            .chain(providers.collect::<Result<Vec<_>, _>>()?);
+        self.filter_available_providers(app_type, ordered_providers)
+            .await
+    }
+
+    async fn select_providers_with_current(
+        &self,
+        app_type: &str,
+        current_provider: Option<Provider>,
+        auto_failover_enabled: bool,
+    ) -> Result<Vec<Provider>, AppError> {
+        let mut result = Vec::new();
+        let mut total_providers = 0usize;
+        let mut circuit_open_count = 0usize;
 
         if auto_failover_enabled
             && current_provider
@@ -114,6 +160,47 @@ impl ProviderRouter {
             if let Some(current) = current_provider {
                 total_providers = 1;
                 result.push(current);
+            }
+        }
+
+        if result.is_empty() {
+            if total_providers > 0 && circuit_open_count == total_providers {
+                log::warn!("[{app_type}] [FO-004] 所有供应商均已熔断");
+                return Err(AppError::AllProvidersCircuitOpen);
+            } else {
+                log::warn!("[{app_type}] [FO-005] 未配置供应商");
+                return Err(AppError::NoProvidersConfigured);
+            }
+        }
+
+        Ok(result)
+    }
+
+    async fn filter_available_providers<I>(
+        &self,
+        app_type: &str,
+        providers: I,
+    ) -> Result<Vec<Provider>, AppError>
+    where
+        I: IntoIterator<Item = Provider>,
+    {
+        let mut result = Vec::new();
+        let mut total_providers = 0usize;
+        let mut circuit_open_count = 0usize;
+
+        for provider in providers {
+            if !provider_supports_failover(app_type, &provider) {
+                continue;
+            }
+            total_providers += 1;
+
+            let circuit_key = format!("{app_type}:{}", provider.id);
+            let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
+
+            if breaker.is_available().await {
+                result.push(provider);
+            } else {
+                circuit_open_count += 1;
             }
         }
 
@@ -536,6 +623,100 @@ mod tests {
                 .map(|provider| provider.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["fallback"]
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn explicit_provider_chain_uses_project_order_without_global_current() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        let global = Provider::with_id("global".to_string(), "Global".to_string(), json!({}), None);
+        let project_primary = Provider::with_id(
+            "project-primary".to_string(),
+            "Project Primary".to_string(),
+            json!({}),
+            None,
+        );
+        let project_failover = Provider::with_id(
+            "project-failover".to_string(),
+            "Project Failover".to_string(),
+            json!({}),
+            None,
+        );
+        db.save_provider("codex", &global).unwrap();
+        db.save_provider("codex", &project_primary).unwrap();
+        db.save_provider("codex", &project_failover).unwrap();
+        db.set_current_provider("codex", &global.id).unwrap();
+
+        let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+
+        let providers = ProviderRouter::new(db.clone())
+            .select_providers_by_ids(
+                "codex",
+                &[
+                    "project-primary".to_string(),
+                    "project-failover".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            providers
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["project-primary", "project-failover"],
+            "project key routing must use the request-scoped provider chain instead of the global current provider"
+        );
+        assert_eq!(
+            db.get_current_provider("codex").unwrap().as_deref(),
+            Some("global"),
+            "explicit provider chain selection is read-only"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn explicit_provider_chain_skips_missing_ids_and_rejects_empty_chain() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        let fallback = Provider::with_id(
+            "project-failover".to_string(),
+            "Project Failover".to_string(),
+            json!({}),
+            None,
+        );
+        db.save_provider("codex", &fallback).unwrap();
+
+        let router = ProviderRouter::new(db);
+        let providers = router
+            .select_providers_by_ids(
+                "codex",
+                &["missing".to_string(), "project-failover".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            providers
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["project-failover"],
+            "dangling profile failover ids are ignored while usable providers remain available"
+        );
+
+        let error = router
+            .select_providers_by_ids("codex", &[])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AppError::NoProvidersConfigured),
+            "empty explicit project chain should fail locally instead of falling through to global routing"
         );
     }
 

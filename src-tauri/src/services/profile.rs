@@ -19,6 +19,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::app_config::AppType;
+use crate::database::Database;
 use crate::database::Profile;
 use crate::error::AppError;
 use crate::services::{McpService, PromptService, ProviderService, SkillService};
@@ -454,6 +455,42 @@ fn apply_payload(
 pub struct ProfileService;
 
 impl ProfileService {
+    /// 只读解析项目的 Codex provider 链，供代理请求级路由使用。
+    ///
+    /// 不调用 [`Self::apply`]、不写 settings，也不缓存查询结果：Codex 的
+    /// `ccs_<profileId>_` key 只是本地便利路由，必须避免一次请求改动 UI 当前项目
+    /// 或全局 current provider。
+    pub fn resolve_codex_provider_chain_for_profile(
+        db: &Database,
+        profile_id: &str,
+    ) -> Result<Option<Vec<String>>, AppError> {
+        let Some(profile) = db.get_profile(profile_id)? else {
+            return Ok(None);
+        };
+        let payload: ProfilePayload = serde_json::from_str(&profile.payload)
+            .map_err(|e| AppError::Config(format!("解析 profile payload 失败: {e}")))?;
+        let Some(primary_id) = payload
+            .providers
+            .codex
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            return Ok(Some(Vec::new()));
+        };
+
+        let mut chain = vec![primary_id.to_string()];
+        if let Some(failover_ids) = payload.failover.codex.as_ref() {
+            for provider_id in failover_ids {
+                let provider_id = provider_id.trim();
+                if !provider_id.is_empty() && !chain.iter().any(|id| id == provider_id) {
+                    chain.push(provider_id.to_string());
+                }
+            }
+        }
+        Ok(Some(chain))
+    }
+
     /// 抓取分组内应用的当前配置状态生成快照（组外槽位保持默认值）
     pub fn snapshot_current(
         state: &AppState,

@@ -27,6 +27,14 @@ export interface ProxyStatus {
   last_error: string | null;
   failover_count: number;
   active_targets?: ActiveTarget[];
+  last_project_route?: ProjectRouteStatus | null;
+}
+
+export interface ProjectRouteStatus {
+  profileId: string;
+  matched: boolean;
+  fallbackReason: string | null;
+  resolvedProviderId: string | null;
 }
 
 export interface ActiveTarget {

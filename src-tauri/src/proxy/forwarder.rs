@@ -98,6 +98,17 @@ fn validate_codex_official_authorization(
     }
 }
 
+fn should_sync_provider_after_success(
+    project_route_active: bool,
+    current_provider_id_at_start: &str,
+    provider_id: &str,
+) -> bool {
+    // Project-key routing is request-scoped. A successful request must not promote
+    // the profile provider into the global current provider, otherwise one `ccs_*`
+    // request would silently change subsequent non-project Codex sessions.
+    !project_route_active && current_provider_id_at_start != provider_id
+}
+
 pub struct ForwardResult {
     pub response: ProxyResponse,
     pub provider: Provider,
@@ -168,6 +179,8 @@ pub struct RequestForwarder {
     app_handle: Option<tauri::AppHandle>,
     /// 请求开始时的"当前供应商 ID"（用于判断是否需要同步 UI/托盘）
     current_provider_id_at_start: String,
+    /// 请求级项目路由命中时不能把本次 provider 写回全局 current provider。
+    project_route_active: bool,
     /// 代理会话 ID（用于 Gemini Native shadow replay）
     session_id: String,
     /// Session ID 是否由客户端提供；生成值不能作为上游缓存身份。
@@ -255,6 +268,7 @@ impl RequestForwarder {
         optimizer_config: OptimizerConfig,
         copilot_optimizer_config: CopilotOptimizerConfig,
         max_retries: u32,
+        project_route_active: bool,
     ) -> Self {
         // max_retries 是「失败后重试次数」语义，attempt 上限 = retries + 1。
         // saturating_add 防止 u32::MAX + 1 溢出。
@@ -268,6 +282,7 @@ impl RequestForwarder {
             failover_manager,
             app_handle,
             current_provider_id_at_start,
+            project_route_active,
             session_id,
             session_client_provided,
             rectifier_config,
@@ -567,8 +582,11 @@ impl RequestForwarder {
                         let mut status = self.status.write().await;
                         status.success_requests += 1;
                         status.last_error = None;
-                        let should_switch =
-                            self.current_provider_id_at_start.as_str() != provider.id.as_str();
+                        let should_switch = should_sync_provider_after_success(
+                            self.project_route_active,
+                            self.current_provider_id_at_start.as_str(),
+                            provider.id.as_str(),
+                        );
                         if should_switch {
                             status.failover_count += 1;
 
@@ -670,9 +688,11 @@ impl RequestForwarder {
                                         let mut status = self.status.write().await;
                                         status.success_requests += 1;
                                         status.last_error = None;
-                                        let should_switch =
-                                            self.current_provider_id_at_start.as_str()
-                                                != provider.id.as_str();
+                                        let should_switch = should_sync_provider_after_success(
+                                            self.project_route_active,
+                                            self.current_provider_id_at_start.as_str(),
+                                            provider.id.as_str(),
+                                        );
                                         if should_switch {
                                             status.failover_count += 1;
                                             let fm = self.failover_manager.clone();
@@ -816,9 +836,11 @@ impl RequestForwarder {
                                             let mut status = self.status.write().await;
                                             status.success_requests += 1;
                                             status.last_error = None;
-                                            let should_switch =
-                                                self.current_provider_id_at_start.as_str()
-                                                    != provider.id.as_str();
+                                            let should_switch = should_sync_provider_after_success(
+                                                self.project_route_active,
+                                                self.current_provider_id_at_start.as_str(),
+                                                provider.id.as_str(),
+                                            );
                                             if should_switch {
                                                 status.failover_count += 1;
 
@@ -980,9 +1002,11 @@ impl RequestForwarder {
                                         let mut status = self.status.write().await;
                                         status.success_requests += 1;
                                         status.last_error = None;
-                                        let should_switch =
-                                            self.current_provider_id_at_start.as_str()
-                                                != provider.id.as_str();
+                                        let should_switch = should_sync_provider_after_success(
+                                            self.project_route_active,
+                                            self.current_provider_id_at_start.as_str(),
+                                            provider.id.as_str(),
+                                        );
                                         if should_switch {
                                             status.failover_count += 1;
                                             let fm = self.failover_manager.clone();
@@ -3999,6 +4023,7 @@ mod tests {
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
             app_handle: None,
             current_provider_id_at_start: String::new(),
+            project_route_active: false,
             session_id: String::new(),
             session_client_provided: false,
             rectifier_config: RectifierConfig::default(),
@@ -4025,6 +4050,22 @@ mod tests {
         // 上游错误消息保留(截断)，用于诊断失败原因。
         assert!(message.contains("rate limit exceeded"));
         assert!(!message.contains("切换下一个"));
+    }
+
+    #[test]
+    fn project_route_success_does_not_trigger_global_provider_switch() {
+        assert!(
+            should_sync_provider_after_success(false, "global", "fallback"),
+            "normal failover must still sync the global current provider after success"
+        );
+        assert!(
+            !should_sync_provider_after_success(true, "global", "project-provider"),
+            "project-key routing is request-scoped and must not rewrite global current provider"
+        );
+        assert!(
+            !should_sync_provider_after_success(false, "global", "global"),
+            "same-provider success has no state transition to record"
+        );
     }
 
     #[test]
