@@ -560,6 +560,13 @@ impl Database {
                         Self::migrate_v18_to_v19(conn)?;
                         Self::set_user_version(conn, 19)?;
                     }
+                    19 => {
+                        log::info!(
+                            "迁移数据库从 v19 到 v20（补齐 MiniMax Code MCP/Skills 启用列）"
+                        );
+                        Self::migrate_v19_to_v20(conn)?;
+                        Self::set_user_version(conn, 20)?;
+                    }
                     _ => {
                         return Err(AppError::Database(format!(
                             "未知的数据库版本 {version}，无法迁移到 {SCHEMA_VERSION}"
@@ -1621,7 +1628,20 @@ impl Database {
         if Self::table_exists(conn, "providers")? {
             Self::add_column_if_missing(conn, "providers", "failover_sort_index", "INTEGER")?;
         }
-        // v3.20.4 分支同版本添加的 MiniMax Code 启用开关，合并于此步。
+        Self::add_mcode_enabled_columns_if_missing(conn)
+    }
+
+    /// v19 -> v20: 修复已处于 v19 但缺少 MiniMax Code MCP/Skills 启用列的数据库。
+    ///
+    /// 部分构建曾把故障转移排序和 MiniMax Code 支持都标记为 v19；如果用户先运行
+    /// 了只包含 `failover_sort_index` 的 v19，合并后的 v18->v19 不会重跑，随后 MCP
+    /// 查询会因缺少 `enabled_mcode` 报 `no such column`。此迁移幂等补齐列。
+    fn migrate_v19_to_v20(conn: &Connection) -> Result<(), AppError> {
+        Self::add_mcode_enabled_columns_if_missing(conn)
+    }
+
+    fn add_mcode_enabled_columns_if_missing(conn: &Connection) -> Result<(), AppError> {
+        // MiniMax Code 启用开关默认关闭，避免升级后意外写入用户的 ~/.minimax 配置。
         for table in ["mcp_servers", "skills"] {
             if Self::table_exists(conn, table)? {
                 Self::add_column_if_missing(
@@ -3984,6 +4004,54 @@ mod tests {
         )?);
         assert!(Database::has_column(&conn, "mcp_servers", "enabled_mcode")?);
         assert!(Database::has_column(&conn, "skills", "enabled_mcode")?);
+        assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
+
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v19_to_v20_repairs_missing_mcode_columns() -> Result<(), AppError> {
+        // 先运行过旧 v19 的数据库不会重跑 v18->v19；必须用新版本补列，避免 MCP
+        // 列表查询 `enabled_mcode` 时触发 SQLite `no such column`。
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE providers (
+                id TEXT NOT NULL,
+                app_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                settings_config TEXT NOT NULL,
+                sort_index INTEGER,
+                failover_sort_index INTEGER,
+                in_failover_queue BOOLEAN NOT NULL DEFAULT 0,
+                PRIMARY KEY (id, app_type)
+             );
+             CREATE TABLE mcp_servers (
+                id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                server_config TEXT NOT NULL,
+                enabled_hermes BOOLEAN NOT NULL DEFAULT 0,
+                PRIMARY KEY (id)
+             );
+             CREATE TABLE skills (
+                id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                directory TEXT NOT NULL,
+                enabled_hermes BOOLEAN NOT NULL DEFAULT 0,
+                PRIMARY KEY (id)
+             );",
+        )?;
+        Database::set_user_version(&conn, 19)?;
+
+        Database::apply_schema_migrations_on_conn(&conn)?;
+
+        assert!(
+            Database::has_column(&conn, "mcp_servers", "enabled_mcode")?,
+            "v19 库缺少 MCP enabled_mcode 会导致应用项目时查询失败"
+        );
+        assert!(
+            Database::has_column(&conn, "skills", "enabled_mcode")?,
+            "v19 库缺少 Skills enabled_mcode 会导致 MiniMax Code 同步失败"
+        );
         assert_eq!(Database::get_user_version(&conn)?, SCHEMA_VERSION);
 
         Ok(())
