@@ -464,7 +464,14 @@ impl ProfileService {
         db: &Database,
         profile_id: &str,
     ) -> Result<Option<Vec<String>>, AppError> {
-        let Some(profile) = db.get_profile(profile_id)? else {
+        // 用户在 UI 里只能看到 profile 的 name（如 "GLM"），看不到 UUID id。
+        // ccs_<profileId>_ 令牌里填的可能是 name 也可能是 id，先按 id 查、
+        // 查不到再按 name 回退，保证两种写法都能路由到正确的 profile。
+        let profile = match db.get_profile(profile_id)? {
+            Some(p) => Some(p),
+            None => db.get_profile_by_name(profile_id)?,
+        };
+        let Some(profile) = profile else {
             return Ok(None);
         };
         let payload: ProfilePayload = serde_json::from_str(&profile.payload)

@@ -85,6 +85,36 @@ impl Database {
         }
     }
 
+
+    /// 按项目名称查找 profile。
+    ///
+    /// `ccs_<profileId>_` 路由令牌对用户可见的只有 profile 名称（UI 不展示 UUID），
+    /// 因此当按 id 查不到时需要回退到按 name 查找，保证用户用 name 拼 key 也能路由。
+    pub fn get_profile_by_name(&self, name: &str) -> Result<Option<Profile>, AppError> {
+        let conn = lock_conn!(self.conn);
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, name, payload, sort_order, created_at, updated_at
+                 FROM profiles WHERE name = ?1 COLLATE NOCASE",
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        match stmt.query_row(params![name], |row| {
+            Ok(Profile {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                payload: row.get(2)?,
+                sort_order: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        }) {
+            Ok(profile) => Ok(Some(profile)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AppError::Database(e.to_string())),
+        }
+    }
+
     /// 保存项目（插入或整行替换）
     pub fn save_profile(&self, profile: &Profile) -> Result<(), AppError> {
         let conn = lock_conn!(self.conn);
@@ -179,6 +209,26 @@ mod tests {
         assert!(db.delete_profile("a")?);
         assert!(!db.delete_profile("a")?);
         assert!(db.get_profile("a")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_profile_by_name_finds_profile_case_insensitive() -> Result<(), AppError> {
+        let db = Database::memory()?;
+
+        db.save_profile(&sample("uuid-1", "GLM", Some(1)))?;
+
+        // 大小写不敏感
+        let got = db.get_profile_by_name("glm")?.expect("profile found by name");
+        assert_eq!(got.id, "uuid-1");
+        assert_eq!(got.name, "GLM");
+
+        // 原始大小写也能查到
+        let got = db.get_profile_by_name("GLM")?.expect("profile found by exact name");
+        assert_eq!(got.id, "uuid-1");
+
+        // 查不到时返回 None，不报错
+        assert!(db.get_profile_by_name("nonexistent")?.is_none());
         Ok(())
     }
 
