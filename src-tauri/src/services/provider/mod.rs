@@ -1044,7 +1044,8 @@ mod tests {
         );
     }
 
-    /// A stale backup row must be refreshed but must not divert the live write.
+    /// A stale backup without an enabled route flag must be refreshed but must
+    /// not divert the live write in non-route mode.
     #[tokio::test]
     #[serial]
     async fn update_current_claude_provider_writes_live_when_backup_row_is_stale() {
@@ -1090,6 +1091,73 @@ mod tests {
         assert_eq!(
             live["env"]["ANTHROPIC_BASE_URL"].as_str(),
             Some("https://api.new.example")
+        );
+        let backup = db
+            .get_live_backup("claude")
+            .await
+            .expect("read backup")
+            .expect("backup remains");
+        assert!(backup.original_config.contains("https://api.new.example"));
+    }
+
+    /// When route/takeover mode is still enabled, saving the active provider
+    /// must only refresh the restore backup while the proxy process is stopped;
+    /// writing the upstream URL to live would flip Claude Code back to direct mode.
+    #[tokio::test]
+    #[serial]
+    async fn update_current_claude_provider_updates_backup_only_when_route_enabled_and_proxy_stopped(
+    ) {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let state = AppState::new(db.clone());
+        let original = Provider::with_id(
+            "p1".into(),
+            "Claude A".into(),
+            json!({
+                "env": {
+                    "ANTHROPIC_AUTH_TOKEN": "token-a",
+                    "ANTHROPIC_BASE_URL": "https://api.old.example"
+                }
+            }),
+            None,
+        );
+        db.save_provider("claude", &original)
+            .expect("save provider");
+        db.set_current_provider("claude", "p1")
+            .expect("set current provider");
+        crate::settings::set_current_provider(&AppType::Claude, Some("p1"))
+            .expect("set local current provider");
+        write_live_with_common_config_for_state(&state, &AppType::Claude, &original)
+            .expect("seed live file");
+        db.save_live_backup(
+            "claude",
+            &serde_json::to_string(&original.settings_config).expect("serialize backup"),
+        )
+        .await
+        .expect("seed route-mode backup");
+        let mut config = db
+            .get_proxy_config_for_app("claude")
+            .await
+            .expect("read proxy config");
+        config.enabled = true;
+        db.update_proxy_config_for_app(config)
+            .await
+            .expect("enable route mode");
+        assert!(!state.proxy_service.is_running().await);
+
+        let mut updated = original.clone();
+        updated.settings_config["env"]["ANTHROPIC_BASE_URL"] =
+            Value::String("https://api.new.example".into());
+        ProviderService::update(&state, AppType::Claude, None, updated)
+            .expect("update current provider");
+
+        let live: Value = read_json_file(&get_claude_settings_path()).expect("read live");
+        assert_eq!(
+            live["env"]["ANTHROPIC_BASE_URL"].as_str(),
+            Some("https://api.old.example"),
+            "saving in route mode while the proxy is stopped must not rewrite live to the upstream direct URL"
         );
         let backup = db
             .get_live_backup("claude")
@@ -1895,6 +1963,71 @@ command = "legacy-cmd"
                 .is_none(),
             "model override should be removed in takeover live config"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn update_current_codex_provider_updates_backup_only_when_route_enabled_and_proxy_stopped(
+    ) {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let state = AppState::new(db.clone());
+
+        let original = Provider::with_id(
+            "p1".into(),
+            "Codex A".into(),
+            codex_settings("https://api.old.example/v1", "token-a"),
+            None,
+        );
+        db.save_provider("codex", &original).expect("save provider");
+        db.set_current_provider("codex", "p1")
+            .expect("set current provider");
+        crate::settings::set_current_provider(&AppType::Codex, Some("p1"))
+            .expect("set local current provider");
+        write_live_with_common_config_for_state(&state, &AppType::Codex, &original)
+            .expect("seed live config");
+        db.save_live_backup(
+            "codex",
+            &serde_json::to_string(&original.settings_config).expect("serialize backup"),
+        )
+        .await
+        .expect("seed route-mode backup");
+        let mut config = db
+            .get_proxy_config_for_app("codex")
+            .await
+            .expect("read proxy config");
+        config.enabled = true;
+        db.update_proxy_config_for_app(config)
+            .await
+            .expect("enable route mode");
+        assert!(!state.proxy_service.is_running().await);
+
+        let mut updated = original.clone();
+        updated.settings_config = codex_settings("https://api.new.example/v1", "token-b");
+        ProviderService::update(&state, AppType::Codex, None, updated)
+            .expect("update current Codex provider");
+
+        let live_config = fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read Codex config.toml");
+        assert!(
+            live_config.contains("https://api.old.example/v1"),
+            "saving in route mode while the proxy is stopped must not rewrite Codex live to the upstream direct URL"
+        );
+        assert!(
+            !live_config.contains("https://api.new.example/v1"),
+            "the edited provider URL belongs in the route backup until takeover is restored"
+        );
+        let backup = db
+            .get_live_backup("codex")
+            .await
+            .expect("read backup")
+            .expect("backup remains");
+        assert!(backup
+            .original_config
+            .contains("https://api.new.example/v1"));
+        assert!(backup.original_config.contains("token-b"));
     }
 
     #[tokio::test]

@@ -85,7 +85,6 @@ impl Database {
         }
     }
 
-
     /// 按项目名称查找 profile。
     ///
     /// `ccs_<profileId>_` 路由令牌对用户可见的只有 profile 名称（UI 不展示 UUID），
@@ -219,12 +218,16 @@ mod tests {
         db.save_profile(&sample("uuid-1", "GLM", Some(1)))?;
 
         // 大小写不敏感
-        let got = db.get_profile_by_name("glm")?.expect("profile found by name");
+        let got = db
+            .get_profile_by_name("glm")?
+            .expect("profile found by name");
         assert_eq!(got.id, "uuid-1");
         assert_eq!(got.name, "GLM");
 
         // 原始大小写也能查到
-        let got = db.get_profile_by_name("GLM")?.expect("profile found by exact name");
+        let got = db
+            .get_profile_by_name("GLM")?
+            .expect("profile found by exact name");
         assert_eq!(got.id, "uuid-1");
 
         // 查不到时返回 None，不报错

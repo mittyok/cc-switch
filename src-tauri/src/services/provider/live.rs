@@ -1571,15 +1571,12 @@ fn proxy_owns_live_config(
             }
         };
 
-    // The enabled flag is only trusted when the proxy is actually running and
-    // the app still has a backup. This avoids treating an interrupted teardown
-    // (enabled=true, ordinary live file, no backup) as proxy ownership. The
-    // per-app lock covers the short activation window before the flag/placeholder
-    // is committed and avoids using a global proxy-running bit for another app.
-    if takeover_enabled
-        && has_live_backup
-        && futures::executor::block_on(state.proxy_service.is_running())
-    {
+    // While a user-facing route/takeover mode is enabled, the backup is the
+    // restore source and live must stay proxy-owned even if the local proxy
+    // process is temporarily stopped. Otherwise editing the current provider
+    // would rewrite Claude/Codex live files with upstream direct credentials,
+    // flipping clients out of routed mode on save.
+    if takeover_enabled && has_live_backup {
         return true;
     }
 
