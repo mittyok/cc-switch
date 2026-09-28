@@ -404,10 +404,37 @@ async fn resolve_project_route(
                 })
             }
         }
-        Ok(None) => Some(ProjectRouteResolution::Fallback {
-            profile_id,
-            reason: "PROJECT_ROUTE_PROFILE_MISSING".to_string(),
-        }),
+        Ok(None) => {
+            // `ccs_GLM_XXX` often uses `XXX` as a random key suffix. If the
+            // exact id/name is absent, retry `GLM` before silently falling back
+            // to the active GPT profile.
+            if let Some((prefix, _)) = profile_id.rsplit_once('_') {
+                let prefix = prefix.trim();
+                if !prefix.is_empty() {
+                    if let Ok(Some(provider_chain)) = crate::services::profile::ProfileService::resolve_codex_provider_chain_for_profile(&state.db, prefix) {
+                        let primary_provider_exists = provider_chain
+                            .first()
+                            .and_then(|provider_id| state.db.get_provider_by_id(provider_id, app_type_str).ok())
+                            .flatten()
+                            .is_some();
+                        if !primary_provider_exists {
+                            return Some(ProjectRouteResolution::Fallback {
+                                profile_id: prefix.to_string(),
+                                reason: "PROJECT_ROUTE_PROVIDER_MISSING".to_string(),
+                            });
+                        }
+                        return Some(ProjectRouteResolution::Matched {
+                            profile_id: prefix.to_string(),
+                            provider_chain,
+                        });
+                    }
+                }
+            }
+            Some(ProjectRouteResolution::Fallback {
+                profile_id,
+                reason: "PROJECT_ROUTE_PROFILE_MISSING".to_string(),
+            })
+        }
         Err(error) => Some(ProjectRouteResolution::Fallback {
             profile_id,
             reason: format!("PROJECT_ROUTE_PROFILE_READ_FAILED: {error}"),
@@ -425,7 +452,7 @@ fn extract_codex_profile_id(headers: &HeaderMap) -> Option<String> {
     }
     token
         .strip_prefix("ccs_")
-        .and_then(|rest| rest.strip_suffix('_'))
+        .map(|rest| rest.strip_suffix('_').unwrap_or(rest))
         .map(str::trim)
         .filter(|profile_id| !profile_id.is_empty())
         .map(str::to_string)
@@ -572,25 +599,20 @@ mod tests {
     }
 
     #[test]
-    fn extract_codex_profile_id_accepts_only_project_route_tokens() {
+    fn extract_codex_profile_id_accepts_project_route_tokens() {
         assert_eq!(
             extract_codex_profile_id(&bearer_headers("ccs_backend-api_")),
             Some("backend-api".to_string())
         );
         assert_eq!(
-            extract_codex_profile_id(&bearer_headers("ccs_has_multiple_underscores_")),
-            Some("has_multiple_underscores".to_string()),
-            "profile ids may contain underscores; only the final delimiter is structural"
+            extract_codex_profile_id(&bearer_headers("ccs_GLM_XXX")),
+            Some("GLM_XXX".to_string()),
+            "suffixed project keys are resolved against the exact id first"
         );
         assert_eq!(
             extract_codex_profile_id(&bearer_headers("ccs__")),
             None,
             "empty project ids must not trigger project routing"
-        );
-        assert_eq!(
-            extract_codex_profile_id(&bearer_headers("ccs_no-trailing-underscore")),
-            None,
-            "missing trailing delimiter keeps the legacy non-project token path"
         );
         assert_eq!(
             extract_codex_profile_id(&bearer_headers("sk-live-token")),
@@ -666,6 +688,51 @@ mod tests {
                     route.resolved_provider_id.as_deref()
                 )),
             Some((&"backend-api".to_string(), true, Some("project")))
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_context_uses_profile_name_from_suffixed_route_key() {
+        let db = Arc::new(Database::memory().unwrap());
+        db.save_provider("codex", &test_codex_provider("global"))
+            .unwrap();
+        db.save_provider("codex", &test_codex_provider("glm-provider"))
+            .unwrap();
+        db.set_current_provider("codex", "global").unwrap();
+
+        let mut payload = ProfilePayload::default();
+        payload.providers.codex = Some("glm-provider".to_string());
+        db.save_profile(&crate::database::Profile {
+            id: "profile-glm".to_string(),
+            name: "GLM".to_string(),
+            payload: serde_json::to_string(&payload).unwrap(),
+            sort_order: None,
+            created_at: Some(1),
+            updated_at: Some(1),
+        })
+        .unwrap();
+
+        let state = test_state(db.clone());
+        let ctx = RequestContext::new(
+            &state,
+            &json!({ "model": "gpt-test" }),
+            &bearer_headers("ccs_GLM_XXX"),
+            AppType::Codex,
+            "Codex",
+            "codex",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ctx.provider.id, "glm-provider");
+        assert!(matches!(
+            ctx.route_source,
+            RouteSource::ProjectProfile { .. }
+        ));
+        assert_eq!(
+            db.get_current_provider("codex").unwrap().as_deref(),
+            Some("global"),
+            "suffixed project key routes must stay request-scoped and not activate the GLM profile globally"
         );
     }
 
