@@ -35,6 +35,10 @@ export interface ProjectRouteStatus {
   matched: boolean;
   fallbackReason: string | null;
   resolvedProviderId: string | null;
+  routeApp?: string | null;
+  keySource?: string | null;
+  keyFingerprint?: string | null;
+  profileCandidate?: string | null;
 }
 
 export interface ActiveTarget {

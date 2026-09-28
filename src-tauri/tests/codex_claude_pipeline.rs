@@ -19,7 +19,8 @@ use std::sync::{Arc, Mutex};
 
 use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
 use cc_switch_lib::{
-    start_test_proxy, update_settings, AppSettings, CodexClaudePipelineMode, Database, Provider,
+    start_test_proxy, update_settings, AppSettings, CodexClaudePipelineMode, Database,
+    ProfilePayload, Provider,
 };
 use serde_json::{json, Value};
 
@@ -233,6 +234,150 @@ async fn codex_claude_pipeline_sends_clean_anthropic_headers_to_upstream() {
         headers.get("accept").and_then(|v| v.to_str().ok()),
         Some("application/json"),
         "Codex event-stream Accept must be normalized for Anthropic upstream"
+    );
+
+    drop(server);
+}
+
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn codex_claude_pipeline_routes_by_project_key_to_claude_profile_provider() {
+    let _guard = test_mutex().lock().expect("acquire test mutex");
+    reset_test_fs();
+    let _home = ensure_test_home();
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let make_upstream = |label: &'static str| async move {
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || async move {
+                Json(json!({
+                    "id": format!("msg_{label}"),
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-test",
+                    "content": [{"type": "text", "text": label}],
+                    "stop_reason": "end_turn",
+                    "stop_sequence": null,
+                    "usage": {"input_tokens": 1, "output_tokens": 1}
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock upstream");
+        let port = listener.local_addr().expect("mock upstream addr").port();
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("mock upstream server");
+        });
+        port
+    };
+    let global_port = make_upstream("global").await;
+    let project_port = make_upstream("project").await;
+
+    let db = Arc::new(Database::init().expect("create test database"));
+    let global_provider = Provider {
+        id: "global-claude".to_string(),
+        name: "Global Claude".to_string(),
+        settings_config: json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": format!("http://127.0.0.1:{global_port}"),
+                "ANTHROPIC_AUTH_TOKEN": "global-token",
+                "ANTHROPIC_MODEL": "claude-test"
+            }
+        }),
+        website_url: None,
+        category: None,
+        created_at: None,
+        sort_index: None,
+        notes: None,
+        meta: None,
+        icon: None,
+        icon_color: None,
+        in_failover_queue: false,
+    };
+    let project_provider = Provider {
+        id: "project-claude".to_string(),
+        name: "Project Claude".to_string(),
+        settings_config: json!({
+            "env": {
+                "ANTHROPIC_BASE_URL": format!("http://127.0.0.1:{project_port}"),
+                "ANTHROPIC_AUTH_TOKEN": "project-token",
+                "ANTHROPIC_MODEL": "claude-test"
+            }
+        }),
+        website_url: None,
+        category: None,
+        created_at: None,
+        sort_index: None,
+        notes: None,
+        meta: None,
+        icon: None,
+        icon_color: None,
+        in_failover_queue: false,
+    };
+    db.save_provider("claude", &global_provider)
+        .expect("save global claude provider");
+    db.save_provider("claude", &project_provider)
+        .expect("save project claude provider");
+    db.set_current_provider("claude", &global_provider.id)
+        .expect("set DB current claude provider");
+
+    let mut payload = ProfilePayload::default();
+    payload.providers.claude = Some(project_provider.id.clone());
+    db.save_profile(&cc_switch_lib::Profile {
+        id: "backend-api".to_string(),
+        name: "Backend API".to_string(),
+        payload: serde_json::to_string(&payload).unwrap(),
+        sort_order: None,
+        created_at: Some(1),
+        updated_at: Some(1),
+    })
+    .expect("save project profile");
+
+    let mut settings = AppSettings::default();
+    settings.codex_use_claude_pipeline = CodexClaudePipelineMode::Always;
+    settings.current_provider_claude = Some(global_provider.id.clone());
+    update_settings(settings).expect("update settings");
+
+    let (proxy_port, server) = start_test_proxy(db.clone()).await.expect("start proxy");
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{proxy_port}/v1/responses"))
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer ccs_backend-api_")
+        .json(&json!({
+            "model": "claude-test",
+            "input": "Say route label",
+            "max_output_tokens": 16
+        }))
+        .send()
+        .await
+        .expect("send proxy request");
+
+    assert_eq!(resp.status().as_u16(), 200);
+    let text = resp.text().await.expect("read response");
+    assert!(
+        text.contains("project"),
+        "Codex→Claude project key routing should use the profile's Claude provider, got {text}"
+    );
+    assert_eq!(
+        db.get_current_provider("claude").unwrap().as_deref(),
+        Some("global-claude"),
+        "project key route must not mutate the global Claude provider"
+    );
+    let status = server.get_status().await;
+    let route = status
+        .last_project_route
+        .expect("project route status recorded");
+    assert_eq!(route.profile_id, "backend-api");
+    assert_eq!(route.route_app.as_deref(), Some("claude"));
+    assert_eq!(
+        route.resolved_provider_id.as_deref(),
+        Some("project-claude")
     );
 
     drop(server);

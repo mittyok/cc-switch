@@ -15,6 +15,7 @@ use crate::proxy::{
     ProxyError,
 };
 use axum::http::{header, HeaderMap};
+use sha2::{Digest, Sha256};
 use std::time::Instant;
 
 /// 流式超时配置
@@ -31,7 +32,7 @@ pub struct StreamingTimeoutConfig {
 pub enum RouteSource {
     /// 沿用当前激活 provider / 现有 failover 队列。
     CurrentProvider,
-    /// 命中 `ccs_<profileId>_`，使用项目保存的 Codex provider 链。
+    /// 命中 `ccs_<profileId>_`，使用项目保存的目标应用 provider 链。
     ProjectProfile { profile_id: String },
     /// 解析到项目 key 但项目或 provider 不可用，已兜底到当前激活 provider。
     ProjectFallback { profile_id: String, reason: String },
@@ -153,6 +154,7 @@ impl RequestContext {
             Some(ProjectRouteResolution::Matched {
                 profile_id,
                 provider_chain,
+                route_key,
             }) => {
                 let providers = state
                     .provider_router
@@ -166,16 +168,27 @@ impl RequestContext {
                         matched: true,
                         fallback_reason: None,
                         resolved_provider_id: providers.first().map(|provider| provider.id.clone()),
+                        route_app: Some(app_type_str.to_string()),
+                        key_source: Some(route_key.source.as_str().to_string()),
+                        key_fingerprint: Some(route_key.fingerprint.clone()),
+                        profile_candidate: Some(route_key.profile_id.clone()),
                     },
                 )
                 .await;
                 log::info!(
-                    "[Codex] PROJECT_ROUTE_MATCHED profile_id='{profile_id}', resolved_provider_id='{}', path_app='{app_type_str}', session_id='{session_id}'",
+                    "[{tag}] PROJECT_ROUTE_MATCHED profile_id='{profile_id}', key_source='{}', key='{}', key_fp='{}', resolved_provider_id='{}', path_app='{app_type_str}', session_id='{session_id}'",
+                    route_key.source.as_str(),
+                    route_key.masked_token,
+                    route_key.fingerprint,
                     providers.first().map(|provider| provider.id.as_str()).unwrap_or("")
                 );
                 (providers, RouteSource::ProjectProfile { profile_id })
             }
-            Some(ProjectRouteResolution::Fallback { profile_id, reason }) => {
+            Some(ProjectRouteResolution::Fallback {
+                profile_id,
+                reason,
+                route_key,
+            }) => {
                 let providers = state
                     .provider_router
                     .select_providers(app_type_str)
@@ -188,11 +201,18 @@ impl RequestContext {
                         matched: false,
                         fallback_reason: Some(reason.clone()),
                         resolved_provider_id: providers.first().map(|provider| provider.id.clone()),
+                        route_app: Some(app_type_str.to_string()),
+                        key_source: Some(route_key.source.as_str().to_string()),
+                        key_fingerprint: Some(route_key.fingerprint.clone()),
+                        profile_candidate: Some(route_key.profile_id.clone()),
                     },
                 )
                 .await;
                 log::warn!(
-                    "[Codex] {reason} profile_id='{profile_id}', fallback_provider_id='{}', path_app='{app_type_str}', session_id='{session_id}'",
+                    "[{tag}] {reason} profile_id='{profile_id}', key_source='{}', key='{}', key_fp='{}', fallback_provider_id='{}', path_app='{app_type_str}', session_id='{session_id}'",
+                    route_key.source.as_str(),
+                    route_key.masked_token,
+                    route_key.fingerprint,
                     providers.first().map(|provider| provider.id.as_str()).unwrap_or("")
                 );
                 (
@@ -351,11 +371,36 @@ enum ProjectRouteResolution {
     Matched {
         profile_id: String,
         provider_chain: Vec<String>,
+        route_key: ProjectRouteKey,
     },
     Fallback {
         profile_id: String,
         reason: String,
+        route_key: ProjectRouteKey,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectRouteKey {
+    profile_id: String,
+    source: ProjectRouteKeySource,
+    masked_token: String,
+    fingerprint: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectRouteKeySource {
+    AuthorizationBearer,
+    XApiKey,
+}
+
+impl ProjectRouteKeySource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthorizationBearer => "authorization_bearer",
+            Self::XApiKey => "x_api_key",
+        }
+    }
 }
 
 fn map_provider_selection_error(error: crate::error::AppError) -> ProxyError {
@@ -372,18 +417,23 @@ async fn resolve_project_route(
     app_type: &AppType,
     app_type_str: &str,
 ) -> Option<ProjectRouteResolution> {
-    if !matches!(app_type, AppType::Codex) {
+    if !matches!(
+        app_type,
+        AppType::Claude | AppType::ClaudeDesktop | AppType::Codex
+    ) {
         return None;
     }
-    let profile_id = extract_codex_profile_id(headers)?;
-    match crate::services::profile::ProfileService::resolve_codex_provider_chain_for_profile(
-        &state.db,
-        &profile_id,
-    ) {
+    let route_key = extract_project_route_key(headers)?;
+    let profile_id = route_key.profile_id.clone();
+    match resolve_provider_chain_for_profile_app(&state.db, &profile_id, app_type) {
         Ok(Some(provider_chain)) if provider_chain.is_empty() => {
             Some(ProjectRouteResolution::Fallback {
                 profile_id,
-                reason: "PROJECT_ROUTE_CODEX_PROVIDER_MISSING".to_string(),
+                reason: format!(
+                    "PROJECT_ROUTE_{}_PROVIDER_MISSING",
+                    route_app_reason(app_type)
+                ),
+                route_key,
             })
         }
         Ok(Some(provider_chain)) => {
@@ -396,11 +446,13 @@ async fn resolve_project_route(
                 Some(ProjectRouteResolution::Fallback {
                     profile_id,
                     reason: "PROJECT_ROUTE_PROVIDER_MISSING".to_string(),
+                    route_key,
                 })
             } else {
                 Some(ProjectRouteResolution::Matched {
                     profile_id,
                     provider_chain,
+                    route_key,
                 })
             }
         }
@@ -411,21 +463,27 @@ async fn resolve_project_route(
             if let Some((prefix, _)) = profile_id.rsplit_once('_') {
                 let prefix = prefix.trim();
                 if !prefix.is_empty() {
-                    if let Ok(Some(provider_chain)) = crate::services::profile::ProfileService::resolve_codex_provider_chain_for_profile(&state.db, prefix) {
+                    if let Ok(Some(provider_chain)) =
+                        resolve_provider_chain_for_profile_app(&state.db, prefix, app_type)
+                    {
                         let primary_provider_exists = provider_chain
                             .first()
-                            .and_then(|provider_id| state.db.get_provider_by_id(provider_id, app_type_str).ok())
+                            .and_then(|provider_id| {
+                                state.db.get_provider_by_id(provider_id, app_type_str).ok()
+                            })
                             .flatten()
                             .is_some();
                         if !primary_provider_exists {
                             return Some(ProjectRouteResolution::Fallback {
                                 profile_id: prefix.to_string(),
                                 reason: "PROJECT_ROUTE_PROVIDER_MISSING".to_string(),
+                                route_key: route_key.clone(),
                             });
                         }
                         return Some(ProjectRouteResolution::Matched {
                             profile_id: prefix.to_string(),
                             provider_chain,
+                            route_key: route_key.clone(),
                         });
                     }
                 }
@@ -433,16 +491,69 @@ async fn resolve_project_route(
             Some(ProjectRouteResolution::Fallback {
                 profile_id,
                 reason: "PROJECT_ROUTE_PROFILE_MISSING".to_string(),
+                route_key,
             })
         }
         Err(error) => Some(ProjectRouteResolution::Fallback {
             profile_id,
             reason: format!("PROJECT_ROUTE_PROFILE_READ_FAILED: {error}"),
+            route_key,
         }),
     }
 }
 
-fn extract_codex_profile_id(headers: &HeaderMap) -> Option<String> {
+fn resolve_provider_chain_for_profile_app(
+    db: &crate::database::Database,
+    profile_id: &str,
+    app_type: &AppType,
+) -> Result<Option<Vec<String>>, crate::error::AppError> {
+    let profile = match db.get_profile(profile_id)? {
+        Some(profile) => Some(profile),
+        None => db.get_profile_by_name(profile_id)?,
+    };
+    let Some(profile) = profile else {
+        return Ok(None);
+    };
+
+    let payload: crate::services::profile::ProfilePayload = serde_json::from_str(&profile.payload)
+        .map_err(|e| crate::error::AppError::Config(format!("解析 profile payload 失败: {e}")))?;
+    let Some(primary_id) = payload
+        .providers
+        .get(app_type)
+        .and_then(|id| id.as_deref())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return Ok(Some(Vec::new()));
+    };
+
+    let mut chain = vec![primary_id.to_string()];
+    if let Some(failover_ids) = payload.failover.get(app_type).and_then(|ids| ids.as_ref()) {
+        for provider_id in failover_ids {
+            let provider_id = provider_id.trim();
+            if !provider_id.is_empty() && !chain.iter().any(|id| id == provider_id) {
+                chain.push(provider_id.to_string());
+            }
+        }
+    }
+    Ok(Some(chain))
+}
+
+fn route_app_reason(app_type: &AppType) -> &'static str {
+    match app_type {
+        AppType::Claude => "CLAUDE",
+        AppType::ClaudeDesktop => "CLAUDE_DESKTOP",
+        AppType::Codex => "CODEX",
+        _ => "APP",
+    }
+}
+
+fn extract_project_route_key(headers: &HeaderMap) -> Option<ProjectRouteKey> {
+    extract_project_route_key_from_authorization(headers)
+        .or_else(|| extract_project_route_key_from_x_api_key(headers))
+}
+
+fn extract_project_route_key_from_authorization(headers: &HeaderMap) -> Option<ProjectRouteKey> {
     let authorization = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
     let mut parts = authorization.split_whitespace();
     let scheme = parts.next()?;
@@ -450,12 +561,57 @@ fn extract_codex_profile_id(headers: &HeaderMap) -> Option<String> {
     if !scheme.eq_ignore_ascii_case("bearer") || parts.next().is_some() {
         return None;
     }
-    token
-        .strip_prefix("ccs_")
-        .map(|rest| rest.strip_suffix('_').unwrap_or(rest))
-        .map(str::trim)
-        .filter(|profile_id| !profile_id.is_empty())
-        .map(str::to_string)
+    project_route_key_from_token(token, ProjectRouteKeySource::AuthorizationBearer)
+}
+
+fn extract_project_route_key_from_x_api_key(headers: &HeaderMap) -> Option<ProjectRouteKey> {
+    let token = headers.get("x-api-key")?.to_str().ok()?.trim();
+    project_route_key_from_token(token, ProjectRouteKeySource::XApiKey)
+}
+
+fn project_route_key_from_token(
+    token: &str,
+    source: ProjectRouteKeySource,
+) -> Option<ProjectRouteKey> {
+    let profile_id = token
+        .strip_prefix("ccs_")?
+        .strip_suffix('_')
+        .unwrap_or_else(|| token.strip_prefix("ccs_").unwrap())
+        .trim();
+    if profile_id.is_empty() {
+        return None;
+    }
+    Some(ProjectRouteKey {
+        profile_id: profile_id.to_string(),
+        source,
+        masked_token: mask_project_route_token(token),
+        fingerprint: short_sha256_hex(token.as_bytes()),
+    })
+}
+
+fn mask_project_route_token(token: &str) -> String {
+    let char_count = token.chars().count();
+    if char_count <= 8 {
+        return "***".to_string();
+    }
+    let prefix: String = token.chars().take(4).collect();
+    let suffix: String = token
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{prefix}…{suffix}")
+}
+
+fn short_sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest[..6]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 async fn update_project_route_status(state: &ProxyState, route_status: ProjectRouteStatus) {
@@ -522,6 +678,12 @@ mod tests {
             header::AUTHORIZATION,
             format!("Bearer {token}").parse().unwrap(),
         );
+        headers
+    }
+
+    fn x_api_key_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-api-key", token.parse().unwrap());
         headers
     }
 
@@ -599,26 +761,33 @@ mod tests {
     }
 
     #[test]
-    fn extract_codex_profile_id_accepts_project_route_tokens() {
+    fn extract_project_route_key_accepts_safe_project_route_tokens() {
         assert_eq!(
-            extract_codex_profile_id(&bearer_headers("ccs_backend-api_")),
+            extract_project_route_key(&bearer_headers("ccs_backend-api_"))
+                .map(|key| key.profile_id),
             Some("backend-api".to_string())
         );
         assert_eq!(
-            extract_codex_profile_id(&bearer_headers("ccs_GLM_XXX")),
+            extract_project_route_key(&bearer_headers("ccs_GLM_XXX")).map(|key| key.profile_id),
             Some("GLM_XXX".to_string()),
             "suffixed project keys are resolved against the exact id first"
         );
         assert_eq!(
-            extract_codex_profile_id(&bearer_headers("ccs__")),
+            extract_project_route_key(&bearer_headers("ccs__")).map(|key| key.profile_id),
             None,
             "empty project ids must not trigger project routing"
         );
         assert_eq!(
-            extract_codex_profile_id(&bearer_headers("sk-live-token")),
+            extract_project_route_key(&bearer_headers("sk-live-token")).map(|key| key.profile_id),
             None,
             "non ccs tokens must keep existing provider routing"
         );
+
+        let key = extract_project_route_key(&x_api_key_headers("ccs_backend-api_"))
+            .expect("x-api-key ccs token should route local project profiles");
+        assert_eq!(key.profile_id, "backend-api");
+        assert_eq!(key.source, ProjectRouteKeySource::XApiKey);
+        assert_ne!(key.masked_token, "ccs_backend-api_");
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -626,7 +795,7 @@ mod tests {
             "Basic ccs_backend-api_".parse().unwrap(),
         );
         assert_eq!(
-            extract_codex_profile_id(&headers),
+            extract_project_route_key(&headers).map(|key| key.profile_id),
             None,
             "only Bearer tokens participate in project routing"
         );
@@ -689,6 +858,110 @@ mod tests {
                 )),
             Some((&"backend-api".to_string(), true, Some("project")))
         );
+        let status = state.status.read().await;
+        let route = status.last_project_route.as_ref().unwrap();
+        assert_eq!(route.route_app.as_deref(), Some("codex"));
+        assert_eq!(route.key_source.as_deref(), Some("authorization_bearer"));
+        assert_eq!(route.profile_candidate.as_deref(), Some("backend-api"));
+        assert_ne!(route.key_fingerprint.as_deref(), Some("ccs_backend-api_"));
+    }
+
+    #[tokio::test]
+    async fn claude_context_uses_project_route_from_x_api_key_without_mutating_current_provider() {
+        let db = Arc::new(Database::memory().unwrap());
+        db.save_provider("claude", &test_codex_provider("claude-global"))
+            .unwrap();
+        db.save_provider("claude", &test_codex_provider("claude-project"))
+            .unwrap();
+        db.set_current_provider("claude", "claude-global").unwrap();
+
+        let mut payload = ProfilePayload::default();
+        payload.providers.claude = Some("claude-project".to_string());
+        db.save_profile(&crate::database::Profile {
+            id: "backend-api".to_string(),
+            name: "Backend API".to_string(),
+            payload: serde_json::to_string(&payload).unwrap(),
+            sort_order: None,
+            created_at: Some(1),
+            updated_at: Some(1),
+        })
+        .unwrap();
+
+        let state = test_state(db.clone());
+        let ctx = RequestContext::new(
+            &state,
+            &json!({ "model": "claude-test" }),
+            &x_api_key_headers("ccs_backend-api_"),
+            AppType::Claude,
+            "Claude",
+            "claude",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ctx.provider.id, "claude-project");
+        assert!(matches!(
+            ctx.route_source,
+            RouteSource::ProjectProfile { .. }
+        ));
+        assert_eq!(
+            db.get_current_provider("claude").unwrap().as_deref(),
+            Some("claude-global"),
+            "project key route must stay request-scoped for Claude-compatible entries"
+        );
+        let status = state.status.read().await;
+        let route = status.last_project_route.as_ref().unwrap();
+        assert_eq!(route.route_app.as_deref(), Some("claude"));
+        assert_eq!(route.key_source.as_deref(), Some("x_api_key"));
+        assert_eq!(
+            route.resolved_provider_id.as_deref(),
+            Some("claude-project")
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_context_falls_back_when_profile_lacks_claude_provider() {
+        let db = Arc::new(Database::memory().unwrap());
+        db.save_provider("claude", &test_codex_provider("claude-global"))
+            .unwrap();
+        db.set_current_provider("claude", "claude-global").unwrap();
+
+        let mut payload = ProfilePayload::default();
+        payload.providers.codex = Some("codex-only".to_string());
+        db.save_profile(&crate::database::Profile {
+            id: "codex-only-profile".to_string(),
+            name: "Codex Only".to_string(),
+            payload: serde_json::to_string(&payload).unwrap(),
+            sort_order: None,
+            created_at: Some(1),
+            updated_at: Some(1),
+        })
+        .unwrap();
+
+        let state = test_state(db);
+        let ctx = RequestContext::new(
+            &state,
+            &json!({ "model": "claude-test" }),
+            &bearer_headers("ccs_codex-only-profile_"),
+            AppType::Claude,
+            "Claude",
+            "claude",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(ctx.provider.id, "claude-global");
+        assert!(matches!(
+            ctx.route_source,
+            RouteSource::ProjectFallback { .. }
+        ));
+        let status = state.status.read().await;
+        let route = status.last_project_route.as_ref().unwrap();
+        assert_eq!(
+            route.fallback_reason.as_deref(),
+            Some("PROJECT_ROUTE_CLAUDE_PROVIDER_MISSING")
+        );
+        assert_eq!(route.route_app.as_deref(), Some("claude"));
     }
 
     #[tokio::test]
