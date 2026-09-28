@@ -3468,8 +3468,19 @@ impl ProxyService {
             return;
         }
 
+        let takeover_token = settings
+            .get("auth")
+            .and_then(|auth| auth.get("OPENAI_API_KEY"))
+            .and_then(Value::as_str)
+            .filter(|token| token.trim_start().starts_with("ccs_"))
+            .map(str::to_string)
+            .unwrap_or_else(|| PROXY_TOKEN_PLACEHOLDER.to_string());
+
         if let Some(auth) = settings.get_mut("auth").and_then(|v| v.as_object_mut()) {
-            auth.insert("OPENAI_API_KEY".to_string(), json!(PROXY_TOKEN_PLACEHOLDER));
+            // Preserve local `ccs_<profileId>_...` route keys during takeover: if
+            // Codex sends only PROXY_MANAGED, RequestContext cannot see the
+            // intended project profile and falls back to the active GPT provider.
+            auth.insert("OPENAI_API_KEY".to_string(), json!(takeover_token));
         } else if let Some(root) = settings.as_object_mut() {
             root.insert(
                 "auth".to_string(),
@@ -3618,6 +3629,12 @@ impl ProxyService {
         auth.get("OPENAI_API_KEY").and_then(|v| v.as_str()) == Some(PROXY_TOKEN_PLACEHOLDER)
     }
 
+    fn codex_auth_has_project_route_key(auth: &Value) -> bool {
+        auth.get("OPENAI_API_KEY")
+            .and_then(|v| v.as_str())
+            .is_some_and(|token| token.trim_start().starts_with("ccs_"))
+    }
+
     /// The login state Codex will observe for `config_text`, as far as
     /// cc-switch can tell without touching the keyring: `Some(true)` signed
     /// in, `Some(false)` signed out, `None` undecidable. Which store Codex
@@ -3677,15 +3694,16 @@ impl ProxyService {
             .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
             .filter(|account_id| !account_id.trim().is_empty());
         let managed_official = official_passthrough && managed_account_id.is_some();
-        let placeholder_auth = config
-            .get("auth")
-            .is_some_and(Self::codex_auth_has_proxy_placeholder);
+        let proxy_managed_auth = config.get("auth").is_some_and(|auth| {
+            Self::codex_auth_has_proxy_placeholder(auth)
+                || Self::codex_auth_has_project_route_key(auth)
+        });
 
         // Takeover must never overwrite Codex's long-lived ChatGPT login. For
-        // third-party providers the placeholder is moved into config.toml; for
+        // third-party providers the proxy-managed token is moved into config.toml; for
         // codex-official no placeholder is needed because requires_openai_auth
         // makes Codex supply its native authorization.
-        if official_passthrough || placeholder_auth {
+        if official_passthrough || proxy_managed_auth {
             let config_str = config.get("config").and_then(|v| v.as_str()).unwrap_or("");
             let profile = provider
                 .map(crate::proxy::providers::resolve_codex_catalog_tool_profile)
@@ -6465,6 +6483,64 @@ experimental_bearer_token = "PROXY_MANAGED"
             !live_config.contains("http://127.0.0.1:15721"),
             "cleanup should remove local proxy base_url"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn codex_takeover_preserves_project_route_key_as_live_bearer_token() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload settings");
+        crate::settings::update_settings(crate::settings::AppSettings {
+            preserve_codex_official_auth_on_switch: false,
+            ..Default::default()
+        })
+        .expect("disable Codex official auth preservation");
+
+        let db = Arc::new(Database::memory().expect("init db"));
+        let service = ProxyService::new(db);
+        let mut provider = Provider::with_id(
+            "route-glm".to_string(),
+            "GLM Route".to_string(),
+            json!({
+                "auth": { "OPENAI_API_KEY": "ccs_GLM_XXX" },
+                "config": r#"model_provider = "glm"
+model = "glm-4.5"
+
+[model_providers.glm]
+name = "GLM"
+base_url = "https://open.bigmodel.cn/api/paas/v4"
+wire_api = "responses"
+"#
+            }),
+            None,
+        );
+        provider.category = Some("custom".to_string());
+
+        let mut takeover_settings = provider.settings_config.clone();
+        ProxyService::apply_codex_takeover_fields_for_provider(
+            &mut takeover_settings,
+            "http://127.0.0.1:15721/v1",
+            &provider,
+        )
+        .expect("apply takeover fields");
+        service
+            .write_codex_takeover_live_for_provider(&takeover_settings, Some(&provider))
+            .expect("write takeover live config");
+
+        let live_config = std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read live config");
+        assert!(
+            live_config.contains("experimental_bearer_token = \"ccs_GLM_XXX\""),
+            "takeover must preserve ccs route keys so RequestContext can route by profile instead of falling back to the active provider; got:\n{live_config}"
+        );
+        assert!(
+            !live_config.contains(PROXY_TOKEN_PLACEHOLDER),
+            "project-route takeover should not replace the local route key with the generic placeholder; got:\n{live_config}"
+        );
+        assert!(live_config.contains("base_url = \"http://127.0.0.1:15721/v1\""));
+
+        crate::settings::update_settings(crate::settings::AppSettings::default())
+            .expect("reset settings");
     }
 
     #[test]
