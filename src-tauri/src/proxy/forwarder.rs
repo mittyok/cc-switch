@@ -2377,7 +2377,12 @@ impl RequestForwarder {
             .get("model")
             .and_then(|v| v.as_str())
             .unwrap_or("<none>");
-        log::info!("[{tag}] >>> 请求目标: {target_for_log} (model={request_model})");
+        // 带 provider：failover/多供应商时同一 URL 可能对应多家供应商，仅凭 target 无法定位
+        // 实际命中者，且需与下方 <<< 上游请求失败 日志的 provider 字段对齐便于关联。
+        log::info!(
+            "[{tag}] >>> 请求目标: {target_for_log} (provider={}, model={request_model})",
+            provider.name
+        );
         log::debug!(
             "[{tag}] >>> 请求体已准备: bytes={}, hash={} (content omitted)",
             body_bytes.len(),
