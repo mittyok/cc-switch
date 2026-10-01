@@ -43,20 +43,24 @@ impl ProviderRouter {
     /// - 故障转移关闭时：仅返回当前供应商
     /// - 故障转移开启时：仅使用故障转移队列，按队列顺序依次尝试（P1 → P2 → ...）
     pub async fn select_providers(&self, app_type: &str) -> Result<Vec<Provider>, AppError> {
-        let current_id = AppType::from_str(app_type)
-            .ok()
-            .and_then(|app_enum| {
-                crate::settings::get_effective_current_provider(&self.db, &app_enum)
-                    .ok()
-                    .flatten()
-            })
-            .or_else(|| self.db.get_current_provider(app_type).ok().flatten());
-        let current_provider = current_id
-            .as_deref()
-            .map(|id| self.db.get_provider_by_id(id, app_type))
-            .transpose()?
-            .flatten();
+        // 代理模式下路由到代理路由那家，和直连指针无关。
+        let current_provider = AppType::from_str(app_type).ok().and_then(|app_enum| {
+            crate::mode::current::provider_in_use(&self.db, &app_enum)
+                .ok()
+                .flatten()
+        });
+        self.select_providers_with_current(app_type, current_provider)
+            .await
+    }
 
+    /// 同 [`Self::select_providers`]，正在用的那家由调用方给出：处理请求时上下文已经读过
+    /// 一次（要读 `live-state.json` 和这一行），不用每个请求再读一遍，两处用的也一定是
+    /// 同一家。
+    pub async fn select_providers_with_current(
+        &self,
+        app_type: &str,
+        current_provider: Option<Provider>,
+    ) -> Result<Vec<Provider>, AppError> {
         // 检查该应用的自动故障转移开关是否开启（从 proxy_config 表读取）
         let auto_failover_enabled = match self.db.get_proxy_config_for_app(app_type).await {
             Ok(config) => config.auto_failover_enabled,
@@ -66,8 +70,12 @@ impl ProviderRouter {
             }
         };
 
-        self.select_providers_with_current(app_type, current_provider, auto_failover_enabled)
-            .await
+        self.select_providers_with_current_and_failover(
+            app_type,
+            current_provider,
+            auto_failover_enabled,
+        )
+        .await
     }
 
     /// 按请求级显式 provider id 链选择供应商，不读取/写入全局 current provider。
@@ -94,7 +102,7 @@ impl ProviderRouter {
             .is_some_and(|provider| !provider_supports_failover(app_type, provider))
         {
             return self
-                .select_providers_with_current(app_type, current_provider, true)
+                .select_providers_with_current_and_failover(app_type, current_provider, true)
                 .await;
         }
 
@@ -105,7 +113,7 @@ impl ProviderRouter {
             .await
     }
 
-    async fn select_providers_with_current(
+    async fn select_providers_with_current_and_failover(
         &self,
         app_type: &str,
         current_provider: Option<Provider>,

@@ -124,8 +124,13 @@ impl RequestContext {
         let optimizer_config = state.db.get_optimizer_config().unwrap_or_default();
         let copilot_optimizer_config = state.db.get_copilot_optimizer_config().unwrap_or_default();
 
-        let current_provider_id =
-            crate::settings::get_current_provider(&app_type).unwrap_or_default();
+        let current_provider = crate::mode::current::provider_in_use(&state.db, &app_type)
+            .ok()
+            .flatten();
+        let current_provider_id = current_provider
+            .as_ref()
+            .map(|provider| provider.id.clone())
+            .unwrap_or_default();
 
         // 从请求体提取模型名称
         let request_model = body
@@ -668,7 +673,7 @@ mod tests {
             gemini_shadow: Arc::new(Default::default()),
             codex_chat_history: Arc::new(Default::default()),
             app_handle: None,
-            failover_manager: Arc::new(FailoverSwitchManager::new(db)),
+            failover_manager: Arc::new(FailoverSwitchManager::new()),
         }
     }
 

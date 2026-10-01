@@ -509,7 +509,12 @@ impl ProfileService {
 
         for app in scope.apps().iter() {
             if let Some(slot) = payload.providers.get_mut(app) {
-                *slot = crate::settings::get_effective_current_provider(&state.db, app)?;
+                // 和应用快照时一致：代理模式下记的是代理路由到的那家。
+                *slot = crate::mode::current::provider_for(
+                    &state.db,
+                    app,
+                    crate::mode::current::Purpose::InUse,
+                )?;
             }
             if let Some(slot) = payload.failover.get_mut(app) {
                 *slot = Some(
@@ -693,13 +698,14 @@ impl ProfileService {
     ///
     /// 应用指定项目的快照到当前分组内的所有应用。
     ///
-    /// 返回 `(warnings, should_stop_proxy)`：当当前分组内所有接管都被关闭、且
-    /// 其它应用也没有接管时，建议调用者停止代理服务。
+    /// 供应商按应用当前的模式切换：直连模式改直连指针，代理模式改代理路由；不再为了
+    /// 避开代理先退出代理模式。返回仅包含 warnings，不携带 stop-proxy 建议（清空当前
+    /// 项目时由 [`Self::clear_current`] 单独判断是否停止代理服务）。
     pub fn apply(
         state: &AppState,
         profile_id: &str,
         scope: ProfileScope,
-    ) -> Result<(Vec<String>, bool), AppError> {
+    ) -> Result<Vec<String>, AppError> {
         let mut warnings = Vec::new();
 
         // 自动保存旧项目当前状态（仅当前分组），失败不阻塞切换
@@ -725,7 +731,7 @@ impl ProfileService {
         let payload: ProfilePayload = serde_json::from_str(&profile.payload)
             .map_err(|e| AppError::Config(format!("解析 profile payload 失败: {e}")))?;
 
-        let (apply_warnings, should_stop_proxy) =
+        let (apply_warnings, _should_stop_proxy) =
             apply_payload(state, &payload, scope, profile_id)?;
         warnings.extend(apply_warnings);
 
@@ -733,7 +739,7 @@ impl ProfileService {
             .db
             .set_current_profile_id(scope.as_str(), Some(profile_id))?;
 
-        Ok((warnings, should_stop_proxy))
+        Ok(warnings)
     }
 }
 
