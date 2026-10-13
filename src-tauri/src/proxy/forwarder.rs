@@ -2864,8 +2864,16 @@ fn summarize_upstream_body(body: &str) -> String {
 }
 
 fn extract_json_error_message(body: &Value) -> Option<String> {
+    if let Some(message) = body.pointer("/error/message").and_then(Value::as_str) {
+        if let Some(cause) = extract_nested_json_error_message(body.pointer("/error/cause")) {
+            // JDCloud wraps the actionable OpenAI error (for example context_length_exceeded)
+            // in error.cause while the outer message is only the generic "模型服务调用失败".
+            return Some(format!("{message}: {cause}"));
+        }
+        return Some(message.to_string());
+    }
+
     let candidates = [
-        body.pointer("/error/message"),
         body.pointer("/message"),
         body.pointer("/detail"),
         body.pointer("/error"),
@@ -2875,6 +2883,19 @@ fn extract_json_error_message(body: &Value) -> Option<String> {
         .into_iter()
         .flatten()
         .find_map(|value| value.as_str().map(ToString::to_string))
+}
+
+fn extract_nested_json_error_message(value: Option<&Value>) -> Option<String> {
+    let text = value.and_then(Value::as_str)?.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    if let Ok(json_body) = serde_json::from_str::<Value>(text) {
+        return extract_json_error_message(&json_body);
+    }
+
+    Some(text.to_string())
 }
 
 fn split_endpoint_and_query(endpoint: &str) -> (&str, Option<&str>) {
@@ -3894,6 +3915,24 @@ mod tests {
         // 上游错误消息保留(截断)，用于诊断失败原因。
         assert!(message.contains("rate limit exceeded"));
         assert!(!message.contains("切换下一个"));
+    }
+
+    #[test]
+    fn upstream_summary_includes_jdcloud_nested_cause() {
+        let error = ProxyError::UpstreamError {
+            status: 400,
+            body: Some(
+                r#"{"error":{"cause":"{\n  \"error\": {\n    \"message\": \"Input tokens exceed the configured limit of 922000 tokens. Your messages resulted in 1682533 tokens. Please reduce the length of the messages.\",\n    \"type\": \"invalid_request_error\",\n    \"param\": \"messages\",\n    \"code\": \"context_length_exceeded\"\n  }\n}","code":400,"message":"模型服务调用失败","status":"FAILED_RESPONSE"},"requestId":"req","result":null}"#
+                    .to_string(),
+            ),
+        };
+
+        let summary = summarize_proxy_error(&error);
+
+        assert!(
+            summary.contains("模型服务调用失败: Input tokens exceed the configured limit"),
+            "JDCloud puts the actionable context_length_exceeded detail in error.cause, so the operator log must include it"
+        );
     }
 
     #[test]
