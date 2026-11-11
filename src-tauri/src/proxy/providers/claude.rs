@@ -39,6 +39,8 @@ const BEDROCK_COMPAT_ANTHROPIC_HOST_HINTS: &[&str] = &[
     "modelservice.jdcloud.com",
 ];
 const BEDROCK_COMPAT_ANTHROPIC_MAX_TOKENS: u64 = 32_000;
+const OPENAI_CHAT_STOP_UNSUPPORTED_MODEL_HINTS: &[&str] = &["gpt5.5", "gpt-5.5"];
+const OPENAI_CHAT_STOP_UNSUPPORTED_PROVIDER_HINTS: &[&str] = &["jdcloud", "京东云"];
 
 /// 获取 Claude 供应商的 API 格式
 ///
@@ -827,6 +829,55 @@ fn should_preserve_reasoning_content_for_openai_chat(provider: &Provider, body: 
         .any(is_reasoning_vendor_identifier)
 }
 
+fn normalized_model_hint(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '.' || *ch == '-')
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn provider_matches_openai_chat_stop_unsupported_hint(provider: &Provider) -> bool {
+    provider
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.provider_type.as_deref())
+        .into_iter()
+        .chain(std::iter::once(provider.id.as_str()))
+        .chain(std::iter::once(provider.name.as_str()))
+        .chain(provider.website_url.as_deref())
+        .chain(
+            provider
+                .settings_config
+                .pointer("/env/ANTHROPIC_BASE_URL")
+                .and_then(Value::as_str),
+        )
+        .any(|value| {
+            let normalized = value.to_ascii_lowercase();
+            OPENAI_CHAT_STOP_UNSUPPORTED_PROVIDER_HINTS
+                .iter()
+                .any(|hint| normalized.contains(hint))
+        })
+}
+
+fn should_strip_openai_chat_stop(provider: &Provider, result: &Value, is_copilot: bool) -> bool {
+    if is_copilot {
+        return true;
+    }
+
+    let model = result
+        .get("model")
+        .and_then(Value::as_str)
+        .map(normalized_model_hint)
+        .unwrap_or_default();
+
+    !model.is_empty()
+        && OPENAI_CHAT_STOP_UNSUPPORTED_MODEL_HINTS
+            .iter()
+            .any(|hint| model.contains(hint))
+        && provider_matches_openai_chat_stop_unsupported_hint(provider)
+}
+
 pub fn transform_claude_request_for_api_format(
     body: serde_json::Value,
     provider: &Provider,
@@ -931,12 +982,13 @@ pub fn transform_claude_request_for_api_format(
             // 不在 SSE 末尾吐 usage → 转换出的 Anthropic message_delta 全 0 →
             // 整笔 input/output/cache 漏记（与 Codex Responses→Chat 路径同源）。
             super::transform::inject_openai_stream_include_usage(&mut result);
-            // GitHub Copilot 的 OpenAI Chat 端点不支持 `stop` 参数，携带该字段会
-            // 直接返回 400。Claude Code auto mode 的 classifier 请求会带
-            // stop_sequences（转换后即为 stop），导致 classifier 在 Copilot 下
-            // 始终不可用（Issue #5175）。仅在 Copilot 路径移除该字段，其它
-            // OpenAI 兼容上游（如 OpenRouter）继续保留 stop 语义。
-            if is_copilot {
+            // 部分 OpenAI Chat 兼容端点不支持 `stop` 参数，携带会直接 400：
+            // - Copilot 的 classifier 路径（Issue #5175）；
+            // - JDCloud GPT-5.5：Claude Code 权限分类请求携带 stop_sequences，
+            //   转换为 stop 后上游返回 "Unsupported parameter: 'stop'"，客户端
+            //   包装成“模型暂不可用”。仅对已知不支持组合移除，OpenRouter 等继续
+            //   保留 stop 语义，避免改变正常停词行为。
+            if should_strip_openai_chat_stop(provider, &result, is_copilot) {
                 if let Some(obj) = result.as_object_mut() {
                     obj.remove("stop");
                 }
@@ -2625,6 +2677,61 @@ mod tests {
                 .unwrap();
 
         assert!(transformed.get("stop").is_none());
+    }
+
+    #[test]
+    fn test_transform_claude_request_openai_chat_strips_stop_for_jdcloud_gpt55() {
+        // JDCloud GPT-5.5 returns 400 `Unsupported parameter: 'stop'` for
+        // Claude Code permission/classifier requests after stop_sequences -> stop
+        // conversion, which the client surfaces as a transient model outage.
+        let provider = create_provider_with_meta(
+            json!({
+                "env": {
+                    "ANTHROPIC_BASE_URL": "https://ai-api.jdcloud.com/v1",
+                    "ANTHROPIC_API_KEY": "test-key"
+                }
+            }),
+            ProviderMeta {
+                provider_type: Some("jdcloud_openai".to_string()),
+                ..Default::default()
+            },
+        );
+        let body = json!({
+            "model": "Jdcloud-openai-GPT5.5-e0",
+            "messages": [{ "role": "user", "content": "permission check" }],
+            "max_tokens": 8,
+            "stop_sequences": ["\n\nHuman:"]
+        });
+
+        let transformed =
+            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None)
+                .unwrap();
+
+        assert!(
+            transformed.get("stop").is_none(),
+            "JDCloud GPT-5.5 rejects OpenAI Chat `stop`; classifier requests must strip it"
+        );
+    }
+
+    #[test]
+    fn test_transform_claude_request_openai_chat_keeps_stop_for_non_jdcloud_gpt55() {
+        // Keep the workaround gated by provider identity: a GPT-5.5-shaped model
+        // on a generic OpenAI-compatible gateway may support stop semantics.
+        let provider = create_provider(json!({
+            "env": { "ANTHROPIC_BASE_URL": "https://openrouter.ai/api/v1" }
+        }));
+        let body = json!({
+            "model": "gpt-5.5",
+            "messages": [{ "role": "user", "content": "hello" }],
+            "max_tokens": 64,
+            "stop_sequences": ["\n\nHuman:"]
+        });
+
+        let transformed =
+            transform_claude_request_for_api_format(body, &provider, "openai_chat", None, None)
+                .unwrap();
+
+        assert_eq!(transformed["stop"], json!(["\n\nHuman:"]));
     }
 
     #[test]

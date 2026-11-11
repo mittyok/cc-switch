@@ -18,6 +18,8 @@ A Codex→Claude `mode=always` incident can fail even earlier, during the prefer
 
 A Codex→Claude fallback incident can also fail during the preferred Codex-provider first hop with OpenAI Responses validation like `Invalid 'input[67].id': 'resp_chatcmpl-..._msg'. Expected an ID that begins with 'msg'.` This happens when cc-switch emits assistant `message` output items with Chat-derived ids such as `resp_*_msg`; Codex replays them as future `input[]` items and strict Responses gateways reject the replay. Generate assistant message item ids with a `msg_` prefix on both non-streaming and streaming Chat/Anthropic conversion paths.
 
+A Claude Code permission/classifier incident on 2026-11-11 was different from the Anthropic/Bedrock path: the selected provider used `apiFormat=openai_chat` and model `Jdcloud-openai-GPT5.5-e0`. Claude sent `stop_sequences`; cc-switch correctly converted that to OpenAI Chat `stop`, but this JDCloud GPT-5.5 gateway rejected it with `Unsupported parameter: 'stop' is not supported with this model.`, and Claude Code surfaced the failure as a transient model outage. Strip `stop` only for the known JDCloud GPT-5.5 OpenAI Chat combination (and the existing Copilot classifier workaround); keep `stop` for generic OpenAI-compatible gateways so normal stop-sequence semantics are preserved.
+
 The log deliberately includes only request-shape facts:
 
 - provider id/name and effective endpoint
